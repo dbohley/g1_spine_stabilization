@@ -1,0 +1,18 @@
+control:
+  dt: 0.02
+  interpolation_time: 3.0
+  rotation_duration: 10.0
+
+trajectory:
+  sine:
+    amplitude: 0.524    # ~30 degrees
+    frequency: 0.3      # Hz
+
+box:
+  size: [0.16, 0.16, 0.16]
+  color: [0.8, 0.3, 0.2]
+  mass: 0.2
+
+frames:
+  pelvis_world_x: -0.1934
+  pelvis_world_z: 0.7923
