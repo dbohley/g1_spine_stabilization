@@ -1,32 +1,52 @@
-# controller/box_rotation.py
+"""
+Bimanual pose-tracking controller (CoppeliaSim, sine placeholder).
+
+Three-phase routine:
+  1. Interpolate EE targets from the default standing pose to the grasp pose.
+  2. Drive both hands together via the trajectory source (sine wave for now,
+     ArUco-driven in Session 3).
+  3. Interpolate EE targets back to the default standing pose.
+"""
+
 import math
+import os
 import time
+
 import numpy as np
+import yaml
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
-from ik_solver import G1HandIK
-from utils.sim_utils import (
+from g1_spine_stabilization.kinematics.ik_solver import G1HandIK
+from g1_spine_stabilization.sim.coppelia_utils import (
     get_arm_handles, read_joint_state, set_joint_positions,
     create_box, attach_box_to_hand, detach_box,
 )
-from utils.transforms import make_se3, slerp_rotation, smoothstep
-from controller.trajectory import (
+from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep
+from g1_spine_stabilization.trajectory.targets import (
     compute_hand_targets,
-    sine_trajectory,
     R_L_BASE,
     R_R_BASE,
     L_EE_DEFAULT,
     R_EE_DEFAULT,
 )
+from g1_spine_stabilization.trajectory.sources import sine_trajectory
+
 
 ARM_DEFAULT_Q = np.array([
     -0.07641,  0.3355,  -0.38365, -0.04522,  1.18319,  0.3721,  0.10582,
     -0.0737,  -0.3477,   0.37916, -0.03927, -1.17787,  0.37036, -0.0962,
 ])
 
-# Pelvis world Z so we can position the box correctly in world frame
-PELVIS_WORLD_Z = 0.7923  # measured earlier
-PELVIS_WORLD_X = -0.1934
+# Path to the default YAML config, resolved relative to the project root.
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+)
+DEFAULT_CONFIG_PATH = os.path.join(PROJECT_ROOT, 'configs', 'default.yaml')
+
+
+def _load_config(config_path):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
 
 
 def step_realtime(sim, control_dt):
@@ -38,14 +58,38 @@ def step_realtime(sim, control_dt):
         time.sleep(sleep_time)
 
 
-def rotate_box_controller(
-    box_size           = [0.16, 0.16, 0.16],   # 16cm cube
-    rotation_amplitude = 0.524,                 # ~30 degrees
-    rotation_freq      = 0.3,                   # Hz
-    duration           = 10.0,                  # seconds
-    control_dt         = 0.02,                  # seconds per step
-    interpolation_time = 3.0,                   # seconds
+def run_pose_tracking_sim(
+    config_path        = None,
+    box_size           = None,
+    rotation_amplitude = None,
+    rotation_freq      = None,
+    duration           = None,
+    control_dt         = None,
+    interpolation_time = None,
 ):
+    """
+    Run the bimanual pose-tracking controller against the CoppeliaSim sim.
+
+    YAML config provides defaults; explicit kwargs override.
+    """
+    # ---------------------------------------------------
+    # Load config (defaults) and apply kwarg overrides
+    # ---------------------------------------------------
+    if config_path is None:
+        config_path = DEFAULT_CONFIG_PATH
+    cfg = _load_config(config_path)
+
+    control_dt         = control_dt         if control_dt         is not None else cfg['control']['dt']
+    interpolation_time = interpolation_time if interpolation_time is not None else cfg['control']['interpolation_time']
+    duration           = duration           if duration           is not None else cfg['control']['rotation_duration']
+    rotation_amplitude = rotation_amplitude if rotation_amplitude is not None else cfg['trajectory']['sine']['amplitude']
+    rotation_freq      = rotation_freq      if rotation_freq      is not None else cfg['trajectory']['sine']['frequency']
+    box_size           = list(box_size)     if box_size           is not None else list(cfg['box']['size'])
+    box_color          = list(cfg['box']['color'])
+    box_mass           = cfg['box']['mass']
+    pelvis_world_x     = cfg['frames']['pelvis_world_x']
+    pelvis_world_z     = cfg['frames']['pelvis_world_z']
+
     # Half width is half the box width in y direction
     box_half_width = box_size[1] / 2
 
@@ -59,9 +103,9 @@ def rotate_box_controller(
 
     # Box position in world frame for creating it in CoppeliaSim
     box_center_world = [
-        box_center_pelvis[0] + PELVIS_WORLD_X,
+        box_center_pelvis[0] + pelvis_world_x,
         box_center_pelvis[1],
-        box_center_pelvis[2] + PELVIS_WORLD_Z,
+        box_center_pelvis[2] + pelvis_world_z,
     ]
 
     print(f"Box size:        {box_size}")
@@ -95,8 +139,8 @@ def rotate_box_controller(
         sim,
         size=box_size,
         position=box_center_world,
-        color=[0.8, 0.3, 0.2],   # red-orange
-        mass=0.2,
+        color=box_color,
+        mass=box_mass,
     )
     print(f"Box created, handle: {box_handle}")
 
@@ -143,9 +187,9 @@ def rotate_box_controller(
     attach_box_to_hand(sim, box_handle, left_hand_handle)
 
     # ---------------------------------------------------
-    # Phase 2: Rotate box
+    # Phase 2: Track target trajectory
     # ---------------------------------------------------
-    print(f"\nPhase 2: Rotating for {duration}s...")
+    print(f"\nPhase 2: Tracking target for {duration}s...")
     steps_rotate = int(duration / control_dt)
 
     for i in range(steps_rotate):
@@ -164,8 +208,6 @@ def rotate_box_controller(
 
         if i % 50 == 0:
             print(f"  t={t:.1f}s  theta={math.degrees(theta):.1f} deg")
-
-    # In box_rotation.py, replace Phase 3 with this:
 
     # ---------------------------------------------------
     # Phase 3: Return to default pose using IK
@@ -202,14 +244,3 @@ def rotate_box_controller(
 
     sim.stopSimulation()
     print("\nDone.")
-
-
-if __name__ == '__main__':
-    rotate_box_controller(
-        box_size           = [0.16, 0.16, 0.16],
-        rotation_amplitude = 0.524,
-        rotation_freq      = 0.3,
-        duration           = 10.0,
-        control_dt         = 0.02,
-        interpolation_time = 3.0,
-    )

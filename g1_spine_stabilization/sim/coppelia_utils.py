@@ -1,4 +1,3 @@
-# utils/sim_utils.py
 """
 CoppeliaSim helpers for the G1 controller.
 """
@@ -41,10 +40,6 @@ def set_joint_positions(sim, handles, q):
     for h, qi in zip(handles, q):
         sim.setJointTargetPosition(h, float(qi))
 
-
-# utils/sim_utils.py - add this helper
-
-# utils/sim_utils.py - update create_box to make it static by default
 
 def create_box(sim, size, position, color=None, mass=0.1, static=True):
     """

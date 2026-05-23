@@ -70,11 +70,17 @@ class G1HandIK:
         # -------------------------------------------------------
         # Resolve URDF path
         # -------------------------------------------------------
+        # ik_solver.py lives at <project_root>/g1_spine_stabilization/kinematics/,
+        # so the project root is two levels up.
         if urdf_path is None:
-            project_root = os.path.dirname(os.path.abspath(__file__))
-            urdf_path    = os.path.join(project_root, 'g1_with_hands.urdf')
+            project_root = os.path.abspath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+            )
+            urdf_path    = os.path.join(project_root, 'assets', 'g1_with_hands.urdf')
         elif not os.path.isabs(urdf_path):
-            project_root = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.abspath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+            )
             urdf_path    = os.path.join(project_root, urdf_path)
 
         urdf_dir = os.path.dirname(urdf_path)
@@ -334,38 +340,3 @@ class G1HandIK:
         data = self.reduced.model.createData()
         pin.framesForwardKinematics(self.reduced.model, data, q)
         return data.oMf[self.L_ee_id], data.oMf[self.R_ee_id]
-
-
-# -------------------------------------------------------
-# Quick test when run directly
-# -------------------------------------------------------
-if __name__ == '__main__':
-    ik = G1HandIK()
-
-    ARM_DEFAULT_Q = np.array([
-        -0.07641,  0.3355,  -0.38365, -0.04522,  1.18319,  0.3721,  0.10582,
-        -0.0737,  -0.3477,   0.37916, -0.03927, -1.17787,  0.37036, -0.0962,
-    ])
-
-    print("\n--- FK at default arm config ---")
-    L_pose, R_pose = ik.fk(ARM_DEFAULT_Q)
-    print(f"L_ee position: {np.round(L_pose.translation, 4)}")
-    print(f"R_ee position: {np.round(R_pose.translation, 4)}")
-
-    print("\n--- IK solve at default EE positions ---")
-    L_test        = np.eye(4)
-    L_test[:3, 3] = L_pose.translation
-    L_test[:3,:3] = L_pose.rotation
-    R_test        = np.eye(4)
-    R_test[:3, 3] = R_pose.translation
-    R_test[:3,:3] = R_pose.rotation
-
-    sol_q, sol_tau = ik.solve_ik(L_test, R_test)
-    print(f"sol_q: {np.round(sol_q, 4)}")
-    print(f"  L_shoulder_roll: {sol_q[1]:+.4f}  (bound: >= {L_SHOULDER_ROLL_MIN})")
-    print(f"  R_shoulder_roll: {sol_q[8]:+.4f}  (bound: <= {R_SHOULDER_ROLL_MAX})")
-
-    L_actual, R_actual = ik.fk(sol_q)
-    print(f"\nPosition errors:")
-    print(f"  L: {np.round(L_actual.translation - L_test[:3,3], 4)}")
-    print(f"  R: {np.round(R_actual.translation - R_test[:3,3], 4)}")

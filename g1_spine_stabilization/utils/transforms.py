@@ -1,6 +1,5 @@
-# utils/transforms.py
 """
-SE3 math helpers for the G1 box rotation controller.
+SE3 math helpers for the G1 pose-tracking controller.
 All poses are in the robot pelvis frame unless otherwise noted.
 """
 
