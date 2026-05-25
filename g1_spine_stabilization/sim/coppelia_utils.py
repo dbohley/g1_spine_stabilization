@@ -3,7 +3,6 @@ CoppeliaSim helpers for the G1 controller.
 """
 
 import numpy as np
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
 # Joint names in reduced model order (matches IK solver sol_q indices 0-13)
 PREFIX = '/pelvis_respondable'

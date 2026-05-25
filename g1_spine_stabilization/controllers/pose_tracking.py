@@ -19,7 +19,7 @@ from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 from g1_spine_stabilization.kinematics.ik_solver import G1HandIK
 from g1_spine_stabilization.sim.coppelia_utils import (
     get_arm_handles, read_joint_state, set_joint_positions,
-    create_box, attach_box_to_hand, detach_box,
+    create_box, attach_box_to_hand,
 )
 from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep
 from g1_spine_stabilization.trajectory.targets import (
