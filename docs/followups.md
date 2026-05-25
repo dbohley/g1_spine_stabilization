@@ -82,12 +82,17 @@ from what Session 2's task spec called out as outstanding cleanups (Task
 ### Test results
 
 ```
-pytest tests/test_detector.py tests/test_perception_frames.py tests/test_mock_tracker.py -v
-13 passed, 1 warning in 4.25s
+pytest tests/ -v
+29 passed, 1 warning in 6.31s
 ```
 
 The 1 warning is the known harmless `pinocchio::DeprecatedBool` notice
 documented in CLAUDE.md.
+
+The Session 2 spec's `pytest.ini` skeleton included a `rootdir = .`
+line. Modern pytest (9.x in this env) treats `rootdir` as a CLI-only
+option, not an ini key, and emits a `PytestConfigWarning`. Dropped the
+line — pytest auto-detects `rootdir` from the `pytest.ini` location.
 
 ### Rough edges for Session 3
 
