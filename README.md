@@ -60,7 +60,60 @@ for that same target, and prints the position errors.
 pytest tests/
 ```
 
-The test suite is pure Pinocchio / NumPy — no CoppeliaSim required.
+The test suite is pure Pinocchio / NumPy / OpenCV — no CoppeliaSim or
+RealSense hardware required. Perception tests synthesize AprilTag images
+in-memory via `cv2.aruco.generateImageMarker`.
+
+## Perception (AprilTag → pelvis-frame pose)
+
+The `g1_spine_stabilization/perception/` module turns RGB frames from the
+head-mounted RealSense D435 into 6-DoF marker poses expressed in the
+robot's pelvis frame. It's built as three composable layers:
+
+- **Frame sources** (`frame_sources.py`): `ImageFileSource`,
+  `VideoFileSource`, `RealSenseSource`. `RealSenseSource` lazy-imports
+  `pyrealsense2` so this package stays importable on machines without
+  librealsense installed.
+- **Detector** (`detector.py`): wraps `cv2.aruco.ArucoDetector` +
+  `cv2.solvePnP` (planar `SOLVEPNP_IPPE_SQUARE`) to recover SE3 pose in
+  the camera optical frame plus a per-detection reprojection error.
+- **Tracker** (`tracker.py`): composes a source + detector + the
+  camera→pelvis transform chain. `MockMarkerTracker` returns scripted
+  observations for hardware-free testing.
+
+### Visualizing detections against real hardware
+
+```bash
+python scripts/visualize_markers.py --source realsense
+```
+
+Streams color frames, draws axes on detected markers, and prints
+pelvis-frame positions per detection. Press `q` to quit.
+
+### Mock mode (no camera attached)
+
+```bash
+python scripts/visualize_markers.py --source mock
+```
+
+Emits three scripted observations and exits — useful for smoke-testing
+imports and the config plumbing without any hardware.
+
+### Important install notes
+
+- `opencv-contrib-python` is in `requirements.txt` (`cv2.aruco` lives in
+  the contrib build).
+- **`pyrealsense2` is NOT in `requirements.txt`.** It must be installed
+  separately from conda-forge:
+
+  ```bash
+  conda install -c conda-forge pyrealsense2
+  ```
+
+- The `T_optical_to_d435` transform in `configs/default.yaml` ships with
+  the standard ROS optical-frame convention (`-90°` Z then `-90°` X) as
+  a placeholder. **It needs calibration against the real robot the first
+  time the perception pipeline is wired into the controller.**
 
 ## Folder structure
 
