@@ -340,3 +340,11 @@ class G1HandIK:
         data = self.reduced.model.createData()
         pin.framesForwardKinematics(self.reduced.model, data, q)
         return data.oMf[self.L_ee_id], data.oMf[self.R_ee_id]
+
+    def get_full_model_and_data(self):
+        """Expose the un-reduced (53-DOF) Pinocchio model + a fresh data object.
+
+        Needed by the perception module to compute FK of frames that the
+        reduced model does not animate (e.g. d435_link via waist joints).
+        """
+        return self.robot.model, self.robot.model.createData()

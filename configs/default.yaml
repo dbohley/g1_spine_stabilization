@@ -16,3 +16,26 @@ box:
 frames:
   pelvis_world_x: -0.1934
   pelvis_world_z: 0.7923
+
+perception:
+  marker_dict: "DICT_APRILTAG_36h11"   # cv2.aruco constant name
+  marker_size: 0.04                    # meters (4 cm square)
+  object_marker_id: 0
+  target_marker_id: 1
+  # Camera intrinsics — used when not auto-loading from a live RealSense.
+  # Defaults are placeholder D435 RGB values; will be overridden when using
+  # RealSenseSource (which queries the camera itself).
+  camera:
+    intrinsics:
+      fx: 615.0
+      fy: 615.0
+      cx: 320.0
+      cy: 240.0
+    distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+    resolution: [640, 480]
+  # Transform from d435_link (URDF mount frame) to camera optical frame.
+  # NEEDS CALIBRATION against the real robot. Default below is standard
+  # ROS optical-frame convention: rotate -90° about Z, then -90° about X.
+  d435_link_to_optical:
+    xyz: [0.0, 0.0, 0.0]
+    rpy: [-1.5708, 0.0, -1.5708]
