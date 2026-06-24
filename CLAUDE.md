@@ -15,17 +15,28 @@ Object width and depth are passed as runtime arguments — markers are used for 
 
 ## Current Status
 
-**Working baseline (post-Session 1):** Robot loads cleanly into CoppeliaSim. IK solves both arms simultaneously with self-collision avoidance via tightened shoulder_roll bounds. Box gets created in the scene, grasped, attached to the left hand, rotated around the X axis driven by a sine wave θ trajectory, then released back to the default pose. Three-phase controller: interpolate to grasp → rotate → interpolate back.
+**Working baseline:** Robot loads cleanly into CoppeliaSim. IK solves both arms simultaneously with self-collision avoidance via tightened shoulder_roll bounds. Box is created, grasped, attached to the left hand, rotated about X by a sine-wave θ trajectory, then released. Three-phase controller: interpolate to grasp → rotate → interpolate back.
 
-Repo is restructured into a proper Python package with configs, tests, and entry-point scripts. All 16 tests pass. Sim behavior is identical to pre-restructure.
+The repo is a proper Python package (configs, tests, entry-point scripts). **Perception (Session 2) is complete**: AprilTag detector + frame-transform stack + hardware-free tests; `scripts/visualize_markers.py` runs in `--source realsense` and `--source mock`. **29 tests pass.**
+
+**Direction shift (Session 0, SDK discovery — complete):** we are adopting the external `g1_inspire_sdk` as the hardware transport + preview + camera layer. Source-grounded analysis is in `docs/sdk_analysis.md`. The adoption is **additive** — CoppeliaSim stays as the sim of record; the SDK becomes a parallel hardware/preview path. SDK adoption is tracked as sessions SDK-1 … SDK-6 (below). SDK-1 (unified env + full-stack install) is the next session.
 
 ## Session Roadmap
 
-- **Session 1: COMPLETE.** Repo restructure, packaging, configs, tests. No behavior change. See `docs/followups.md` for the session's detailed notes.
-- **Session 2: IN PROGRESS.** AprilTag perception module (standalone, no robot integration yet).
-- **Session 3:** Replace sine wave with marker-driven target source; perception-driven controller.
-- **Session 4:** Grip force controller (finger close + optional wrist press).
-- **Session 5 (deferred):** Real-robot bringup — gated on providing the reference codebase.
+**Original pipeline (CoppeliaSim track):**
+
+- **Session 1 — COMPLETE.** Repo restructure, packaging, configs, tests.
+- **Session 2 — COMPLETE.** AprilTag perception module (standalone). 29 tests.
+
+**SDK adoption track (additive; built on `g1_inspire_sdk`):**
+
+- **Session 0 — COMPLETE.** Read-only SDK discovery. See `docs/sdk_analysis.md`.
+- **SDK-1 — NEXT.** Unified `g1` conda env; install the full stack (dry-run + live-hardware bindings + RealSense camera); verify; commit `environment.yml`; retire `teleoperate`.
+- **SDK-2.** Perception re-platform: swap `RealSenseSource` → the SDK's `RealSenseCamera` behind the existing detector/tracker. Retires the standalone pyrealsense path. (Completes the camera side of the old Session 3.)
+- **SDK-3.** IK transport adapter: feed `G1HandIK` output to `arm.set_joint_targets(q14)`; validate against the dry-run preview. Additive hardware path; CoppeliaSim path unchanged.
+- **SDK-4 = original Session 3.** Marker-driven target source replaces the sine wave; runs in both CoppeliaSim and the SDK preview.
+- **SDK-5 = original Session 4.** Grip force from `TransportGraspController` + our acceleration policy. Prereq: weigh the Inspire hand, set `hand_mass_kg`.
+- **SDK-6 = original Session 5.** Real-robot bringup: the env already has the bindings (SDK-1); flip `dry_run=False`; **human-run** live bring-up.
 
 ## File Structure
 
@@ -103,16 +114,25 @@ g1_spine_stabilization/
 
 ## Hard Rules
 
+- **Never run live-robot code in a Claude Code session.** Any command that connects to or commands the physical robot — non-dry-run `connect()` / `initialize()` / `start_streaming()` / `step()`, DDS bring-up against a real network interface, any motor or hand command to hardware — is run by a **human only**, with the robot mounted and an E-stop in reach. `initialize()` moves the arm to a default pose and **counts as actuation**. Claude Code may *install* and *import-verify* the hardware bindings, and may run **dry-run** (`dry_run=True`) and **live-camera** checks (the camera does not actuate the robot). For anything live on the robot, Claude Code **writes** the script (e.g. `scripts/live_robot_check.py`) and stops; the human executes it.
 - **Never modify `assets/g1_with_hands.urdf` without explicit approval.** It's been carefully constructed and tuned. Changes propagate to both Pinocchio and CoppeliaSim.
 - **Never change the EE frame definitions** (`L_ee_link`, `R_ee_link`) without discussing first. They define the IK target convention.
 - **Never change the shoulder_roll bounds** (`L_SHOULDER_ROLL_MIN = 0.15`, `R_SHOULDER_ROLL_MAX = -0.15`) without explicit approval. They prevent self-collision with the torso. These stay as code constants in `ik_solver.py`, NOT in the YAML config.
 - **Never change the IK cost weights** (50 trans, 5 rot, 0.02 reg, 0.1 smooth) without approval. They stay as code constants.
 - **Always preserve the joint ordering** in `ARM_JOINT_NAMES` — it must match the IK solver's reduced model order exactly.
 - **Don't use `simURDF.import_`** in CoppeliaSim Python API — `import` is a Python keyword. Use `simURDF.importFile()` instead.
-- **Don't add new dependencies without discussion.** Current stack: numpy, scipy, pinocchio (conda-forge), casadi, pyyaml, coppeliasim_zmqremoteapi_client, pytest, opencv-contrib-python, pyrealsense2 (conda-forge). New libs need a justification.
+- **Don't add new dependencies without discussion.** As of SDK-1 the project moves to a single unified conda env (`g1`) covering both this repo and the SDK. Core stack: numpy, scipy, pinocchio (**conda-forge**, with CasADi bindings), casadi, pyyaml, `coppeliasim_zmqremoteapi_client`, pytest, `opencv-contrib-python`, pyrealsense2; plus the SDK and its deps (`rerun-sdk`, and for live hardware: `cyclonedds==0.10.2`, `unitree_sdk2py`, `inspire_sdkpy`, `pymodbus`). Pinocchio is conda-forge only. `pyrealsense2` stays lazy-imported. New libs need justification.
 - **`pyrealsense2` should be lazy-imported** inside `RealSenseSource.__init__` so the perception module works on machines without it.
+- **Keep `G1HandIK`; never adopt the SDK's IK.** Drive the arm by feeding our `solve_ik` output to `arm.set_joint_targets(q14)` (identity hand-off — our joint order matches the SDK's). **Never** use `arm.set_ee_targets(...)`: it runs the SDK IK (which lacks our shoulder-roll bounds, weakens orientation 5×, retargets the EE) and double-filters.
+- **Do not import `g1_inspire_sdk._common.weighted_moving_filter`** — it pulls `matplotlib` at module top. Use our own filter.
+
+## External SDK (dependency, not patterns)
+
+The `g1_inspire_sdk` (cloned at `~/reference/g1_inspire_sdk`, editable-installed into the `g1` env) is a **dependency we build on** — unlike the `g1_data_collection` reference, which is patterns-only. We *do* import and call the SDK's arm/hand/camera/preview transport. We do **not** modify the clone (`git pull` only), and we do **not** use its IK or its `weighted_moving_filter` (see Hard Rules). Decisions and exact call surface: `docs/sdk_analysis.md`.
 
 ## Reference Codebase Policy
+
+**Note:** this policy covers `g1_data_collection` only. The `g1_inspire_sdk` is a dependency we build on, not a patterns-only reference — see "External SDK" above.
 
 A separate codebase for G1 teleoperation and data collection may be provided as a reference (the `g1_data_collection` repo or similar). It contains Vive tracker integration, a vendored `fairmotion` library, an alternative IK solver, DDS command helpers, and startup/safety code for the real robot.
 
@@ -285,13 +305,13 @@ Modified from the Unitree G1 29-DOF URDF. Key modifications:
 These are unresolved and will be decided in their respective sessions:
 
 - **Orientation-only vs full 6-DoF tracking** (Session 3): when the target marker moves in space, does the held object follow that translation, or only match orientation? Probably a CLI flag.
-- **Target filtering** (Session 3): how aggressively to smooth the target-marker pose to avoid IK twitching from camera noise. The IK already has output smoothing; adding input smoothing needs to be coordinated to avoid double-filtering.
+- **Target filtering** (Session 3 / SDK-4): how aggressively to smooth the target-marker pose to avoid IK twitching from camera noise. The IK already has output smoothing; adding input smoothing needs to be coordinated to avoid double-filtering. The SDK transport adds its own filtering stage too — see the double-filter caveat in `docs/sdk_analysis.md` (this is also why we avoid the SDK's `set_ee_targets` and `weighted_moving_filter`).
 - **Error budget** (Session 3): expected end-to-end accuracy is roughly: ~2-5 mm from marker detection + ~5-10 mm from camera-to-pelvis calibration + ~2 mm from IK round-trip floor = ~10-20 mm at the EE. If the application requires tighter than this, the IK cost weights would need revisiting (which is on the Hard Rules list).
-- **Grip pressure** (Session 4): closed-loop with force feedback, or just a fixed wrist offset baked into the grasp pose?
 
 **Resolved:**
 - Camera mounting: head-mounted RealSense D435 (uses `d435_link` in URDF).
 - Marker spec: AprilTag `DICT_APRILTAG_36h11`, 4 cm markers.
+- **Grip pressure** (SDK-5): start from the SDK's `TransportGraspController` combined with our acceleration policy, rather than a fixed wrist offset. Prereq: weigh the Inspire hand and set `hand_mass_kg`.
 
 ## Coding Conventions
 
@@ -363,7 +383,7 @@ These are unresolved and will be decided in their respective sessions:
 Run from the repo root:
 
 1. **Pinocchio FK / IK self-test:** `python scripts/verify_ik.py` — verify EE positions and IK round-trip
-2. **Unit tests:** `pytest tests/ -v` — all 16 tests pass (more added in Session 2)
+2. **Unit tests:** `pytest tests/ -v` — all 29 tests pass
 3. **CoppeliaSim scene setup:** `python scripts/setup_scene.py` — import URDF, visual check
 4. **Full controller:** `python scripts/run_pose_tracking_sim.py`
 5. **(Session 2+, with hardware) Marker visualizer:** `python scripts/visualize_markers.py`
