@@ -69,6 +69,36 @@ def run_realsense(config, dry_run=False):
                     np.asarray(intrinsics.distortion), rvec, t,
                     perception["marker_size"] * 0.5,
                 )
+                
+
+
+            # Label each drawn axis with its dominant pelvis-frame direction.
+            # pose_pelvis is the marker pose already composed through to pelvis frame.
+            R_pelvis = pose_pelvis[:3, :3]
+            axis_length = perception["marker_size"] * 0.5
+
+            # Where the tip of each marker-frame axis lands in the image
+            axis_tips_3d = np.array([
+                [axis_length, 0, 0],
+                [0, axis_length, 0],
+                [0, 0, axis_length],
+            ], dtype=np.float32)
+            rvec_opt, _ = cv2.Rodrigues(det.pose_in_optical[:3, :3])
+            tip_pixels, _ = cv2.projectPoints(
+                axis_tips_3d, rvec_opt, det.pose_in_optical[:3, 3],
+                intrinsics.camera_matrix, np.asarray(intrinsics.distortion),
+            )
+            tip_pixels = tip_pixels.reshape(-1, 2).astype(int)
+
+            pelvis_names = ['Xp', 'Yp', 'Zp']
+            for marker_axis_idx in range(3):
+                direction_in_pelvis = R_pelvis[:, marker_axis_idx]
+                dominant = int(np.argmax(np.abs(direction_in_pelvis)))
+                sign = '+' if direction_in_pelvis[dominant] > 0 else '-'
+                label = f"{sign}{pelvis_names[dominant]}"
+                px = tuple(tip_pixels[marker_axis_idx] + np.array([5, 0]))
+                cv2.putText(frame, label, px,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)               
                 cv2.putText(
                     frame, f"id={det.marker_id} err={det.reprojection_error:.2f}px",
                     tuple(det.corners[0].astype(int)),
@@ -82,6 +112,10 @@ def run_realsense(config, dry_run=False):
                 print(f"[visualize_markers] id={det.marker_id} "
                       f"pelvis_pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] m  "
                       f"reproj_err={det.reprojection_error:.2f} px")
+                R = pose_pelvis[:3, :3]
+                print(f"  marker_X_in_pelvis = [{R[0,0]:+.2f}, {R[1,0]:+.2f}, {R[2,0]:+.2f}]")
+                print(f"  marker_Y_in_pelvis = [{R[0,1]:+.2f}, {R[1,1]:+.2f}, {R[2,1]:+.2f}]")
+                print(f"  marker_Z_in_pelvis = [{R[0,2]:+.2f}, {R[1,2]:+.2f}, {R[2,2]:+.2f}]")
             cv2.imshow("AprilTag detections", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break

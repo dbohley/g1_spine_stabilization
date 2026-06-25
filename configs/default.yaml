@@ -38,4 +38,4 @@ perception:
   # ROS optical-frame convention: rotate -90° about Z, then -90° about X.
   d435_link_to_optical:
     xyz: [0.0, 0.0, 0.0]
-    rpy: [-1.5708, 0.0, -1.5708]
+    rpy: [3.14159, 0.0, 1.5708] # hand calibrated 
