@@ -223,3 +223,179 @@ decisions Sessions 3–5 will act on.
 - Only `docs/sdk_analysis.md` and `docs/followups.md` were written.
 - `ik_solver.py`, the URDF, and everything under `assets/` — untouched.
 - `CLAUDE.md` and all other repo code — untouched.
+
+## SDK-1 follow-ups (manual env install)
+
+Out-of-session: the unified env was built **by hand** following the SDK
+README, not inside a Claude Code session, because the live-hardware
+install is intricate enough that interactive control beat scripting it.
+Recording the result here so SDK-2 has firm ground.
+
+### What was built
+
+- Conda env `g1_inspire_sdk` (Python 3.12.13, per the SDK README).
+- SDK installed editable from git
+  (`github.com/Daniel891116/g1_inspire_sdk`, commit `981e9e18`).
+  Sub-packages `inspire_sdkpy` and `unitree_sdk2py` installed editable
+  from the repo's `third_party/` subdirectories.
+- Live-hardware tier: `cyclonedds==0.10.2` from PyPI (no source build
+  required); `unitree_sdk2py` and `inspire_sdkpy` as editable sub-installs
+  (above).
+- Our repo (`g1_spine_stabilization`) importable from the env when run
+  from the repo root; **not yet pip-installed** into the env — fold into
+  SDK-2 preflight if needed.
+
+### SDK examples verified
+
+- **`examples/01_preview_joint_trajectory.py`** — preview path renders;
+  Rerun visualizer works.
+- **`examples/06_pick_and_place.py`** — ran on the **live robot**; arm
+  and hand commands executed successfully; the SDK's arm + hand command
+  path is proven end-to-end on this hardware.
+- **`examples/07_camera_preview.py`** — RealSense capture works through
+  the SDK's `RealSenseCamera`; live frames appeared in Rerun.
+
+### Deliberate decisions
+
+- **No `environment.yml` committed.** The SDK's README is the rebuild
+  recipe; `docs/sdk_setup.md` is the per-machine ledger (written in
+  SDK-2 preflight).
+
+### Deviations from the SDK README
+
+- Small CycloneDDS account-specific quirks (multi-user machine); not
+  relevant to the repo or reproducible outside this machine. No
+  recipe-level deviations.
+
+### Environment notes
+
+- `matplotlib` 3.11.0 IS installed in the env (pulled in as a transitive
+  dep), but it does not leak at import time — confirmed by import sweep.
+  The CLAUDE.md hard rule against importing
+  `g1_inspire_sdk._common.weighted_moving_filter` remains critical: that
+  import would pull matplotlib into the module namespace.
+- `opencv-python` 4.13.0 is installed rather than `opencv-contrib-python`
+  (same situation as the `teleoperate` env). `cv2.aruco` works on this
+  build; `requirements.txt` still declares `opencv-contrib-python` per spec.
+- `pytest` and `coppeliasim-zmqremoteapi-client` were not installed during
+  the manual SDK-1 setup; both added at the start of SDK-2 preflight.
+
+### Test results
+
+- **Our 29 tests not run in this env during SDK-1** — both missing
+  packages (`pytest`, `coppeliasim-zmqremoteapi-client`) were installed
+  and all 29 tests run as SDK-2 Step 0 preflight. Result: **29 passed**.
+
+### Rough edges for SDK-2
+
+- `docs/sdk_setup.md` written in SDK-2 preflight (this session).
+- `g1_spine_stabilization` not pip-installed into the env; works via
+  sys.path from the repo root. Add `pip install -e .` to the setup doc
+  and install if needed.
+- The intrinsics shape returned by `RealSenseCamera.intrinsics` uses
+  `ppx`/`ppy` rather than `cx`/`cy` — SDK-2's wrapper handles the remap.
+
+### Out-of-scope items left for later
+
+- Wiring the SDK into our perception pipeline — SDK-2.
+- IK transport adapter — SDK-3.
+- Controller / grip-force work — SDK-4 / SDK-5.
+
+### Things not modified
+
+- `assets/g1_with_hands.urdf` — untouched.
+- IK weights, shoulder-roll bounds, default arm pose — untouched.
+- The SDK clone — `git pull` only, no edits.
+
+## SDK-2 follow-ups (perception re-platform)
+
+First SDK code session. Swapped the camera backend in `RealSenseSource`;
+everything downstream (`AprilTagDetector`, `MarkerTracker`, `frames.py`,
+`scripts/visualize_markers.py`) is unchanged.
+
+### What was built
+
+- **`g1_spine_stabilization/perception/frame_sources.py`** — `RealSenseSource`
+  internals replaced. Same public interface (constructor signature +
+  optional `dry_run` kwarg, `.read()`, `.intrinsics_native`, `.close()`).
+  Internally wraps `g1_inspire_sdk.camera.RealSenseCamera`; lazy-imports
+  the SDK in `__init__`. Intrinsics remap: SDK `ppx`/`ppy`/`coeffs` →
+  our `cx`/`cy`/`distortion`. Removed the now-unused `numpy` import.
+- **`tests/test_realsense_source_sdk.py`** — 6 new hardware-free tests
+  using `dry_run=True`: frame shape, dtype, timestamp, intrinsics keys,
+  copy behavior, lifecycle (close + re-create), detector smoke on synthetic
+  frame.
+- **`scripts/visualize_markers.py`** — `--dry-run` flag added. When
+  `--source realsense --dry-run` is used, `RealSenseSource(dry_run=True)`
+  returns synthetic gradient frames from the SDK; no camera needed.
+- **`docs/sdk_setup.md`** — per-machine env ledger (Step 0 deliverable):
+  env name, Python version, SDK commit, full `conda list` + `pip freeze`.
+- **`CLAUDE.md`** — patch v2 applied: SDK-1 marked complete, SDK-2 to
+  NEXT, dependency hard rule updated (no `environment.yml`; sdk_setup.md
+  is the ledger), External SDK section path corrected
+  (`~/g1_inspire_sdk`), env name updated to `g1_inspire_sdk`.
+- **`docs/followups.md`** — SDK-1 entry appended (this file).
+
+### Deviations from spec
+
+- **`pytest` and `coppeliasim-zmqremoteapi-client` were missing** from the
+  `g1_inspire_sdk` env (not installed during SDK-1). Both are core-stack
+  items. Added them at the start of Step 0 preflight; 29 tests then passed.
+- **`g1_spine_stabilization` is not pip-installed** into the env. All
+  script and test runs work via `sys.path` from the repo root. The setup
+  doc notes this and gives the fix (`pip install -e .`).
+
+### Environment notes
+
+- New `hppfcl` deprecation warning appears in pytest output:
+  `DeprecationWarning: Please update your 'hppfcl' imports to 'coal'`.
+  Comes from Pinocchio's dependency; harmless. Not in our code.
+
+### Test results
+
+```
+35 passed, 1 warning in 3.74s
+```
+
+29 original tests unchanged. 6 new SDK-source tests green.
+
+### Human-run smoke check (not executed by Claude Code)
+
+With a RealSense D435 connected:
+```
+conda activate g1_inspire_sdk
+python scripts/visualize_markers.py --source realsense
+```
+Expected: live AprilTag detection at the same rate as before the swap.
+
+The `--dry-run` variant (no camera required):
+```
+python scripts/visualize_markers.py --source realsense --dry-run
+```
+Expected: loop runs, prints nothing (synthetic gradient frame has no
+markers), no exceptions.
+
+### Rough edges for SDK-3
+
+- SDK-3 will feed `G1HandIK` output to `arm.set_joint_targets(q14)`.
+  The `G1InspireRobot` lifecycle (`connect → initialize → start_streaming
+  → shutdown`) must be respected; `initialize()` actuates the arm (runs
+  it to default pose) so it counts as live-robot code under the hard rule.
+  SDK-3 validates against dry-run preview only; live bring-up is SDK-6.
+- The timing split between the SDK's 250 Hz arm thread and our control
+  cadence needs to be tested in dry-run; don't try to match the motor rate.
+
+### Out-of-scope items left for later
+
+- IK transport adapter (`G1HandIK` → `set_joint_targets`) — SDK-3.
+- Marker-driven target source replacing the sine wave — SDK-4.
+- Grip-force work — SDK-5.
+- Live-robot bringup — SDK-6 (human-run only).
+
+### Things not modified
+
+- `detector.py`, `tracker.py`, `frames.py`, `types.py` — untouched.
+- `ik_solver.py`, `assets/g1_with_hands.urdf`, IK weights, EE frames,
+  shoulder-roll bounds — untouched.
+- `docs/sdk_analysis.md` — untouched.
+- `configs/default.yaml` — untouched (camera config keys unchanged).

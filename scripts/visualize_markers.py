@@ -32,9 +32,9 @@ from g1_spine_stabilization.perception.types import MarkerObservation
 from g1_spine_stabilization.utils.config import load_config
 
 
-def run_realsense(config):
+def run_realsense(config, dry_run=False):
     perception = config["perception"]
-    source = RealSenseSource()
+    source = RealSenseSource(dry_run=dry_run)
     native = source.intrinsics_native
     intrinsics = CameraIntrinsics(
         fx=native["fx"], fy=native["fy"], cx=native["cx"], cy=native["cy"],
@@ -116,10 +116,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=["realsense", "mock"], default="mock")
     parser.add_argument("--config", default=None)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Use synthetic camera frames (no hardware needed)")
     args = parser.parse_args()
     config = load_config(args.config)
     if args.source == "realsense":
-        run_realsense(config)
+        run_realsense(config, dry_run=args.dry_run)
     else:
         run_mock(config)
 
