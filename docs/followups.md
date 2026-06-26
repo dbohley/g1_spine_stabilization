@@ -399,3 +399,113 @@ markers), no exceptions.
   shoulder-roll bounds — untouched.
 - `docs/sdk_analysis.md` — untouched.
 - `configs/default.yaml` — untouched (camera config keys unchanged).
+
+## SDK-3 / SDK-4 follow-ups (IK transport adapter + marker-driven source, merged)
+
+These two sessions were merged because the live-marker preview script is the
+natural validation of the IK transport — no additional IK code is needed to
+demonstrate it.
+
+### What was built
+
+- **`g1_spine_stabilization/perception/frames.py`** — `d435_to_pelvis_from_pinocchio`
+  gains an optional `ik` parameter. Callers that already hold a `G1HandIK`
+  instance can pass it in to avoid re-instantiating Pinocchio (~5–15 s cold
+  start). Backward-compatible: no-arg calls still work.
+- **`g1_spine_stabilization/trajectory/sources.py`** — two new classes:
+  - `SineSource`: wraps `sine_trajectory` behind the same `.startup()` /
+    `.step() → (box_center, theta)` interface so the SDK controller doesn't
+    branch on source type.
+  - `MarkerSource`: reads `MarkerTracker.step()` each control tick, extracts
+    `theta = arctan2(R[2,1], R[2,2])` from the target marker's rotation, and
+    returns `(box_center, theta)`. Two modes: `"orient-only"` (box_center
+    fixed from object marker at startup) and `"6dof"` (box_center tracks target
+    marker position). Falls back to last known values when no new detection.
+- **`g1_spine_stabilization/controllers/sdk_pose_tracking.py`** — new module
+  with `run_pose_tracking_sdk(robot, ik, cfg, source, duration=None)`. Mirrors
+  the three-phase logic of `run_pose_tracking_sim` but drives
+  `G1InspireRobot` instead of CoppeliaSim. Reads joint state from
+  `robot.get_state()["arm"]["q"]`, sets targets via `robot.step(q_arm=sol_q)`,
+  paces with `time.sleep(control_dt)`. Hand open/close replaces the
+  CoppeliaSim box attach/detach. Caller owns the robot lifecycle.
+- **`scripts/run_pose_tracking_preview.py`** — multi-mode entry point:
+  - `--source sine` (default): `SineSource`, runs for `rotation_duration` seconds.
+  - `--source mock`: `_AnimatedMockTracker` (time-varying poses, no camera),
+    `MarkerSource`, runs for `rotation_duration` seconds.
+  - `--source marker`: live `RealSenseSource` + `AprilTagDetector` +
+    `MarkerTracker` + `MarkerSource`; runs until `KeyboardInterrupt`.
+  - `--tracking orient-only|6dof` (for marker/mock modes).
+  - Instantiates `RerunPreview(spawn=True)` and passes it to
+    `G1InspireRobot(dry_run=True, preview=preview)` so all three phases appear
+    in the Rerun viewer.
+- **`tests/test_sdk_transport.py`** — 4 hardware-free `dry_run=True` tests:
+  lifecycle, `get_state()["arm"]["q"]` shape, `step(q_arm=...)`, hand commands.
+- **`tests/test_marker_source.py`** — 7 tests covering `MarkerSource`
+  (orient-only, 6dof, last-known fallback, invalid mode) and `SineSource`.
+- **`CLAUDE.md`** — patched: SDK-2 → COMPLETE, SDK-3+4 → NEXT/merged,
+  test count 29 → 46, calibration status updated, file structure updated,
+  `d435_to_pelvis_from_pinocchio()` note added, Open Design Questions revised.
+
+### Deviations from spec
+
+- **`robot.get_state()` key is `state["arm"]["q"]`**, not `"q_arm"`. Discovered
+  at test time; fixed in `sdk_pose_tracking.py` and `test_sdk_transport.py`.
+  The SDK's actual state dict is `{arm: {q, dq, tau}, arm_ee_left, arm_ee_right,
+  hand_left, hand_right}`.
+
+### Test results
+
+```
+46 passed, 1 warning in 3.63s
+```
+
+11 new tests (7 marker-source + 4 sdk-transport). All 46 green.
+
+### Human-run smoke checks (not executed by Claude Code)
+
+```bash
+conda activate g1_inspire_sdk
+# No camera, Rerun viewer:
+python scripts/run_pose_tracking_preview.py --source sine
+python scripts/run_pose_tracking_preview.py --source mock --tracking orient-only
+python scripts/run_pose_tracking_preview.py --source mock --tracking 6dof
+
+# With RealSense D435 + two AprilTag markers:
+python scripts/run_pose_tracking_preview.py --source marker --tracking orient-only
+python scripts/run_pose_tracking_preview.py --source marker --tracking 6dof
+```
+
+Expected for sine/mock: Rerun opens; robot arms move through all three phases;
+script exits cleanly. Expected for marker: arms respond in real time to the
+target AprilTag; Ctrl+C to exit.
+
+### Rough edges for SDK-5
+
+- Phase 2 duration logic: `duration=None` uses `cfg["control"]["rotation_duration"]`
+  (10 s) for sine/mock; `float("inf")` is passed by the script for the live
+  marker mode. This is implicit; consider an explicit `interactive=True` kwarg
+  in a future refactor if the interface needs to be cleaner.
+- `_AnimatedMockTracker` in `run_pose_tracking_preview.py` is script-local; if
+  it needs reuse in other contexts, promote it to `perception/tracker.py`.
+- `G1InspireRobot(hand_side="both")` — confirm this is the correct value for
+  controlling both hands simultaneously when the real robot is connected in
+  SDK-6. (In `dry_run=True` it is irrelevant.)
+- Phase 3 reads FK from `ik.fk(current_q)` to get start-of-return EE poses.
+  Verify this is correct after Phase 2 when `current_q` has been filtered by
+  the IK's `WeightedMovingFilter` — the filter may cause a small discontinuity
+  at the transition. Investigate if Phase 3 interpolation looks jerky in Rerun.
+
+### Out-of-scope left for later
+
+- SDK-5: grip force from `TransportGraspController` + our acceleration policy;
+  prereq: weigh the Inspire hand, set `hand_mass_kg`.
+- SDK-6 (human-run): flip `dry_run=False`, mount robot, E-stop in reach.
+- CoppeliaSim path (`run_pose_tracking_sim.py`) — completely untouched this session.
+
+### Things not modified
+
+- `ik_solver.py`, `assets/g1_with_hands.urdf`, IK weights, EE frame defs,
+  shoulder-roll bounds — untouched.
+- `controllers/pose_tracking.py` (CoppeliaSim path) — untouched.
+- `detector.py`, `tracker.py`, `types.py`, `frame_sources.py` — untouched.
+- `docs/sdk_analysis.md` — untouched.

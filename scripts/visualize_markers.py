@@ -72,33 +72,7 @@ def run_realsense(config, dry_run=False):
                 
 
 
-            # Label each drawn axis with its dominant pelvis-frame direction.
-            # pose_pelvis is the marker pose already composed through to pelvis frame.
-            R_pelvis = pose_pelvis[:3, :3]
-            axis_length = perception["marker_size"] * 0.5
-
-            # Where the tip of each marker-frame axis lands in the image
-            axis_tips_3d = np.array([
-                [axis_length, 0, 0],
-                [0, axis_length, 0],
-                [0, 0, axis_length],
-            ], dtype=np.float32)
-            rvec_opt, _ = cv2.Rodrigues(det.pose_in_optical[:3, :3])
-            tip_pixels, _ = cv2.projectPoints(
-                axis_tips_3d, rvec_opt, det.pose_in_optical[:3, 3],
-                intrinsics.camera_matrix, np.asarray(intrinsics.distortion),
-            )
-            tip_pixels = tip_pixels.reshape(-1, 2).astype(int)
-
-            pelvis_names = ['Xp', 'Yp', 'Zp']
-            for marker_axis_idx in range(3):
-                direction_in_pelvis = R_pelvis[:, marker_axis_idx]
-                dominant = int(np.argmax(np.abs(direction_in_pelvis)))
-                sign = '+' if direction_in_pelvis[dominant] > 0 else '-'
-                label = f"{sign}{pelvis_names[dominant]}"
-                px = tuple(tip_pixels[marker_axis_idx] + np.array([5, 0]))
-                cv2.putText(frame, label, px,
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)               
+               
                 cv2.putText(
                     frame, f"id={det.marker_id} err={det.reprojection_error:.2f}px",
                     tuple(det.corners[0].astype(int)),
