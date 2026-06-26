@@ -12,3 +12,5 @@ env/
 .pytest_cache/
 .ipynb_checkpoints/
 *.log
+Miniforge3-Linux-x86_64.sh
+*.egg-info/
