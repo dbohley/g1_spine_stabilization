@@ -32,9 +32,9 @@ from g1_spine_stabilization.perception.types import MarkerObservation
 from g1_spine_stabilization.utils.config import load_config
 
 
-def run_realsense(config):
+def run_realsense(config, dry_run=False):
     perception = config["perception"]
-    source = RealSenseSource()
+    source = RealSenseSource(dry_run=dry_run)
     native = source.intrinsics_native
     intrinsics = CameraIntrinsics(
         fx=native["fx"], fy=native["fy"], cx=native["cx"], cy=native["cy"],
@@ -69,6 +69,10 @@ def run_realsense(config):
                     np.asarray(intrinsics.distortion), rvec, t,
                     perception["marker_size"] * 0.5,
                 )
+                
+
+
+               
                 cv2.putText(
                     frame, f"id={det.marker_id} err={det.reprojection_error:.2f}px",
                     tuple(det.corners[0].astype(int)),
@@ -82,6 +86,10 @@ def run_realsense(config):
                 print(f"[visualize_markers] id={det.marker_id} "
                       f"pelvis_pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] m  "
                       f"reproj_err={det.reprojection_error:.2f} px")
+                R = pose_pelvis[:3, :3]
+                print(f"  marker_X_in_pelvis = [{R[0,0]:+.2f}, {R[1,0]:+.2f}, {R[2,0]:+.2f}]")
+                print(f"  marker_Y_in_pelvis = [{R[0,1]:+.2f}, {R[1,1]:+.2f}, {R[2,1]:+.2f}]")
+                print(f"  marker_Z_in_pelvis = [{R[0,2]:+.2f}, {R[1,2]:+.2f}, {R[2,2]:+.2f}]")
             cv2.imshow("AprilTag detections", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
@@ -116,10 +124,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=["realsense", "mock"], default="mock")
     parser.add_argument("--config", default=None)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Use synthetic camera frames (no hardware needed)")
     args = parser.parse_args()
     config = load_config(args.config)
     if args.source == "realsense":
-        run_realsense(config)
+        run_realsense(config, dry_run=args.dry_run)
     else:
         run_mock(config)
 

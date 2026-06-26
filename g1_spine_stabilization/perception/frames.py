@@ -21,20 +21,21 @@ def optical_to_d435_from_config(config_section) -> np.ndarray:
     return make_se3(xyz, R)
 
 
-def d435_to_pelvis_from_pinocchio(locked_joint_config=None) -> np.ndarray:
+def d435_to_pelvis_from_pinocchio(locked_joint_config=None, ik=None) -> np.ndarray:
     """Compute T_d435_to_pelvis via Pinocchio FK at the given (or zero) joint config.
 
     For the current controller, head/waist joints are locked at zero, so this
     is a constant computed once. If they move later, this function must be
     called per-frame.
-    """
-    # Lazy import: pinocchio is heavy and only needed here.
-    import pinocchio as pin
-    from g1_spine_stabilization.kinematics.ik_solver import G1HandIK
 
-    # G1HandIK already loads the full robot model; reuse it rather than
-    # re-loading. The IK class exposes the full model via a public accessor.
-    ik = G1HandIK()
+    Pass an already-loaded G1HandIK instance via `ik` to avoid the ~5-15 s
+    Pinocchio/CasADi cold-start when one is already available.
+    """
+    import pinocchio as pin
+
+    if ik is None:
+        from g1_spine_stabilization.kinematics.ik_solver import G1HandIK
+        ik = G1HandIK()
     model, data = ik.get_full_model_and_data()
     q = locked_joint_config if locked_joint_config is not None else np.zeros(model.nq)
     pin.forwardKinematics(model, data, q)

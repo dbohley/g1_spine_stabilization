@@ -21,7 +21,7 @@ perception:
   marker_dict: "DICT_APRILTAG_36h11"   # cv2.aruco constant name
   marker_size: 0.04                    # meters (4 cm square)
   object_marker_id: 0
-  target_marker_id: 1
+  target_marker_id: 2
   # Camera intrinsics — used when not auto-loading from a live RealSense.
   # Defaults are placeholder D435 RGB values; will be overridden when using
   # RealSenseSource (which queries the camera itself).
@@ -38,4 +38,4 @@ perception:
   # ROS optical-frame convention: rotate -90° about Z, then -90° about X.
   d435_link_to_optical:
     xyz: [0.0, 0.0, 0.0]
-    rpy: [-1.5708, 0.0, -1.5708]
+    rpy: [-1.5708, 0.0, -1.5708] # hand calibrated 
