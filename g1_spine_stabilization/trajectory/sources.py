@@ -83,6 +83,8 @@ class MarkerSource:
         self._control_dt = control_dt
         self._box_center = None      # set by startup()
         self._last_theta = 0.0
+        self._last_obj_obs = None
+        self._last_tgt_obs = None
         # Stale-target tracking
         self._target_stale_frames = 0
         self._stale_warned_05 = False
@@ -184,6 +186,7 @@ class MarkerSource:
 
         # --- Target marker ---
         tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
+        self._last_tgt_obs = tgt_obs
         if tgt_obs is not None:
             R = tgt_obs.pose_in_pelvis[:3, :3]
             self._last_theta = float(np.arctan2(R[2, 1], R[2, 2]))
@@ -204,6 +207,7 @@ class MarkerSource:
 
         # --- Object marker monitoring ---
         obj_obs = next((o for o in current if o.marker_id == self._obj_id), None)
+        self._last_obj_obs = obj_obs
         if obj_obs is not None:
             self._object_stale_frames = 0
             self._object_warned_2s = False
@@ -219,6 +223,16 @@ class MarkerSource:
                 self._object_warned_5s = True
 
         return self._box_center.copy(), self._last_theta
+
+    @property
+    def last_obj_obs(self):
+        """Most recent object marker observation from the last step(), or None."""
+        return self._last_obj_obs
+
+    @property
+    def last_tgt_obs(self):
+        """Most recent target marker observation from the last step(), or None."""
+        return self._last_tgt_obs
 
     @property
     def target_stale_seconds(self) -> float:

@@ -51,9 +51,10 @@ class RealSenseSource:
     Pass dry_run=True to get synthetic gradient frames without a camera.
     """
 
-    def __init__(self, width=640, height=480, fps=30, dry_run=False):
+    def __init__(self, width=640, height=480, fps=30, dry_run=False, preview=None):
         from g1_inspire_sdk.camera import RealSenseCamera   # lazy
-        self._cam = RealSenseCamera(width=width, height=height, fps=fps, dry_run=dry_run)
+        self._cam = RealSenseCamera(width=width, height=height, fps=fps,
+                                    dry_run=dry_run, preview=preview)
         self._cam.connect()
         # Remap SDK intrinsics (ppx/ppy/coeffs) to our convention (cx/cy/distortion).
         intr = self._cam.intrinsics

@@ -188,8 +188,27 @@ def main():
     ])
 
     # -------------------------------------------------------------------
+    # SDK: Preview + Robot  (created first so preview is available to sources)
+    # -------------------------------------------------------------------
+    from g1_inspire_sdk.preview import RerunPreview
+    from g1_inspire_sdk import G1InspireRobot
+    from g1_inspire_sdk.camera import RealSenseCamera
+
+    print("[preview] Opening Rerun viewer…")
+    preview = RerunPreview(spawn=True)
+
+    robot = G1InspireRobot(
+        dry_run=True,
+        arm_side="both",
+        hand_side="both",
+        preview=preview,
+    )
+
+    # -------------------------------------------------------------------
     # Build the trajectory source
     # -------------------------------------------------------------------
+    cam_for_preview = None   # set for sine/mock; marker mode drives it via tracker
+
     if args.source == "sine":
         source = SineSource(
             box_center=box_center_pelvis,
@@ -197,6 +216,9 @@ def main():
             freq=cfg["trajectory"]["sine"]["frequency"],
         )
         duration = None   # use config default (rotation_duration)
+        cam_for_preview = RealSenseCamera(dry_run=True)
+        cam_for_preview.connect()
+        cam_for_preview.attach_preview(preview)
 
     elif args.source == "mock":
         mock_tracker = _AnimatedMockTracker(
@@ -208,10 +230,13 @@ def main():
         )
         source = MarkerSource(mock_tracker, obj_id, tgt_id, mode=args.tracking, countdown=0.0)
         duration = None   # use config default
+        cam_for_preview = RealSenseCamera(dry_run=True)
+        cam_for_preview.connect()
+        cam_for_preview.attach_preview(preview)
 
     elif args.source == "marker":
         print("[preview] Setting up live RealSense + AprilTag tracker…")
-        frame_source = RealSenseSource()
+        frame_source = RealSenseSource(preview=preview)
         native = frame_source.intrinsics_native
         intrinsics = CameraIntrinsics(
             fx=native["fx"], fy=native["fy"],
@@ -226,22 +251,7 @@ def main():
         )
         source = MarkerSource(tracker, obj_id, tgt_id, mode=args.tracking, countdown=3.0)
         duration = float("inf")   # run until Ctrl+C
-
-    # -------------------------------------------------------------------
-    # SDK: Preview + Robot
-    # -------------------------------------------------------------------
-    from g1_inspire_sdk.preview import RerunPreview
-    from g1_inspire_sdk import G1InspireRobot
-
-    print("[preview] Opening Rerun viewer…")
-    preview = RerunPreview(spawn=True)
-
-    robot = G1InspireRobot(
-        dry_run=True,
-        arm_side="both",
-        hand_side="both",
-        preview=preview,
-    )
+        # cam_for_preview stays None: RealSenseSource.read() auto-pushes frames via the SDK
 
     print("[preview] Connecting robot (dry_run=True)…")
     robot.connect()
@@ -250,9 +260,12 @@ def main():
     print("[preview] Robot ready. Starting controller…")
 
     try:
-        run_pose_tracking_sdk(robot, ik, cfg, source, duration=duration)
+        run_pose_tracking_sdk(robot, ik, cfg, source, duration=duration,
+                              preview=preview, cam_for_preview=cam_for_preview)
     finally:
         robot.shutdown()
+        if cam_for_preview is not None:
+            cam_for_preview.shutdown()
         print("[preview] Shutdown complete.")
 
 

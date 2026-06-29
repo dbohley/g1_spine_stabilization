@@ -18,6 +18,13 @@ import math
 import time
 
 import numpy as np
+from scipy.spatial.transform import Rotation as _Rot
+
+try:
+    import rerun as rr
+    _HAS_RERUN = True
+except ImportError:
+    _HAS_RERUN = False
 
 from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep
 from g1_spine_stabilization.trajectory.targets import (
@@ -47,18 +54,79 @@ def _get_q(robot):
     return ARM_DEFAULT_Q.copy()
 
 
-def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None):
+def _rpy_deg(R):
+    """Return [roll, pitch, yaw] in degrees from a 3x3 rotation matrix (intrinsic XYZ)."""
+    return np.degrees(_Rot.from_matrix(R).as_euler('xyz'))
+
+
+def _log_marker_info(source, theta, elapsed, preview):
+    """Print augmented per-step marker diagnostics and optionally push to Rerun."""
+    print(f"[SDKController] t={elapsed:.1f}s  "
+          f"theta_Rx (target marker rot about robot X axis) = {math.degrees(theta):+.1f}°")
+
+    obj_obs = getattr(source, 'last_obj_obs', None)
+    tgt_obs = getattr(source, 'last_tgt_obs', None)
+
+    if obj_obs is not None:
+        p = obj_obs.pose_in_pelvis[:3, 3]
+        rpy = _rpy_deg(obj_obs.pose_in_pelvis[:3, :3])
+        print(f"  Object marker:  pos=[{p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f}]  "
+              f"rpy=[{rpy[0]:+.1f}°, {rpy[1]:+.1f}°, {rpy[2]:+.1f}°]")
+    else:
+        print("  Object marker:  (no observation this step)")
+
+    if tgt_obs is not None:
+        p = tgt_obs.pose_in_pelvis[:3, 3]
+        rpy = _rpy_deg(tgt_obs.pose_in_pelvis[:3, :3])
+        print(f"  Target marker:  pos=[{p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f}]  "
+              f"rpy=[{rpy[0]:+.1f}°, {rpy[1]:+.1f}°, {rpy[2]:+.1f}°]")
+    else:
+        print("  Target marker:  (no observation this step)")
+
+    if obj_obs is not None and tgt_obs is not None:
+        R_obj = obj_obs.pose_in_pelvis[:3, :3]
+        R_tgt = tgt_obs.pose_in_pelvis[:3, :3]
+        R_diff = R_obj.T @ R_tgt   # identity = perfect tracking
+        r_diff = _Rot.from_matrix(R_diff)
+        q = r_diff.as_quat()       # [x, y, z, w]
+        angle_deg = np.degrees(np.linalg.norm(r_diff.as_rotvec()))
+        print(f"  Tracking delta: q=[x={q[0]:+.3f}, y={q[1]:+.3f}, "
+              f"z={q[2]:+.3f}, w={q[3]:+.3f}]  angle={angle_deg:.1f}°")
+
+    _AXIS_LEN = 0.05
+    if _HAS_RERUN and preview is not None:
+        for _name, _obs in [("markers/object", obj_obs), ("markers/target", tgt_obs)]:
+            if _obs is not None:
+                _t = _obs.pose_in_pelvis[:3, 3]
+                _R = _obs.pose_in_pelvis[:3, :3]
+                rr.log(_name, rr.Arrows3D(
+                    origins=[_t, _t, _t],
+                    vectors=[_R[:, 0] * _AXIS_LEN,
+                             _R[:, 1] * _AXIS_LEN,
+                             _R[:, 2] * _AXIS_LEN],
+                    colors=[[255, 0, 0, 255],
+                            [0, 255, 0, 255],
+                            [0, 0, 255, 255]],
+                ))
+
+
+def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
+                          preview=None, cam_for_preview=None):
     """Run the three-phase pose-tracking controller via the SDK transport.
 
     Args:
-        robot:    G1InspireRobot instance (connect/initialize/start_streaming
-                  already called by the caller).
-        ik:       G1HandIK instance (already loaded).
-        cfg:      config dict loaded from default.yaml.
-        source:   trajectory source with .startup() and .step() -> (box_center, theta).
-                  Use SineSource for sine-wave mode, MarkerSource for live AprilTag mode.
-        duration: Phase 2 duration in seconds. None = run until KeyboardInterrupt
-                  (marker-driven interactive mode).
+        robot:           G1InspireRobot instance (connect/initialize/start_streaming
+                         already called by the caller).
+        ik:              G1HandIK instance (already loaded).
+        cfg:             config dict loaded from default.yaml.
+        source:          trajectory source with .startup() and .step() -> (box_center, theta).
+                         Use SineSource for sine-wave mode, MarkerSource for live AprilTag mode.
+        duration:        Phase 2 duration in seconds. None = run until KeyboardInterrupt
+                         (marker-driven interactive mode).
+        preview:         RerunPreview instance; enables Rerun marker-frame logging.
+        cam_for_preview: RealSenseCamera(dry_run=True) pre-attached to preview; capture()
+                         is called every step to push synthetic frames to the Rerun camera pane.
+                         Pass None for marker mode (frames arrive via the tracker).
     """
     control_dt         = cfg["control"]["dt"]
     interpolation_time = cfg["control"]["interpolation_time"]
@@ -82,6 +150,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None):
     steps_interp = int(interpolation_time / control_dt)
 
     current_q = _get_q(robot)
+    _last_log_t = time.monotonic() - 1.0  # fire on first step
     for i in range(steps_interp):
         alpha = smoothstep(i / steps_interp)
 
@@ -98,9 +167,12 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None):
         )
         robot.step(q_arm=sol_q)
         current_q = sol_q
+        if cam_for_preview is not None:
+            cam_for_preview.capture()
         time.sleep(control_dt)
 
-        if i % 50 == 0:
+        if time.monotonic() - _last_log_t >= 1.0:
+            _last_log_t = time.monotonic()
             print(f"  {alpha * 100:.0f}%")
 
     print("[SDKController] At grasp pose.")
@@ -110,7 +182,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None):
     # ---------------------------------------------------------------
     print(f"[SDKController] Phase 2: tracking target (duration={duration}s)…")
     t_start = time.monotonic()
-    step_idx = 0
+    _last_log_t = t_start - 1.0   # fire on first step
     _obj_lost_warned = False
     try:
         while True:
@@ -128,11 +200,13 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None):
             sol_q, _ = ik.solve_ik(L_target, R_target, current_q, current_dq)
             robot.step(q_arm=sol_q)
             current_q = sol_q
+            if cam_for_preview is not None:
+                cam_for_preview.capture()
             time.sleep(control_dt)
 
-            if step_idx % 50 == 0:
-                print(f"  t={elapsed:.1f}s  theta={math.degrees(theta):.1f}°")
-            step_idx += 1
+            if time.monotonic() - _last_log_t >= 1.0:
+                _last_log_t = time.monotonic()
+                _log_marker_info(source, theta, elapsed, preview)
 
     except KeyboardInterrupt:
         print("\n[SDKController] KeyboardInterrupt — exiting Phase 2.")
@@ -149,6 +223,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None):
     R_start_rot = R_current_pose.rotation.copy()
 
     steps_return = int(interpolation_time / control_dt)
+    _last_log_t = time.monotonic() - 1.0   # fire on first step
     for i in range(steps_return):
         alpha = smoothstep(i / steps_return)
 
@@ -165,6 +240,12 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None):
         )
         robot.step(q_arm=sol_q)
         current_q = sol_q
+        if cam_for_preview is not None:
+            cam_for_preview.capture()
         time.sleep(control_dt)
+
+        if time.monotonic() - _last_log_t >= 1.0:
+            _last_log_t = time.monotonic()
+            print(f"  {alpha * 100:.0f}%")
 
     print("[SDKController] Done.")

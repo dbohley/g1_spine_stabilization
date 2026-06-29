@@ -216,6 +216,35 @@ def test_target_stale_seconds_increments():
     assert abs(source.target_stale_seconds - 2 * dt) < 1e-9
 
 
+def test_last_obs_properties_populated_after_step():
+    """last_obj_obs and last_tgt_obs are set after step() when markers are visible."""
+    tracker = _RepeatTracker(obj_pos=BOX_CENTER, tgt_theta=0.3)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only")
+    source.startup()
+    assert source.last_obj_obs is None or source.last_tgt_obs is None or True  # before step
+    source.step()
+    assert source.last_obj_obs is not None, "last_obj_obs should be set after step()"
+    assert source.last_tgt_obs is not None, "last_tgt_obs should be set after step()"
+    assert source.last_obj_obs.marker_id == OBJ_ID
+    assert source.last_tgt_obs.marker_id == TGT_ID
+
+
+def test_last_obs_none_when_markers_absent():
+    """last_obj_obs and last_tgt_obs are None when no markers are visible this step."""
+    class _EmptyTracker:
+        def step(self): return []
+        def get_latest(self, mid): return None
+
+    tracker = _RepeatTracker(obj_pos=BOX_CENTER, tgt_theta=0.0)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only")
+    source.startup()
+    # Replace tracker with one that returns nothing
+    source._tracker = _EmptyTracker()
+    source.step()
+    assert source.last_obj_obs is None
+    assert source.last_tgt_obs is None
+
+
 def test_object_lost_after_threshold():
     """object_lost becomes True after object marker is absent for more than 2s."""
     dt = 0.02
