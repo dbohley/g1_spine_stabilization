@@ -17,11 +17,17 @@ Object width and depth are passed as runtime arguments — markers are used for 
 
 **Working baseline:** Robot loads cleanly into CoppeliaSim. IK solves both arms simultaneously with self-collision avoidance via tightened shoulder_roll bounds. Box is created, grasped, attached to the left hand, rotated about X by a sine-wave θ trajectory, then released. Three-phase controller: interpolate to grasp → rotate → interpolate back.
 
-The repo is a proper Python package (configs, tests, entry-point scripts). **Perception (Session 2) is complete**: AprilTag detector + frame-transform stack + hardware-free tests; `scripts/visualize_markers.py` runs in `--source realsense` and `--source mock`. **35 tests pass.**
+The repo is a proper Python package (configs, tests, entry-point scripts). **Perception (Session 2) is complete**: AprilTag detector + frame-transform stack + hardware-free tests; `scripts/visualize_markers.py` runs in `--source realsense` and `--source mock`. **51 tests pass.**
 
 **Direction shift (Session 0, SDK discovery — complete):** we are adopting the external `g1_inspire_sdk` as the hardware transport + preview + camera layer. Source-grounded analysis is in `docs/sdk_analysis.md`. The adoption is **additive** — CoppeliaSim stays as the sim of record; the SDK becomes a parallel hardware/preview path.
 
 **SDK-2 — COMPLETE** (perception re-platform): `RealSenseSource` now wraps `g1_inspire_sdk.camera.RealSenseCamera`. 6 new hardware-free tests; 35 tests pass total. `T_optical_to_d435` hand-calibrated (`rpy: [3.14159, 0.0, 1.5708]` in `configs/default.yaml`).
+
+**SDK-3+4 — COMPLETE** (IK transport + preview): `sdk_pose_tracking.py` drives `G1InspireRobot` via `arm.set_joint_targets(q14)`; `SineSource` + `MarkerSource` in `trajectory/sources.py`; `run_pose_tracking_preview.py` (3 source modes: `sine|mock|marker`, 2 tracking modes: `orient-only|6dof`) is the dry-run preview platform and the pre-flight gate before every live bringup. **51 tests pass.**
+
+**SDK-5 — COMPLETE** (grip force baseline + grasp-demo jerk fix): `GraspController` in `grip_force.py`; `scripts/grasp_demo.py` for bimanual hand-only validation. Phase 0 jerk fixed: interpolation now starts from `ik.fk(current_q)` rather than hardcoded zero-config FK positions — mirrors the Phase R pattern.
+
+**SDK-5.5 — NEXT.** Gravity compensation for Inspire hands: add measured hand mass/CoM/inertia to the Pinocchio model so `sol_tauff` carries correct feedforward torques; wire into `sdk_pose_tracking.py`. Hard gate for SDK-6 live bringup. User will supply: hand mass (kg), CoM in hand frame, inertia tensor, and hand-to-wrist transform. Plan in a Claude chat first (see Open Design Questions).
 
 **Env (manual install — complete):** the unified env is named **`g1_inspire_sdk`** and was built by hand following the SDK's README. Our repo is installed into it. SDK examples **01 (preview), 06 (live pick-and-place), and 07 (live camera)** all run successfully — the live-hardware tier (CycloneDDS + `unitree_sdk2py` + `inspire_sdkpy` + `pyrealsense2`) is proven end-to-end. Two items remain from SDK-1: run our own 29 tests in this env (regression check), and write the per-machine setup record (`docs/sdk_setup.md`). Both are handled as preflight in SDK-2; no dedicated env session is required.
 
@@ -37,9 +43,10 @@ The repo is a proper Python package (configs, tests, entry-point scripts). **Per
 - **Session 0 — COMPLETE.** Read-only SDK discovery. See `docs/sdk_analysis.md`.
 - **SDK-1 — COMPLETE (manual).** Env `g1_inspire_sdk` built by hand per the SDK README; our repo installed into it; SDK examples 01/06/07 verified (06 ran on the live robot). Test regression + setup record fold into SDK-2 preflight.
 - **SDK-2 — COMPLETE.** Perception re-platform: `RealSenseSource` now wraps `g1_inspire_sdk.camera.RealSenseCamera`; 6 new tests; 35 total. `T_optical_to_d435` hand-calibrated.
-- **SDK-3 + SDK-4 — NEXT (merged).** IK transport adapter + marker-driven source: feed `G1HandIK` output to `arm.set_joint_targets(q14)`; add `MarkerSource`; multi-mode preview script (`--source sine|marker|mock`, `--tracking orient-only|6dof`). Validates in dry-run Rerun preview; live AprilTags drive the robot arms interactively.
-- **SDK-5 = original Session 4.** Grip force from `TransportGraspController` + our acceleration policy. Prereq: weigh the Inspire hand, set `hand_mass_kg`.
-- **SDK-6 = original Session 5.** Real-robot bringup: the env already has the bindings (SDK-1); flip `dry_run=False`; **human-run** live bring-up.
+- **SDK-3 + SDK-4 — COMPLETE (merged).** IK transport adapter + marker-driven source: `sdk_pose_tracking.py` feeds `G1HandIK` output to `arm.set_joint_targets(q14)`; `MarkerSource` + `SineSource` in `trajectory/sources.py`; `run_pose_tracking_preview.py` multi-mode preview script (`--source sine|marker|mock`, `--tracking orient-only|6dof`). 51 tests total.
+- **SDK-5 — COMPLETE.** Grip force baseline: `GraspController` in `grip_force.py`; `scripts/grasp_demo.py` for bimanual hand-only validation (Phase 0 jerk fixed); `docs/ik_weight_analysis.md` IK weight/payload analysis doc.
+- **SDK-5.5 — NEXT.** Gravity compensation: add measured Inspire hand inertial properties to the Pinocchio reduced model; expose `sol_tauff` from `G1HandIK.solve_ik()` into `sdk_pose_tracking.py`; verify SDK torque feedforward channel availability in `unitree_sdk2py`. **Plan in a Claude chat before coding** (see Open Design Questions). Hard gate for SDK-6.
+- **SDK-6 = original Session 5.** Live-robot bringup: run `scripts/grasp_demo.py --no-dry-run` to validate both hands; complete the full pre-flight sequence in `run_pose_tracking_preview.py` (sine → mock → marker); then flip `dry_run=False` in `run_pose_tracking_sdk.py`. **Human-run only** — robot mounted, E-stop in reach. **Gated on SDK-5.5 completion.**
 
 ## File Structure
 
@@ -74,11 +81,11 @@ g1_spine_stabilization/
 │   │   ├── __init__.py
 │   │   ├── pose_tracking.py         # run_pose_tracking_sim, three-phase controller (CoppeliaSim)
 │   │   ├── sdk_pose_tracking.py     # added SDK-3/4; run_pose_tracking_sdk, three-phase via G1InspireRobot
-│   │   └── grip_force.py            # empty stub for SDK-5
+│   │   └── grip_force.py            # GraspController; config-driven baseline hold (SDK-5)
 │   ├── trajectory/
 │   │   ├── __init__.py
 │   │   ├── targets.py               # compute_hand_targets + constants
-│   │   └── sources.py               # sine_trajectory + MarkerSource (added SDK-3/4)
+│   │   └── sources.py               # SineSource, MarkerSource (SDK-3/4)
 │   ├── perception/                  # populated in Session 2
 │   │   ├── __init__.py
 │   │   ├── types.py                 # MarkerObservation dataclass
@@ -98,6 +105,7 @@ g1_spine_stabilization/
 ├── scripts/
 │   ├── run_pose_tracking_sim.py     # main entry point (CoppeliaSim)
 │   ├── run_pose_tracking_preview.py # added SDK-3/4; --source sine|marker|mock, --tracking orient-only|6dof
+│   ├── grasp_demo.py                # added SDK-5; bimanual hand open/close validation (--dry-run default)
 │   ├── setup_scene.py               # one-time URDF import
 │   ├── verify_ik.py                 # FK + IK self-test (no sim needed)
 │   └── visualize_markers.py         # added in Session 2; --source realsense|mock, --dry-run flag
@@ -119,6 +127,7 @@ g1_spine_stabilization/
     ├── frame_conventions.md
     ├── sdk_analysis.md              # SDK discovery notes (Session 0)
     ├── sdk_setup.md                 # per-machine env ledger (written in SDK-2 preflight)
+    ├── ik_weight_analysis.md        # IK weight/payload brainstorm doc (SDK-5; paste into Claude chat)
     └── followups.md                 # living notes from each session
 ```
 
@@ -135,6 +144,7 @@ g1_spine_stabilization/
 - **`pyrealsense2` should be lazy-imported** inside `RealSenseSource.__init__` so the perception module works on machines without it.
 - **Keep `G1HandIK`; never adopt the SDK's IK.** Drive the arm by feeding our `solve_ik` output to `arm.set_joint_targets(q14)` (identity hand-off — our joint order matches the SDK's). **Never** use `arm.set_ee_targets(...)`: it runs the SDK IK (which lacks our shoulder-roll bounds, weakens orientation 5×, retargets the EE) and double-filters.
 - **Do not import `g1_inspire_sdk._common.weighted_moving_filter`** — it pulls `matplotlib` at module top. Use our own filter.
+- **Do not attempt SDK-6 live bringup until gravity compensation is implemented (SDK-5.5).** Without hand-mass gravity compensation, wrist joints under position-only control will droop under the Inspire hand's weight, and arm behavior at the live-robot stage may be unsafe.
 
 ## External SDK (dependency, not patterns)
 
@@ -253,7 +263,7 @@ Variables:  q ∈ ℝ¹⁴
 
 **`targets.py`** holds `compute_hand_targets(box_center, box_half_width, theta)` — the geometry that turns an object pose into hand SE3 targets. Hand positions arc on a circle of radius `box_half_width` around the object center in the Y-Z plane. Orientations are `Rx(theta) @ R_BASE`.
 
-**`sources.py`** holds the drivers that produce θ over time. Currently just `sine_trajectory(t, amplitude, freq)`. Session 3 will add a marker-driven source.
+**`sources.py`** holds the drivers that produce θ over time. `SineSource` wraps `sine_trajectory(t, amplitude, freq)`. `MarkerSource` (added SDK-3/4) reads AprilTag poses from a `MarkerTracker` and supports `"orient-only"` and `"6dof"` modes.
 
 **Measured base values (from Pinocchio FK at zero config):**
 ```python
@@ -315,6 +325,8 @@ Modified from the Unitree G1 29-DOF URDF. Key modifications:
 ## Open Design Questions
 
 These are unresolved and will be decided in their respective sessions:
+
+- **Gravity compensation** (SDK-5.5): Pinocchio model currently uses zero hand mass (SDK placeholder `hand_mass_kg=0.0`). Once measured hand inertial data is available (mass, CoM in hand frame, inertia tensor, hand-to-wrist transform), the key design decisions are: (a) update `assets/g1_with_hands.urdf` with inertial properties (requires Hard Rule approval) vs. (b) set `pin.Inertia` on the relevant body in the Pinocchio model at runtime inside `G1HandIK.__init__` — option (b) avoids URDF modification and keeps the change isolated to `ik_solver.py`. Also: verify whether `unitree_sdk2py` exposes a torque feedforward DDS channel — if yes, `sol_tauff` (already computed by `solve_ik`, currently discarded in `sdk_pose_tracking.py`) can be sent directly; if no, gravity comp must be absorbed into grip-force policy or approximated via position correction. The acceleration coupling for grip force (`tau_des = tau_baseline + k_a*||a_arm||`) is closely related and should be designed in the same session. **Plan this in a Claude chat before handing to Claude Code** — paste `ik_solver.py`, `sdk_pose_tracking.py`, `grip_force.py`, the URDF hand-attachment section, and `docs/ik_weight_analysis.md` into the chat along with the measured hand properties.
 
 - **Target filtering** (SDK-3/4): how aggressively to smooth the target-marker pose to avoid IK twitching from camera noise. The IK already has output smoothing; adding input smoothing needs to be coordinated to avoid double-filtering. The SDK transport adds its own filtering stage too — see the double-filter caveat in `docs/sdk_analysis.md` (this is also why we avoid the SDK's `set_ee_targets` and `weighted_moving_filter`).
 - **Error budget**: expected end-to-end accuracy is roughly: ~2-5 mm from marker detection + calibration residual (calibration done; exact residual not yet characterized) + ~2 mm from IK round-trip floor = roughly ~5-15 mm at the EE. If the application requires tighter, the IK cost weights would need revisiting (Hard Rules).
@@ -396,10 +408,22 @@ These are unresolved and will be decided in their respective sessions:
 Run from the repo root:
 
 1. **Pinocchio FK / IK self-test:** `python scripts/verify_ik.py` — verify EE positions and IK round-trip
-2. **Unit tests:** `pytest tests/ -v` — all 35 tests pass
+2. **Unit tests:** `pytest tests/ -v` — 51 tests pass
 3. **CoppeliaSim scene setup:** `python scripts/setup_scene.py` — import URDF, visual check
 4. **Full controller:** `python scripts/run_pose_tracking_sim.py`
 5. **(Session 2+, with hardware) Marker visualizer:** `python scripts/visualize_markers.py`
+6. **Grasp demo dry-run:** `python scripts/grasp_demo.py` — validates hand control plumbing + arm IK interpolation. Run all three sides: `--side both`, `--side left`, `--side right`.
+7. **Pose tracking preview — no camera:**
+   ```
+   python scripts/run_pose_tracking_preview.py --source sine
+   python scripts/run_pose_tracking_preview.py --source mock --tracking orient-only
+   python scripts/run_pose_tracking_preview.py --source mock --tracking 6dof
+   ```
+   All three must complete without error or visible arm discontinuity in Rerun.
+8. **Pose tracking preview — live camera:**
+   `python scripts/run_pose_tracking_preview.py --source marker --tracking orient-only`
+   Run with two AprilTag markers (IDs matching `configs/default.yaml`) in the D435's field of view. Arms must respond smoothly to target marker motion. Ctrl+C to exit.
+9. **(SDK-6, human-run only, after SDK-5.5 gravity comp is complete)** Flip `dry_run=False` in `grasp_demo.py --no-dry-run` first; confirm hands actuate safely. Then run `run_pose_tracking_sdk.py` live. Robot mounted, E-stop in reach.
 
 ## When in Doubt
 
