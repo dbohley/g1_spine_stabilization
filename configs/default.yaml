@@ -38,4 +38,12 @@ perception:
   # ROS optical-frame convention: rotate -90° about Z, then -90° about X.
   d435_link_to_optical:
     xyz: [0.0, 0.0, 0.0]
-    rpy: [-1.5708, 0.0, -1.5708] # hand calibrated 
+    rpy: [-1.5708, 0.0, -1.5708] # hand calibrated
+
+grip_force:
+  tau_baseline: 0.25        # target grip force per finger (N); light hold
+  kappa: 0.05               # TransportGraspController coupling gain
+  delta_q_max: 1.0          # max additional closure beyond grasp pose (rad)
+  # Soft close — below SDK hard limits [1.47, 1.47, 1.47, 1.47, 1.2, 0.56].
+  # Order: [index_mcp, middle_mcp, ring_mcp, little_mcp, thumb_rotate, thumb_flex]
+  grasp_pose: [0.9, 0.9, 0.9, 0.9, 0.7, 0.35]

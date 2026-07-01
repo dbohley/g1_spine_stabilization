@@ -509,3 +509,182 @@ target AprilTag; Ctrl+C to exit.
 - `controllers/pose_tracking.py` (CoppeliaSim path) — untouched.
 - `detector.py`, `tracker.py`, `types.py`, `frame_sources.py` — untouched.
 - `docs/sdk_analysis.md` — untouched.
+
+## SDK-5 follow-ups (grip force baseline + IK analysis)
+
+Partial SDK-5 session: grip force controller and hand validation script delivered;
+IK weight/payload analysis written as a standalone brainstorm doc; CLAUDE.md updated
+to reflect SDK-3+4 completion and SDK-6 live-robot path.
+
+### What was built
+
+- **`g1_spine_stabilization/controllers/grip_force.py`** — `GraspController` class.
+  Wraps `TransportGraspController` from `g1_inspire_sdk._ik.force_controller`.
+  Per-hand (create one instance per side from the same config). Key methods:
+  `arm(q_measured)` — snapshots the grasp pose once fingers settle;
+  `step(force, q, dt, tau_des=None)` — runs force-feedback control, falls back to
+  `close_pose` before arming; `reset()` — clears state before re-grasping.
+  `TransportGraspController` is lazy-imported (same pattern as `pyrealsense2`) so
+  the package imports cleanly without `g1_inspire_sdk` installed.
+- **`configs/default.yaml`** — new `grip_force:` section: `tau_baseline=0.25 N`,
+  `kappa=0.05`, `delta_q_max=1.0 rad`, `grasp_pose=[0.9, 0.9, 0.9, 0.9, 0.7, 0.35]`
+  (soft close; below SDK hard limits `[1.47, 1.47, 1.47, 1.47, 1.2, 0.56]`).
+- **`scripts/grasp_demo.py`** — bimanual open → close → hold → release demo.
+  `--dry-run` (default `True`); `--no-dry-run` for live hardware (human-run only
+  with E-stop); `--hold-time N` (default 3 s); `--side {both,left,right}`.
+  Creates one `GraspController` per active hand. Hold loop calls `ctrl.step()` each
+  tick and prints per-finger force when live; dry-run verifies command plumbing only.
+- **`docs/ik_weight_analysis.md`** — self-contained analysis doc (paste into Claude
+  chat for planning). Covers: IK cost formulation, `sol_tauff` computed-but-unused,
+  hand mass in reduced model (needs verification), box payload unmodeled, impact
+  table, proposed clean-session steps, and questions to resolve before coding.
+- **`CLAUDE.md`** — patched: SDK-3+4 → COMPLETE; test count 35 → 46; SDK-5 →
+  NEXT with updated description; SDK-6 description made concrete (grasp_demo first,
+  then preview pre-flight gate, then live flip); file structure updated for new files;
+  `sources.py` note updated to reflect `SineSource` + `MarkerSource` complete.
+
+### Deviations from spec
+
+- `GraspController.step()` exposes an optional `tau_des` override parameter. This
+  is the hook for acceleration coupling (Phase 2) without requiring a subclass or
+  reimplementing the core loop.
+
+### Environment notes
+
+- `TransportGraspController` is in `g1_inspire_sdk._ik.force_controller` (private
+  subpackage, but stable — verified in SDK-0 analysis). Lazy import guard prevents
+  import errors on machines without the SDK.
+- `grasp_demo.py` passes `q_arm=_ARM_DEFAULT_Q` on every `robot.step()` call to
+  keep arms still during the hand test. Avoids accidentally sending a `None` arm
+  command that might be interpreted as "hold last" vs. "no command."
+
+### Test results
+
+```
+51 passed, 1 warning in 3.93s
+```
+No new tests added this session — `GraspController` lazy-imports the SDK, making
+hardware-free unit tests identical to the `RealSenseSource` pattern. Tests will be
+added when the dry-run mode of `GraspController` is fleshed out (currently
+`dry_run` plumbing lives in `G1InspireRobot`, not in `GraspController` itself).
+Note: the count is 51 (not 46 as the SDK-3/4 summary stated) — the actual
+test_marker_source.py had 10 tests, not the 7 cited in that entry.
+
+### Human-run smoke checks (not executed by Claude Code)
+
+```bash
+conda activate g1_inspire_sdk
+
+# Dry-run (safe, no robot):
+python scripts/grasp_demo.py
+python scripts/grasp_demo.py --side left
+python scripts/grasp_demo.py --side right
+
+# Live hardware (HUMAN-RUN ONLY, E-stop required):
+python scripts/grasp_demo.py --no-dry-run
+```
+
+### Rough edges for SDK-5 Phase 2 / SDK-6
+
+- **`hand_mass_kg` still `0.0`** in SDK `g1.yaml`. Must measure before acceleration
+  coupling is calibrated. Record in `docs/sdk_setup.md` and update if URDF changes.
+- **`sol_tauff` still discarded** in `sdk_pose_tracking.py`. No SDK feedforward
+  torque channel exists in `G1InspireRobot`. Worth checking `unitree_sdk2py` DDS
+  command types for a lower-level path before adding complexity.
+- **Acceleration coupling** (`tau_des = tau_baseline + k_a * ||a_arm||`) requires
+  an `a_arm` estimate. Best approach: finite-diff from the `WeightedMovingFilter`
+  history buffer already in `G1HandIK` — no new state needed.
+- **`G1InspireRobot(hand_side="both")`** for SDK-6: confirm this is correct for
+  simultaneous bimanual control on live hardware (irrelevant in dry-run).
+
+### Out-of-scope left for later
+
+- SDK-5 Phase 2: acceleration coupling in `GraspController`.
+- SDK-5 Phase 3: IK weight/payload changes (see `docs/ik_weight_analysis.md`).
+- SDK-6 (human-run): `grasp_demo.py --no-dry-run`, then full preview pre-flight,
+  then live `run_pose_tracking_sdk.py`.
+
+### Things not modified
+
+- `ik_solver.py`, `assets/g1_with_hands.urdf`, IK weights, EE frame defs,
+  shoulder-roll bounds — untouched.
+- `controllers/pose_tracking.py` (CoppeliaSim path) — untouched.
+- All perception modules, trajectory modules, tests — untouched.
+- `docs/sdk_analysis.md` — untouched.
+
+## SDK-5 jerk fix + live-hardware bringup planning
+
+Short follow-up session: fixed the Phase 0 jerk in `grasp_demo.py` and documented
+the pre-flight gate sequence for live hardware bringup.
+
+### What was fixed
+
+- **`scripts/grasp_demo.py` Phase 0 jerk.** Phase 0 interpolated EE targets starting
+  from `L_EE_DEFAULT`/`R_EE_DEFAULT` (FK at zero joint config) and `R_L_BASE`/`R_R_BASE`
+  orientations. After `initialize()`, the robot is at the SDK default pose — a different
+  joint configuration. The first IK command therefore targeted a position that didn't
+  match where the arm actually was, causing a visible jerk.
+- **Fix (line 209, `scripts/grasp_demo.py`):** Added `ik.fk(current_q)` call directly
+  after `_get_q(robot)` to read the actual post-`initialize()` EE pose. Phase 0 now
+  interpolates from those real positions and orientations to the grasp target. Exact
+  mirror of the Phase R pattern already in the file (which was already correct).
+- No test changes. 51 tests still pass.
+
+### Pre-flight gate for live hardware runs (SDK-6)
+
+The following sequence must all pass before any live bringup:
+
+```bash
+conda activate g1_inspire_sdk
+
+# 1. Unit tests
+pytest tests/ -v        # 51 must pass
+
+# 2. Grasp demo dry-run (validates hand control + arm IK interpolation)
+python scripts/grasp_demo.py
+python scripts/grasp_demo.py --side left
+python scripts/grasp_demo.py --side right
+
+# 3. Sine-source preview (validates arm IK + SDK transport, no camera)
+python scripts/run_pose_tracking_preview.py --source sine
+
+# 4. Mock-source preview (validates marker→IK→SDK path headlessly)
+python scripts/run_pose_tracking_preview.py --source mock --tracking orient-only
+python scripts/run_pose_tracking_preview.py --source mock --tracking 6dof
+
+# 5. Live-marker preview (validates full perception→IK→preview pipeline)
+python scripts/run_pose_tracking_preview.py --source marker --tracking orient-only
+# Move target marker in front of the D435; watch arms respond in Rerun; Ctrl+C to exit.
+```
+
+All stages must run without error or visible arm discontinuity in Rerun before
+flipping `dry_run=False` for SDK-6.
+
+### Rough edges / prerequisites before SDK-6
+
+- **Gravity compensation not implemented.** Inspire hands are non-negligible mass
+  hanging off the wrist joints. Under position-only control, IK solutions that ignore
+  hand weight will droop at the wrist. Must be implemented before live bringup.
+- **`hand_mass_kg` still `0.0`** in SDK `g1.yaml`. Needs the measured Inspire hand
+  mass before acceleration coupling or any SDK gravity-comp feature is usable.
+- **`sol_tauff` still discarded** in `sdk_pose_tracking.py`. Once hand inertial
+  properties are added to the Pinocchio model, `sol_tauff` will carry correct
+  feedforward torques — but whether the SDK transport exposes a DDS torque
+  feedforward channel needs to be verified against `unitree_sdk2py` first.
+
+### Out-of-scope left for next session (SDK-5.5)
+
+- Gravity compensation implementation. **Plan in a Claude chat before handing to
+  Claude Code.** Paste into the chat: `ik_solver.py`, `sdk_pose_tracking.py`,
+  `grip_force.py`, the URDF hand-attachment joint section, `docs/ik_weight_analysis.md`,
+  and the measured hand properties (mass, CoM in hand frame, inertia tensor,
+  hand-to-wrist transform). Key questions to resolve in chat: runtime Pinocchio
+  inertia update vs. URDF edit; SDK torque feedforward channel availability; where
+  to wire gravity comp (inside `G1HandIK` vs. `sdk_pose_tracking.py`); how to
+  estimate `a_arm` for acceleration coupling from the `WeightedMovingFilter` history.
+- SDK-6 live bringup — human-run only; gated on gravity comp completion.
+
+### Things not modified
+
+- `ik_solver.py`, tests, perception modules, trajectory modules, sim controller — untouched.
+- `docs/sdk_analysis.md`, `docs/ik_weight_analysis.md` — untouched.
