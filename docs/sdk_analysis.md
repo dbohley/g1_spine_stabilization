@@ -482,3 +482,25 @@ MotorMode.PR = 0; MotorMode.AB = 1
 - **`set_ee_targets` double-filters** — prefer `set_joint_targets` (Section E).
 - **`hand_mass_kg = 0.0` is a TODO** — measure before trusting force estimates
   (Section D).
+
+---
+
+## SDK-5.5 findings: tau feedforward channel (gravity compensation)
+
+**Confirmed in `g1_arm.py`:** `G1Arm.set_joint_targets(q14, tau_ff14=None)` accepts
+an optional 14-vector of feedforward torques. When `None`, defaults to zeros (pure PD
+hold). The live publisher loop reads `_tauff_target` and writes it directly to
+`motor_cmd.tau` in the DDS `LowCmd` message — the motor controller applies
+`τ = τ_ff + kp·(q_des − q) + kd·(0 − dq)`.
+
+**No SDK-internal arm gravity compensation exists** — the position control path sends
+`tau=0` by default. No double-compensation risk.
+
+**`G1InspireRobot.step()` does NOT forward tau** — its `q_arm` branch calls
+`self.arm.set_joint_targets(q_arm)` without a tau argument. SDK class, cannot be
+modified. SDK-5.5 bypasses `robot.step()` and calls `robot.arm.set_joint_targets(sol_q, tau)`
+directly for the arm, which is already the intended call pattern per Hard Rules
+("drive the arm by feeding our solve_ik output to arm.set_joint_targets(q14)").
+
+**ArmAdmittance and `hand_mass_kg`** exist in the SDK for a separate admittance
+control path that we do not use. These do not affect our position control flow.

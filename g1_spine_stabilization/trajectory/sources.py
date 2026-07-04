@@ -243,3 +243,72 @@ class MarkerSource:
     def object_lost(self) -> bool:
         """True if object marker has not been seen for more than 2s during tracking."""
         return self._object_stale_frames * self._control_dt > 2.0
+
+
+class RateLimitedSource:
+    """Slew-rate-limits (box_center, theta) from any wrapped trajectory source.
+
+    Clamped against the ACTUAL measured wall-clock dt between step() calls
+    (not the assumed control_dt). The control loop's true period is set by
+    IK solve cost (~90-180ms measured), not control_dt (0.02s/50Hz), so a
+    source sampling a real-time signal (SineSource's sine, or a live/mock
+    marker's rotation) produces per-step deltas much larger than a properly
+    -paced loop would, which IK's warm start then chases abruptly. This
+    decouples "how fast the commanded target is allowed to move" from "how
+    slowly the control loop happens to actually run" -- a slew-rate-limiter
+    on the INPUT target, architecturally distinct from G1HandIK's
+    WeightedMovingFilter (a moving average on the IK's OUTPUT), so the two
+    do not double-filter.
+
+    Duck-types the same .startup()/.step() contract as SineSource/MarkerSource,
+    so it wraps either uniformly. Unknown attributes (e.g. MarkerSource's
+    last_obj_obs/object_lost/target_stale_seconds) are proxied to the
+    wrapped source via __getattr__.
+    """
+
+    def __init__(self, inner, max_theta_rate, max_pos_rate, clock=time.monotonic):
+        self._inner = inner
+        self._max_theta_rate = float(max_theta_rate)  # rad/s
+        self._max_pos_rate = float(max_pos_rate)       # m/s
+        self._clock = clock
+        self._last_t = None
+        self._last_box_center = None
+        self._last_theta = None
+
+    def startup(self, *args, **kwargs):
+        box_center = self._inner.startup(*args, **kwargs)
+        self._last_t = None  # next step() is always unclamped (fresh seed)
+        return box_center
+
+    def step(self) -> tuple:
+        box_center, theta = self._inner.step()
+        box_center = np.asarray(box_center, dtype=float)
+        theta = float(theta)
+        now = self._clock()
+
+        if self._last_t is None:
+            self._last_box_center = box_center.copy()
+            self._last_theta = theta
+            self._last_t = now
+            return box_center.copy(), theta
+
+        dt = max(now - self._last_t, 1e-6)
+        self._last_t = now
+
+        dtheta = theta - self._last_theta
+        max_dtheta = self._max_theta_rate * dt
+        if abs(dtheta) > max_dtheta:
+            dtheta = math.copysign(max_dtheta, dtheta)
+        self._last_theta = self._last_theta + dtheta
+
+        delta = box_center - self._last_box_center
+        dist = np.linalg.norm(delta)
+        max_dist = self._max_pos_rate * dt
+        if dist > max_dist and dist > 0.0:
+            delta = delta * (max_dist / dist)
+        self._last_box_center = self._last_box_center + delta
+
+        return self._last_box_center.copy(), self._last_theta
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)

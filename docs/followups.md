@@ -688,3 +688,227 @@ flipping `dry_run=False` for SDK-6.
 
 - `ik_solver.py`, tests, perception modules, trajectory modules, sim controller — untouched.
 - `docs/sdk_analysis.md`, `docs/ik_weight_analysis.md` — untouched.
+
+---
+
+## SDK-5.5 follow-ups
+
+### What was done
+
+Gravity compensation for the Inspire RH56 hands: runtime Pinocchio inertia
+correction + tau feedforward wiring.
+
+**Files changed:**
+- `configs/default.yaml` — added `gravity_comp.enabled: true`
+- `g1_spine_stabilization/kinematics/ik_solver.py` — module-level constants
+  (`INSPIRE_HAND_MASS=1.0`, wrist/hand URDF inertia constants), `_make_composite_wrist_inertia()`
+  helper, `gravity_comp_enabled` parameter in `G1HandIK.__init__`, `_apply_hand_inertia_correction()`
+  method inserted before CasADi graph compilation
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` — all 3 phase loops
+  now capture `sol_tauff`; `robot.step(q_arm=sol_q)` replaced with
+  `robot.arm.set_joint_targets(sol_q, sol_tauff)` (SDK tau feedforward channel);
+  Phase 2 logs `tauff/` scalars to Rerun
+- `scripts/run_pose_tracking_preview.py` — passes `gravity_comp_enabled` from cfg to IK
+- `tests/test_gravity_comp.py` — 5 new hardware-free tests (56 total)
+- `docs/sdk_analysis.md`, `docs/ik_weight_analysis.md` — updated
+
+**Key findings:**
+- URDF hand_base_link is 0.141 kg; real Inspire RH56 is **1.0 kg** (scale measurement)
+- `G1Arm.set_joint_targets(q14, tau_ff14=None)` already existed; SDK sends tau=0 by default (no SDK internal gravity comp)
+- `G1InspireRobot.step()` doesn't forward tau — we bypass to `robot.arm.set_joint_targets()` directly
+- Inertia correction confirmed by potential-energy gradient cross-check (Test 2)
+
+### Out of scope for SDK-5.5
+
+- Acceleration coupling (`tau_des = tau_baseline + k_a*||a_arm||`) for grip force — deferred
+- SDK-6 live bringup — human-run only; gated on gravity comp
+
+### Things not modified
+
+- `assets/g1_with_hands.urdf` — runtime correction, no URDF change needed
+- `~/g1_inspire_sdk` — SDK not modified
+- EE frame defs, shoulder_roll bounds, IK cost weights — unchanged
+
+## SDK-6-safety follow-ups
+
+### What was done
+
+Guaranteed safe shutdown phase-out, plus live-mode capability for
+`run_pose_tracking_preview.py`. Trigger: reports that `grasp_demo.py`'s arms
+fell to the table more aggressively at the end of a run than the vendored
+SDK's own example scripts.
+
+**Files changed:**
+- `g1_spine_stabilization/controllers/grasp_sequence.py` — new file. Moved
+  `grasp_demo.py`'s Phase 0/A/B/C/D/R logic into `run_grasp_phases(...)`,
+  restructured so Phase D (hand release) and Phase R (arm return-to-default)
+  always run — even after Ctrl-C/exceptions during Phase 0/A/B/C — followed
+  by a settle pause before returning. Re-raises the first exception
+  encountered after cleanup, so failures are never silently swallowed.
+- `scripts/grasp_demo.py` — reduced to a thin wrapper: arg parsing, config/IK
+  load, robot lifecycle, and a single call to `run_grasp_phases(...)`.
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` — Phase 1
+  (interpolate to grasp) now catches `KeyboardInterrupt` and falls through to
+  Phase 3, mirroring Phase 2's existing precedent. Phase 3 ends with a settle
+  pause (`time.sleep(settle_time)`) before returning to the caller.
+- `scripts/run_pose_tracking_preview.py` — added `--net`, `--dry-run`,
+  `--no-dry-run` flags (mirroring `grasp_demo.py`'s convention) plus the same
+  human confirmation gate, so `mock`/`marker` sources can now actually be run
+  live. Also closes `frame_source` in the `finally` block for `--source
+  marker` (was previously never closed on any exit path).
+- `configs/default.yaml` — added `shutdown.settle_time: 0.4`.
+- `tests/test_grasp_demo_safety.py` — new file, 4 hardware-free tests
+  (baseline completion, fault-during-hold recovery, KeyboardInterrupt-during-
+  Phase-0 recovery, config key present).
+- `tests/test_sdk_transport.py` — 2 new tests (settle pause doesn't hang,
+  Phase 1 KeyboardInterrupt falls through to Phase 3). 62 tests total.
+- `CLAUDE.md` — Current Status, Session Roadmap, File Structure, Standard
+  Verification Workflow step 9 updated; corrected stale references to a
+  `run_pose_tracking_sdk.py` file that was never built.
+
+**Key findings:**
+- Root cause: `grasp_demo.py`'s `main()` had no `except` clause at all — any
+  fault during the grasp/hold phases skipped hand-release and arm-return
+  entirely, jumping straight from an actively-loaded grasp pose into the
+  SDK's fixed damping cutoff.
+- The SDK's own damping command (`G1Arm.shutdown()` → `create_damping_cmd`:
+  `kp=0, kd=8, tau=0`, sent once) is fixed and cannot be changed (vendored
+  SDK, git-pull-only). All of the SDK's own live examples (03/04/05/06)
+  already follow `try: <motion> finally: robot.shutdown()`, matching our
+  scripts' existing top-level structure — the gap was specifically the
+  missing safe-return guarantee inside that structure, not the shutdown
+  mechanism itself.
+- Verified directly in `~/g1_inspire_sdk/g1_inspire_sdk/g1_arm.py`: the 250 Hz
+  publisher thread continuously re-publishes whatever was last passed to
+  `set_joint_targets()` until `stop_streaming()` runs (only reachable via
+  `robot.shutdown()`). So the settle pause needs no repeated command loop —
+  a plain `time.sleep()` holds the arm (with gravity-comp tau feedforward)
+  for free.
+- `G1Arm`/`InspireHand` raise `ValueError` if `dry_run=False` and
+  `network_interface is None` — adding `--no-dry-run` to
+  `run_pose_tracking_preview.py` therefore also required adding `--net`.
+- `scripts/` is excluded from packaging (`setup.py`), so `grasp_demo.py`'s
+  phase logic wasn't testable in place — moved to `controllers/` to match
+  the pattern `sdk_pose_tracking.py` already established.
+
+### Out of scope for SDK-6-safety
+
+- No new "rest pose" with lower gravity torque was designed — Phase R still
+  returns to the existing standing-default pose. The settle pause only
+  guarantees the arm is stationary and gravity-comp-supported immediately
+  before the SDK's fixed damping cutoff, not that the cutoff itself is gentler.
+- No gradual tau-feedforward ramp-down was implemented (deliberately, per
+  user decision — minimal fix scope).
+- SDK-6 live bringup itself — still human-run only.
+
+### Things not modified
+
+- `~/g1_inspire_sdk` — SDK not modified.
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights — unchanged.
+- `docs/gravity_comp_reference.md` — no change needed; the settle pause
+  relies on the already-correctly-routed last `set_joint_targets()` call.
+
+## SDK-6 jerk/smoothness fixes follow-ups
+
+### What was done
+
+First-ever live hardware test (`python scripts/run_pose_tracking_preview.py
+--source mock --tracking 6dof --no-dry-run --net enx6c6e072d3ca1`) surfaced
+two distinct problems: (1) a violent jerk right after startup settles, before
+the arms converge on the mock object, and (2) visibly jumpy/jerky motion
+during tracking, traced to the mock marker "moving in big jumps." Both are
+fixed.
+
+**Files changed:**
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` — Phase 1 now
+  reads `ik.fk(current_q)` right after `current_q = _get_q(robot)` and
+  interpolates from that actual current pose to the grasp target, instead of
+  the hardcoded `L_EE_DEFAULT`/`R_EE_DEFAULT` constants. Mirrors Phase 3's
+  existing pattern in the same file, and the identical fix already applied
+  to `grasp_sequence.py`'s Phase 0 during SDK-5 (see "SDK-5 jerk fix" above)
+  — that fix was simply never ported to this file until now.
+- `g1_spine_stabilization/trajectory/sources.py` — new `RateLimitedSource`
+  class: slew-rate-limits `(box_center, theta)` from any wrapped source
+  (`SineSource`/`MarkerSource`), clamped against the ACTUAL measured
+  wall-clock dt between `.step()` calls (via an injectable `clock`
+  parameter, default `time.monotonic`), not the assumed `control_dt`.
+  Duck-types the same `.startup()`/`.step()` contract; proxies unknown
+  attributes (`object_lost`, `last_obj_obs`, etc.) via `__getattr__`.
+- `configs/default.yaml` — new `trajectory.rate_limit` block
+  (`enabled`, `max_theta_rate_deg_s: 60.0`, `max_pos_rate_m_s: 0.3`);
+  `trajectory.sine.frequency` lowered `0.3` → `0.1` Hz (amplitude unchanged);
+  comment added to `control.dt` cross-referencing the timing finding below.
+- `scripts/run_pose_tracking_preview.py` — wraps `source` in
+  `RateLimitedSource` (config-gated, default on) uniformly across all three
+  `--source` modes, right after source construction and before
+  `robot.connect()`.
+- `tests/test_sdk_transport.py` — new regression test
+  (`test_pose_tracking_sdk_phase1_starts_from_actual_current_pose`) proving
+  Phase 1's first IK target equals `ik.fk(fake_q)`, not `L_EE_DEFAULT`; fails
+  on the old code, passes now.
+- `tests/test_rate_limited_source.py` — new file, 9 hardware-free tests
+  (pass-through when under the limit, clamp when over — both theta and
+  box_center with direction preservation, first-call-unclamped,
+  measured-dt-not-assumed-dt, `__getattr__` proxying, `startup()` reseeding).
+  72 tests total.
+- `CLAUDE.md` — new "Known timing floor" note in the IK Solver section;
+  "Target filtering" Open Design Question de-duplicated (was accidentally
+  repeated verbatim) and moved to "Resolved"; Current Status, Session
+  Roadmap, File Structure updated.
+
+**Key findings:**
+- Root cause 1 (startup jerk): exact same bug class as the already-fixed
+  "SDK-5 jerk fix" (see above) — hardcoded interpolation start instead of
+  the real current pose — just present in a second file (`sdk_pose_tracking.py`
+  Phase 1) that never got the fix ported to it.
+- Root cause 2 (jerky tracking), measured directly: `ik.solve_ik()` costs
+  ~100ms/call (`n=55 mean=104.30ms median=100.89ms min=67.97ms max=161.97ms`,
+  measured running the real code path in the `g1_inspire_sdk` env). Against
+  the assumed `control_dt=0.02s` (50Hz) with an unconditional
+  `time.sleep(control_dt)` (no compute-time compensation anywhere in the
+  repo), the real Phase-2 loop rate is ~6-10Hz. `SineSource`/the mock both
+  sample a real-time sine (`theta = amplitude*sin(2*pi*freq*(monotonic()-t0))`)
+  — correct math, but each `.step()` call samples across a ~90-180ms gap
+  instead of ~20ms, producing per-step deltas 5-9x bigger than intended,
+  which IK's warm-started solve then chases abruptly.
+- Confirmed this is not 6dof-specific: the mock's target marker position
+  never moves in `_AnimatedMockTracker` (only its rotation does), so the
+  jumpiness is purely rotational and would equally affect `--tracking
+  orient-only` or a real live marker feed (a human moving a real marker
+  "smoothly" would still get chopped into big jumps by a 6-10Hz effective
+  loop rate).
+- Confirmed the existing smoothing stack before this fix: only the IK's own
+  output-side 4-tap `WeightedMovingFilter` (on `sol_q`, after the solve) and
+  the SDK's joint-level velocity clip (`G1Arm._clip_to_velocity_limit`,
+  20-30 rad/s in the 250Hz publisher thread) — nothing touched the target
+  *before* the solve. `RateLimitedSource` is architecturally distinct from
+  both (a rate limit on the input vs. a moving average on the output), so it
+  resolves the "double-filtering" concern rather than adding to it.
+- Phase 1/3's `smoothstep(i / steps_interp)` ramp is indexed by iteration
+  count, not wall-clock time, so the slow-loop mechanism above does NOT
+  affect those phases' jerkiness — only their total real-world duration
+  (they just take longer than `interpolation_time` when the loop is slow).
+
+### Out of scope for this fix (deliberate, per user decision)
+
+- Speeding up `ik.solve_ik()` itself (IPOPT `max_iter`/tolerances) — the
+  measured ~100ms/call cost is documented, not addressed. This touches core
+  IK solver behavior with a documented ~1.8mm regularization floor and 5mm
+  round-trip test tolerance; any change needs its own careful validation
+  pass, deferred to a separate future effort.
+- Tuning `max_theta_rate_deg_s`/`max_pos_rate_m_s` against real marker
+  motion data — no real AprilTag marker speed measurement exists yet;
+  current defaults are reasoned placeholders (see comments in
+  `configs/default.yaml`).
+- Live re-test on hardware to confirm the fix — human-run only.
+
+### Things not modified
+
+- `~/g1_inspire_sdk` — SDK not modified.
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights, IPOPT solver settings — unchanged.
+- `g1_spine_stabilization/trajectory/targets.py` (`compute_hand_targets`) —
+  left as pure stateless geometry; rate limiting lives one layer up, in the
+  source wrapper, specifically to avoid injecting state into this function.
+

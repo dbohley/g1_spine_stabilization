@@ -191,3 +191,15 @@ If the robot visibly sags under load during live bringup, the options are:
 | `sol_tauff` never sent | No gravity feedforward to motors | Low — SDK motor ctrl compensates |
 | IK cost has no force terms | Position accuracy unaffected under load | Low until load increases |
 | `hand_mass_kg = 0.0` in SDK config | Admittance gravity subtraction biased | Not in our code path yet (no ArmAdmittance used) |
+
+---
+
+## SDK-5.5 resolution
+
+**Hand mass in Pinocchio:** URDF has `hand_base_link` at 0.141 kg (plus fingers ~0.05 kg, total ~0.28 kg lumped into `wrist_yaw` body after buildReducedModel). Real measured mass of Inspire RH56 = **1.0 kg** (scale measurement). Under-model factor ~3.6×.
+
+**Fix chosen:** Runtime Pinocchio inertia correction in `G1HandIK.__init__()` (option B from CLAUDE.md design question). No URDF modification. After `buildReducedRobot`, overwrite `reduced.model.inertias[wrist_yaw_id]` with bare wrist (0.085 kg, URDF) + 1.0 kg hand (URDF COM/inertia shape, mass scaled to 1.0 kg). Gated behind `gravity_comp.enabled` config flag.
+
+**`sol_tauff` wiring:** `G1Arm.set_joint_targets(q14, tau_ff14=None)` exists and writes directly to `motor_cmd.tau`. SDK sends tau=0 by default (no internal gravity comp). We now call `robot.arm.set_joint_targets(sol_q, sol_tauff)` directly (bypassing `robot.step()` which doesn't forward tau).
+
+**`sol_tauff` never sent** row is now resolved: gravity comp is active.

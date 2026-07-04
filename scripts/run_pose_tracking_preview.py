@@ -17,9 +17,10 @@ Tracking (--tracking, for marker/mock only):
                            theta tracks target marker X-rotation.
   6dof         — box center also tracks target marker translation.
 
-SAFETY NOTE: This script runs with dry_run=True. Live robot: set dry_run=False
-— that is SDK-6 and must be run by a human with the robot mounted and E-stop
-in reach.
+SAFETY NOTE: Defaults to dry_run=True (safe, no hardware). Pass --no-dry-run
+for live-robot mode — that is SDK-6 and must be run by a human with the robot
+mounted and E-stop in reach. Live mode prints a confirmation gate before
+connecting; Ctrl-C at the prompt aborts safely.
 """
 import argparse
 import math
@@ -43,7 +44,7 @@ from g1_spine_stabilization.perception.frames import (
 from g1_spine_stabilization.perception.tracker import MarkerTracker
 from g1_spine_stabilization.perception.types import MarkerObservation
 from g1_spine_stabilization.trajectory.targets import L_EE_DEFAULT
-from g1_spine_stabilization.trajectory.sources import SineSource, MarkerSource
+from g1_spine_stabilization.trajectory.sources import SineSource, MarkerSource, RateLimitedSource
 from g1_spine_stabilization.controllers.sdk_pose_tracking import run_pose_tracking_sdk
 from g1_spine_stabilization.utils.config import load_config
 
@@ -155,6 +156,18 @@ def main():
         "--detect", action="store_true",
         help="Scan for AprilTag IDs for ~5s and exit (requires --source marker)",
     )
+    parser.add_argument(
+        "--net", default="eth0",
+        help="DDS network interface (e.g. eth0). Ignored in dry-run.",
+    )
+    parser.add_argument(
+        "--dry-run", dest="dry_run", action="store_true", default=True,
+        help="Simulate commands without connecting to hardware (default: True)",
+    )
+    parser.add_argument(
+        "--no-dry-run", dest="dry_run", action="store_false",
+        help="Connect to live hardware (HUMAN-RUN ONLY; E-stop required)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -175,11 +188,21 @@ def main():
         _run_detect(perception, obj_id, tgt_id)
         return
 
+    if not args.dry_run:
+        print("[preview] WARNING: live mode selected.")
+        print("[preview]   - Robot must be mounted and powered")
+        print("[preview]   - E-stop must be in reach")
+        print("[preview]   - initialize() will move arms to default pose")
+        if args.source == "marker":
+            print("[preview]   - Live camera + AprilTag tracking will drive the arms in real time")
+        input("[preview] Press Enter to continue (Ctrl-C to abort)...")
+
     # -------------------------------------------------------------------
     # Load IK (reused for the controller AND d435_to_pelvis computation)
     # -------------------------------------------------------------------
     print("[preview] Loading IK solver…")
-    ik = G1HandIK()
+    gravity_comp_enabled = cfg.get("gravity_comp", {}).get("enabled", True)
+    ik = G1HandIK(gravity_comp_enabled=gravity_comp_enabled)
 
     # Default box center in pelvis frame (same as run_pose_tracking_sim)
     box_size = list(cfg["box"]["size"])
@@ -198,7 +221,8 @@ def main():
     preview = RerunPreview(spawn=True)
 
     robot = G1InspireRobot(
-        dry_run=True,
+        network_interface=args.net,
+        dry_run=args.dry_run,
         arm_side="both",
         hand_side="both",
         preview=preview,
@@ -253,7 +277,23 @@ def main():
         duration = float("inf")   # run until Ctrl+C
         # cam_for_preview stays None: RealSenseSource.read() auto-pushes frames via the SDK
 
-    print("[preview] Connecting robot (dry_run=True)…")
+    # -------------------------------------------------------------------
+    # Rate-limit the trajectory source (uniform across sine/mock/marker).
+    # See configs/default.yaml: trajectory.rate_limit.
+    # -------------------------------------------------------------------
+    rate_limit_cfg = cfg.get("trajectory", {}).get("rate_limit", {})
+    if rate_limit_cfg.get("enabled", True):
+        max_theta_rate_deg_s = rate_limit_cfg.get("max_theta_rate_deg_s", 60.0)
+        max_pos_rate_m_s = rate_limit_cfg.get("max_pos_rate_m_s", 0.3)
+        source = RateLimitedSource(
+            source,
+            max_theta_rate=math.radians(max_theta_rate_deg_s),
+            max_pos_rate=max_pos_rate_m_s,
+        )
+        print(f"[preview] Rate limiter enabled: {max_theta_rate_deg_s:.1f} deg/s, "
+              f"{max_pos_rate_m_s:.2f} m/s")
+
+    print(f"[preview] Connecting robot (dry_run={args.dry_run})…")
     robot.connect()
     robot.initialize()
     robot.start_streaming()
@@ -266,6 +306,8 @@ def main():
         robot.shutdown()
         if cam_for_preview is not None:
             cam_for_preview.shutdown()
+        if args.source == "marker":
+            frame_source.close()
         print("[preview] Shutdown complete.")
 
 

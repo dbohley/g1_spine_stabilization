@@ -132,6 +132,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     interpolation_time = cfg["control"]["interpolation_time"]
     if duration is None:
         duration = cfg["control"]["rotation_duration"]
+    gravity_comp_enabled = cfg.get("gravity_comp", {}).get("enabled", True)
 
     # ---------------------------------------------------------------
     # Source startup — detect object marker or initialise sine timer
@@ -150,55 +151,30 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     steps_interp = int(interpolation_time / control_dt)
 
     current_q = _get_q(robot)
+    L_current_pose, R_current_pose = ik.fk(current_q)
+    L_start_pos = L_current_pose.translation.copy()
+    R_start_pos = R_current_pose.translation.copy()
+    L_start_rot = L_current_pose.rotation.copy()
+    R_start_rot = R_current_pose.rotation.copy()
+
     _last_log_t = time.monotonic() - 1.0  # fire on first step
-    for i in range(steps_interp):
-        alpha = smoothstep(i / steps_interp)
-
-        L_pos = (1 - alpha) * L_EE_DEFAULT + alpha * L_grasp[:3, 3]
-        R_pos = (1 - alpha) * R_EE_DEFAULT + alpha * R_grasp[:3, 3]
-        L_R   = slerp_rotation(R_L_BASE, L_grasp[:3, :3], alpha)
-        R_R   = slerp_rotation(R_R_BASE, R_grasp[:3, :3], alpha)
-
-        current_dq = np.zeros(14)
-        sol_q, _ = ik.solve_ik(
-            make_se3(L_pos, L_R),
-            make_se3(R_pos, R_R),
-            current_q, current_dq,
-        )
-        robot.step(q_arm=sol_q)
-        current_q = sol_q
-        if cam_for_preview is not None:
-            cam_for_preview.capture()
-        time.sleep(control_dt)
-
-        if time.monotonic() - _last_log_t >= 1.0:
-            _last_log_t = time.monotonic()
-            print(f"  {alpha * 100:.0f}%")
-
-    print("[SDKController] At grasp pose.")
-
-    # ---------------------------------------------------------------
-    # Phase 2: Track target
-    # ---------------------------------------------------------------
-    print(f"[SDKController] Phase 2: tracking target (duration={duration}s)…")
-    t_start = time.monotonic()
-    _last_log_t = t_start - 1.0   # fire on first step
-    _obj_lost_warned = False
+    _phase1_interrupted = False
     try:
-        while True:
-            elapsed = time.monotonic() - t_start
-            if elapsed >= duration:
-                break
+        for i in range(steps_interp):
+            alpha = smoothstep(i / steps_interp)
 
-            box_center, theta = source.step()
-            if getattr(source, 'object_lost', False) and not _obj_lost_warned:
-                print("[SDKController] WARNING: object marker lost — box may have fallen! (SDK-6: stop here)")
-                _obj_lost_warned = True
-            L_target, R_target = compute_hand_targets(box_center, box_half_width, theta)
+            L_pos = (1 - alpha) * L_start_pos + alpha * L_grasp[:3, 3]
+            R_pos = (1 - alpha) * R_start_pos + alpha * R_grasp[:3, 3]
+            L_R   = slerp_rotation(L_start_rot, L_grasp[:3, :3], alpha)
+            R_R   = slerp_rotation(R_start_rot, R_grasp[:3, :3], alpha)
 
             current_dq = np.zeros(14)
-            sol_q, _ = ik.solve_ik(L_target, R_target, current_q, current_dq)
-            robot.step(q_arm=sol_q)
+            sol_q, sol_tauff = ik.solve_ik(
+                make_se3(L_pos, L_R),
+                make_se3(R_pos, R_R),
+                current_q, current_dq,
+            )
+            robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
             current_q = sol_q
             if cam_for_preview is not None:
                 cam_for_preview.capture()
@@ -206,10 +182,57 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
 
             if time.monotonic() - _last_log_t >= 1.0:
                 _last_log_t = time.monotonic()
-                _log_marker_info(source, theta, elapsed, preview)
-
+                print(f"  {alpha * 100:.0f}%")
     except KeyboardInterrupt:
-        print("\n[SDKController] KeyboardInterrupt — exiting Phase 2.")
+        _phase1_interrupted = True
+        print("\n[SDKController] KeyboardInterrupt — exiting Phase 1 "
+              "(skipping Phase 2, returning to default).")
+
+    if not _phase1_interrupted:
+        print("[SDKController] At grasp pose.")
+
+        # ---------------------------------------------------------------
+        # Phase 2: Track target
+        # ---------------------------------------------------------------
+        print(f"[SDKController] Phase 2: tracking target (duration={duration}s)…")
+        t_start = time.monotonic()
+        _last_log_t = t_start - 1.0   # fire on first step
+        _obj_lost_warned = False
+        try:
+            while True:
+                elapsed = time.monotonic() - t_start
+                if elapsed >= duration:
+                    break
+
+                box_center, theta = source.step()
+                if getattr(source, 'object_lost', False) and not _obj_lost_warned:
+                    print("[SDKController] WARNING: object marker lost — box may have fallen! (SDK-6: stop here)")
+                    _obj_lost_warned = True
+                L_target, R_target = compute_hand_targets(box_center, box_half_width, theta)
+
+                current_dq = np.zeros(14)
+                sol_q, sol_tauff = ik.solve_ik(L_target, R_target, current_q, current_dq)
+                robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
+                current_q = sol_q
+                if cam_for_preview is not None:
+                    cam_for_preview.capture()
+                time.sleep(control_dt)
+
+                if time.monotonic() - _last_log_t >= 1.0:
+                    _last_log_t = time.monotonic()
+                    _log_marker_info(source, theta, elapsed, preview)
+                    if _HAS_RERUN and gravity_comp_enabled:
+                        _TAUFF_JOINT_NAMES = [
+                            "L_shoulder_pitch", "L_shoulder_roll", "L_shoulder_yaw", "L_elbow",
+                            "L_wrist_roll", "L_wrist_pitch", "L_wrist_yaw",
+                            "R_shoulder_pitch", "R_shoulder_roll", "R_shoulder_yaw", "R_elbow",
+                            "R_wrist_roll", "R_wrist_pitch", "R_wrist_yaw",
+                        ]
+                        for _i, _n in enumerate(_TAUFF_JOINT_NAMES):
+                            rr.log(f"tauff/{_n}", rr.Scalars(float(sol_tauff[_i])))
+
+        except KeyboardInterrupt:
+            print("\n[SDKController] KeyboardInterrupt — exiting Phase 2.")
 
     # ---------------------------------------------------------------
     # Phase 3: Return to default pose
@@ -233,12 +256,12 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         R_R   = slerp_rotation(R_start_rot, R_R_BASE, alpha)
 
         current_dq = np.zeros(14)
-        sol_q, _ = ik.solve_ik(
+        sol_q, sol_tauff = ik.solve_ik(
             make_se3(L_pos, L_R),
             make_se3(R_pos, R_R),
             current_q, current_dq,
         )
-        robot.step(q_arm=sol_q)
+        robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
         current_q = sol_q
         if cam_for_preview is not None:
             cam_for_preview.capture()
@@ -248,4 +271,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
             _last_log_t = time.monotonic()
             print(f"  {alpha * 100:.0f}%")
 
+    settle_time = cfg.get("shutdown", {}).get("settle_time", 0.4)
+    print(f"[SDKController] Settling for {settle_time:.2f}s before shutdown...")
+    time.sleep(settle_time)
     print("[SDKController] Done.")

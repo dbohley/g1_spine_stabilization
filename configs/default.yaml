@@ -1,4 +1,9 @@
 control:
+  # dt=0.02 (50Hz) is the configured control-period assumption; measured
+  # Phase-2 loop rate is ~6-10Hz because ik.solve_ik() costs ~100ms/call
+  # (CasADi/IPOPT re-solve from warm start), uncompensated (time.sleep(dt) is
+  # unconditional). See docs/followups.md for the measurement and
+  # trajectory.rate_limit below for the mitigation.
   dt: 0.02
   interpolation_time: 3.0
   rotation_duration: 10.0
@@ -6,7 +11,17 @@ control:
 trajectory:
   sine:
     amplitude: 0.524    # ~30 degrees
-    frequency: 0.3      # Hz
+    frequency: 0.1      # Hz — slowed from 0.3 per live-test feedback
+  rate_limit:
+    enabled: true
+    # >6x the sine's own peak angular rate (0.524*2*pi*0.1 ~= 0.33 rad/s ~= 18.8 deg/s)
+    # so it never clips the intended test signal's own shape -- it only engages
+    # on jumps inflated by the actual ~6-10Hz (not 50Hz) loop rate. See
+    # docs/followups.md for the measured IK solve cost behind that gap.
+    max_theta_rate_deg_s: 60.0
+    # 6dof-mode only (box_center tracking). No measurement of real hand-held
+    # marker motion speed exists yet -- starting placeholder, tune with real data.
+    max_pos_rate_m_s: 0.3
 
 box:
   size: [0.16, 0.16, 0.16]
@@ -39,6 +54,16 @@ perception:
   d435_link_to_optical:
     xyz: [0.0, 0.0, 0.0]
     rpy: [-1.5708, 0.0, -1.5708] # hand calibrated
+
+gravity_comp:
+  enabled: true  # Runtime Pinocchio inertia correction for 1.0 kg Inspire hands
+
+shutdown:
+  # Seconds to hold the final pose (arm held via the SDK's 250 Hz publisher
+  # thread re-publishing the last set_joint_targets call) immediately before
+  # robot.shutdown() sends the SDK's one-shot damping command (kp=0, kd=8,
+  # tau=0). Used by grasp_demo.py (Phase R) and sdk_pose_tracking.py (Phase 3).
+  settle_time: 0.4
 
 grip_force:
   tau_baseline: 0.25        # target grip force per finger (N); light hold
