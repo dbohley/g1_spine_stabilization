@@ -101,7 +101,12 @@ def main() -> None:
     # Load IK before connect/initialize so the cold-start delay (~10s) doesn't
     # create a gap inside the live control loop.
     print("[grasp_demo] Loading IK solver (may take ~10s on cold start)...")
-    ik = G1HandIK(gravity_comp_enabled=gravity_comp_enabled)
+    tauff_filter_cfg = cfg.get("gravity_comp", {}).get("tauff_filter", {})
+    ik = G1HandIK(
+        gravity_comp_enabled=gravity_comp_enabled,
+        tauff_filter_enabled=tauff_filter_cfg.get("enabled", True),
+        tauff_filter_alpha=tauff_filter_cfg.get("alpha", 0.3),
+    )
 
     robot = G1InspireRobot(
         network_interface=args.net,

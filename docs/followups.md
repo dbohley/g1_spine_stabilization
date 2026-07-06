@@ -912,3 +912,137 @@ fixed.
   left as pure stateless geometry; rate limiting lives one layer up, in the
   source wrapper, specifically to avoid injecting state into this function.
 
+## SDK-6 pre-bringup hardening follow-ups
+
+### What was done
+
+User asked for a deeper analysis of remaining jerk/jitter causes beyond the
+previous fix, and specifically how the pipeline changes once it moves from
+the mock source to real AprilTag markers. Three parallel research agents
+plus direct verification found five new issues; the user separately caught
+a sixth (a leftover test edit to the modeled hand mass). All six addressed
+except one (GIL contention), documented and deliberately deferred.
+
+**Files changed:**
+- `g1_spine_stabilization/kinematics/ik_solver.py`:
+  - `INSPIRE_HAND_MASS` reverted from `1.6` (leftover local test edit) back
+    to `1.0` kg (the measured value documented everywhere else, including
+    this same file's own docstrings, which never got updated to match the
+    `1.6` value).
+  - `WeightedMovingFilter.add_data()` fixed: `zip(self.weights, self.queue)`
+    → `zip(self.weights, reversed(self.queue))`. `self.queue` is FIFO
+    (oldest at index 0); the old code paired the largest weight (0.4) with
+    the *oldest* sample instead of the newest.
+  - New `ExponentialMovingAverageFilter` class (single-pole EMA), and a new
+    `self.tauff_filter` instance smoothing `sol_tauff` right before
+    `solve_ik()` returns it (`tauff_filter_enabled`/`tauff_filter_alpha`
+    constructor kwargs, default `alpha=0.3`).
+  - New `self.ipopt_exhaustion_count` counter, incremented in `solve_ik()`'s
+    `except` branch alongside an enriched print.
+- `g1_spine_stabilization/trajectory/sources.py` — new `NoiseFilteredSource`
+  class: median-of-N then EMA on `(box_center, theta)`, composed *before*
+  `RateLimitedSource` in the wrapping chain.
+- `configs/default.yaml` — new `gravity_comp.tauff_filter` block
+  (`enabled`, `alpha: 0.3`) and `trajectory.noise_filter` block (`enabled`,
+  `median_window: 5`, `ema_alpha: 0.3`).
+- `scripts/run_pose_tracking_preview.py` / `scripts/grasp_demo.py` —
+  `G1HandIK(...)` construction gains `tauff_filter_enabled`/
+  `tauff_filter_alpha` read from config. `run_pose_tracking_preview.py`
+  additionally wraps `source` in `NoiseFilteredSource` for `--source marker`
+  only, before the existing `RateLimitedSource` wrapping.
+- Four new test files: `tests/test_weighted_moving_filter.py` (5 tests),
+  `tests/test_ipopt_diagnostics.py` (4 tests), `tests/test_tauff_filter.py`
+  (7 tests), `tests/test_noise_filtered_source.py` (8 tests). 96 tests total.
+- `CLAUDE.md` — IK Solver section ("Smoothing", "Known timing floor",
+  new "Diagnostics" bullet), Open Design Questions (split "Target
+  filtering" into jump/slew, now correctly scoped, and a new sensor-noise
+  entry), Current Status, Session Roadmap, File Structure updated.
+- `docs/sdk_analysis.md` — Section E's "~60 Hz achievable cadence" statement
+  caveated (see below).
+
+**Key findings:**
+- **Hand-mass bug (found by the user, not the research agents):**
+  `INSPIRE_HAND_MASS = 1.6` in `ik_solver.py` was a leftover local test
+  edit — the file's own docstrings at lines 98/354/357 still said "1.0 kg
+  measured hand," directly contradicting the constant two lines above them.
+  Gravity-comp torque scales linearly with this constant, so `sol_tauff` had
+  been ~60% too strong system-wide since whatever session this was changed
+  in — a very plausible contributor to wrist jitter given the SDK's low
+  wrist damping (`kd=1`).
+- **`WeightedMovingFilter` reversed recency weighting (verified directly):**
+  confirmed by reading the vendored SDK's own reference implementation
+  (`~/g1_inspire_sdk/g1_inspire_sdk/_common/weighted_moving_filter.py`),
+  which uses the identical weight vector `[0.4,0.3,0.2,0.1]` via
+  `np.convolve(..., mode="valid")` — convolution flips the kernel, so its
+  newest sample correctly gets weight 0.4. A background agent measured
+  steady-state group delay on a ramp input: 2.0 samples (our buggy version)
+  vs. 1.0 sample (correct). At the real ~6-10Hz loop rate this was
+  ~250-300ms of unintended lag instead of ~125-150ms.
+- **GIL contention (confirmed empirically, documented only — see "Out of
+  scope" below):** a background agent ran a counting thread concurrently
+  with a real IPOPT `opti.solve()` call; the thread's throughput dropped to
+  2.2% of baseline during a 195ms solve, confirming CasADi/IPOPT holds the
+  GIL for effectively the entire solve. Since `G1Arm`'s "250Hz" publisher
+  thread runs in the same process, it's paused during every IK solve.
+  Separately verified via grep: `G1Arm._clip_to_velocity_limit()`
+  (`~/g1_inspire_sdk/g1_inspire_sdk/g1_arm.py:113,426`) uses a fixed
+  `self._motor_dt = 1.0/250.0`, never measured elapsed time — the exact
+  bug class already fixed in-repo via `RateLimitedSource`, but this
+  instance lives inside the vendored SDK.
+- **IPOPT `max_iter` exhaustion is plausible in practice:** a background
+  agent empirically measured IPOPT's iteration count scaling with
+  warm-start distance (4 iters at 0°, 7 at 10°, 8 at 20°, 11 at 45°, on a
+  fixed warm start) — legitimate large tracking jumps could plausibly push
+  iteration count toward `max_iter=30` in messier real bimanual geometry.
+  No prior test/log had ever checked for `solve_ik()`'s `except` branch
+  firing; there is now a counter.
+- **SDK applies `tauff` as an unfiltered zero-order hold:** verified in
+  `G1Arm._live_publisher_loop()` — `q_target` is velocity-clipped every
+  250Hz tick, but `tauff_target` is passed straight through with no
+  interpolation at all. Given gravity-comp torque ~1 N·m at the wrist and
+  low wrist `kd=1`, an un-smoothed `sol_tauff` step every ~100-150ms could
+  produce a small torque "kick" — mitigated by smoothing `sol_tauff`
+  ourselves (fully in our own code, not the vendored SDK) before handoff.
+- **`RateLimitedSource` cannot catch real sensor noise (this is the main
+  finding tying directly to the mock-vs-real-marker question):** verified
+  directly — its clamp only engages on deltas *larger* than the configured
+  rate; anything smaller passes straight through by design (see its own
+  test `test_theta_within_limit_passes_through_unchanged`). Real
+  `solvePnP` detection jitter for a stationary marker is small and
+  continuous, sitting below that threshold (which was deliberately set
+  *above* the trajectory's own peak natural rate). `--source mock`/
+  `--source sine` are perfectly noiseless and have never exercised this —
+  it is a structural gap that only becomes visible with real markers.
+  `NoiseFilteredSource` (median-of-N to reject single-frame misdetection
+  spikes, then EMA to smooth continuous jitter) directly addresses this,
+  applied *before* `RateLimitedSource` in the wrapping chain (clean the
+  signal first, then bound the rate of the clean signal).
+
+### Out of scope for this fix (deliberate, per user decision)
+
+- **GIL contention / SDK publisher-thread starvation** — documented only,
+  not fixed. This is architecture-level (would require running the IK
+  solve without sharing the GIL with the publisher thread — a separate
+  process, or a GIL-releasing extension — both much bigger changes) and
+  lives partly inside the vendored SDK's own fixed-`_motor_dt` assumption,
+  which cannot be modified (git-pull-only). Same deferral category as the
+  IK-solve-speed item from the previous session.
+- Tuning `tauff_filter.alpha`/`noise_filter.median_window`/
+  `noise_filter.ema_alpha` against real hardware/marker data — all three
+  are reasoned placeholders, not measurements (see comments in
+  `configs/default.yaml`).
+- Live re-test on hardware to confirm the mass fix and filter fix reduce
+  visible jitter, and that the noise filter helps on real markers — human-
+  run only.
+
+### Things not modified
+
+- `~/g1_inspire_sdk` — SDK not modified (the GIL-contention and
+  fixed-`_motor_dt` findings live here but cannot be fixed without
+  modifying the vendored clone).
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights, IPOPT solver settings — unchanged.
+- `g1_spine_stabilization/trajectory/targets.py` (`compute_hand_targets`) —
+  left as pure stateless geometry; noise filtering lives one layer up, in
+  the source wrapper.
+

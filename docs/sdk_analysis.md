@@ -310,6 +310,22 @@ Split ownership:
 So: keep `step_realtime` for the sim controller; for hardware, set targets in a
 self-paced loop and let the SDK's 250 Hz thread handle motor I/O.
 
+**Update (SDK-6 pre-bringup hardening session) — the "~60 Hz" figure above
+describes the SDK's own example scripts, not our controller.** Measured
+directly: our `ik.solve_ik()` costs ~100ms/call (CasADi/IPOPT re-solve from
+warm start; `n=55 mean=104.30ms median=100.89ms min=67.97ms max=161.97ms`),
+so our actual Phase-2 loop rate is ~6-10Hz — see CLAUDE.md's "Known timing
+floor" and `docs/followups.md` for the full measurement and the
+`RateLimitedSource` mitigation. Separately, also confirmed empirically this
+session: the SDK's own "250 Hz" publisher thread does not actually sustain
+250 Hz while a solve is in-flight, because (a) CasADi/IPOPT holds the Python
+GIL for effectively 100% of the solve's wall-clock duration, stalling the
+publisher thread (same process, same GIL), and (b) `_clip_to_velocity_limit()`
+uses a fixed assumed `_motor_dt=1/250` rather than measured elapsed time, so
+it doesn't compensate for ticks that fire late. This is documented, not
+fixed — it lives inside the vendored SDK (git-pull-only) and is architecture-
+level, same deferral category as IK-solve-speed work.
+
 **Extra filtering caveat:** `set_ee_targets` applies an output LPF
 (`alpha = dt/(arm_filter_tau+dt)`, `arm_filter_tau=0.30`) *on top of* the IK's
 internal `WeightedMovingFilter` → **double-filtered** (`g1_arm.py`). Another

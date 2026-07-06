@@ -312,3 +312,76 @@ class RateLimitedSource:
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+class NoiseFilteredSource:
+    """Smooths real-sensor (box_center, theta) noise from a wrapped source.
+
+    Two stages, deliberately in this order:
+      1. Median-of-N (per-DOF): rejects a single-frame outlier (e.g. a
+         partially-occluded/motion-blurred AprilTag misdecode for exactly one
+         frame) that an EMA alone would partially incorporate.
+      2. Single-pole EMA: smooths the remaining small, continuous jitter that
+         solvePnP produces even for a stationary marker -- noise well BELOW
+         RateLimitedSource's clamp threshold, which only engages on deltas
+         LARGER than its configured rate.
+
+    Architecturally distinct from RateLimitedSource (cleans the raw signal
+    vs. bounds the rate of the already-clean signal) and from G1HandIK's
+    WeightedMovingFilter (smooths solve_ik's OUTPUT sol_q; this smooths the
+    trajectory's INPUT before compute_hand_targets/solve_ik ever see it).
+    Intended composition: source -> NoiseFilteredSource -> RateLimitedSource
+    -> controller (noise-filtering innermost since it cleans the raw signal;
+    slew-limiting outermost since it bounds the rate of that cleaned signal,
+    including any real fast motion that follows).
+
+    Duck-types .startup()/.step(); proxies unknown attributes to the wrapped
+    source via __getattr__, matching RateLimitedSource's pattern.
+    """
+
+    def __init__(self, inner, median_window=5, ema_alpha=0.3):
+        if median_window < 1 or median_window % 2 == 0:
+            raise ValueError(
+                f"median_window must be a positive odd integer, got {median_window}"
+            )
+        self._inner = inner
+        self._median_window = int(median_window)
+        self._ema_alpha = float(ema_alpha)
+        self._box_hist = []
+        self._theta_hist = []
+        self._ema_box = None
+        self._ema_theta = None
+
+    def startup(self, *args, **kwargs):
+        box_center = self._inner.startup(*args, **kwargs)
+        self._box_hist, self._theta_hist = [], []
+        self._ema_box, self._ema_theta = None, None
+        return box_center
+
+    def step(self) -> tuple:
+        box_center, theta = self._inner.step()
+        box_center = np.asarray(box_center, dtype=float)
+        theta = float(theta)
+
+        self._box_hist.append(box_center.copy())
+        self._theta_hist.append(theta)
+        if len(self._box_hist) > self._median_window:
+            self._box_hist.pop(0)
+            self._theta_hist.pop(0)
+
+        if len(self._box_hist) < self._median_window:
+            med_box, med_theta = box_center, theta
+        else:
+            med_box = np.median(np.stack(self._box_hist, axis=0), axis=0)
+            med_theta = float(np.median(self._theta_hist))
+
+        if self._ema_box is None:
+            self._ema_box, self._ema_theta = med_box.copy(), med_theta
+        else:
+            self._ema_box = self._ema_alpha * med_box + (1.0 - self._ema_alpha) * self._ema_box
+            self._ema_theta = self._ema_alpha * med_theta + (1.0 - self._ema_alpha) * self._ema_theta
+
+        return self._ema_box.copy(), self._ema_theta
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)

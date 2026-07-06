@@ -44,7 +44,9 @@ from g1_spine_stabilization.perception.frames import (
 from g1_spine_stabilization.perception.tracker import MarkerTracker
 from g1_spine_stabilization.perception.types import MarkerObservation
 from g1_spine_stabilization.trajectory.targets import L_EE_DEFAULT
-from g1_spine_stabilization.trajectory.sources import SineSource, MarkerSource, RateLimitedSource
+from g1_spine_stabilization.trajectory.sources import (
+    SineSource, MarkerSource, RateLimitedSource, NoiseFilteredSource,
+)
 from g1_spine_stabilization.controllers.sdk_pose_tracking import run_pose_tracking_sdk
 from g1_spine_stabilization.utils.config import load_config
 
@@ -202,7 +204,12 @@ def main():
     # -------------------------------------------------------------------
     print("[preview] Loading IK solver…")
     gravity_comp_enabled = cfg.get("gravity_comp", {}).get("enabled", True)
-    ik = G1HandIK(gravity_comp_enabled=gravity_comp_enabled)
+    tauff_filter_cfg = cfg.get("gravity_comp", {}).get("tauff_filter", {})
+    ik = G1HandIK(
+        gravity_comp_enabled=gravity_comp_enabled,
+        tauff_filter_enabled=tauff_filter_cfg.get("enabled", True),
+        tauff_filter_alpha=tauff_filter_cfg.get("alpha", 0.3),
+    )
 
     # Default box center in pelvis frame (same as run_pose_tracking_sim)
     box_size = list(cfg["box"]["size"])
@@ -276,6 +283,22 @@ def main():
         source = MarkerSource(tracker, obj_id, tgt_id, mode=args.tracking, countdown=3.0)
         duration = float("inf")   # run until Ctrl+C
         # cam_for_preview stays None: RealSenseSource.read() auto-pushes frames via the SDK
+
+        # ---------------------------------------------------------------
+        # Noise-filter the real marker signal (marker mode only -- sine/mock
+        # are noiseless by construction, so a median+EMA filter would only
+        # add avoidable lag/distortion there). See configs/default.yaml:
+        # trajectory.noise_filter.
+        # ---------------------------------------------------------------
+        noise_filter_cfg = cfg.get("trajectory", {}).get("noise_filter", {})
+        if noise_filter_cfg.get("enabled", True):
+            median_window = noise_filter_cfg.get("median_window", 5)
+            ema_alpha = noise_filter_cfg.get("ema_alpha", 0.3)
+            source = NoiseFilteredSource(
+                source, median_window=median_window, ema_alpha=ema_alpha,
+            )
+            print(f"[preview] Noise filter enabled: median_window={median_window}, "
+                  f"ema_alpha={ema_alpha:.2f}")
 
     # -------------------------------------------------------------------
     # Rate-limit the trajectory source (uniform across sine/mock/marker).

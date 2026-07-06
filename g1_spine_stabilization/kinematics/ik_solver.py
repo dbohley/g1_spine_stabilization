@@ -21,7 +21,13 @@ import casadi
 # Smoothing filter
 # -------------------------------------------------------
 class WeightedMovingFilter:
-    """Weighted moving average filter for smoothing joint commands."""
+    """Weighted moving average filter for smoothing joint commands.
+
+    Weights are recency-ordered: weights[0] applies to the newest sample,
+    weights[-1] to the oldest. self.queue is FIFO (oldest at index 0), so
+    the newest sample is the last element -- zip against reversed(queue) to
+    pair weights[0] with the newest sample.
+    """
 
     def __init__(self, weights, data_size=14):
         self.weights     = np.array(weights)
@@ -40,12 +46,37 @@ class WeightedMovingFilter:
             self.filtered = self.queue[-1].copy()
         else:
             self.filtered = sum(
-                w * d for w, d in zip(self.weights, self.queue)
+                w * d for w, d in zip(self.weights, reversed(self.queue))
             )
 
     @property
     def filtered_data(self):
         return self.filtered
+
+
+class ExponentialMovingAverageFilter:
+    """Single-pole EMA: y = alpha*x + (1-alpha)*y_prev.
+
+    First call passes through unchanged (seeds y_prev) -- matching
+    WeightedMovingFilter's fill-in-window convention, so steady-state
+    accuracy is unaffected by filter start-up.
+    """
+
+    def __init__(self, alpha, data_size=14):
+        assert 0.0 < alpha <= 1.0, "alpha must be in (0, 1]"
+        self.alpha = float(alpha)
+        self.data_size = data_size
+        self._value = None
+
+    def add_data(self, new_data):
+        new_data = np.asarray(new_data, dtype=float)
+        self._value = new_data.copy() if self._value is None \
+            else self.alpha * new_data + (1.0 - self.alpha) * self._value
+        return self._value
+
+    @property
+    def filtered_data(self):
+        return self._value
 
 
 # -------------------------------------------------------
@@ -64,7 +95,7 @@ R_SHOULDER_ROLL_MAX = -0.15   # right can't go above this (inward = bad)
 # Gravity compensation: Inspire RH56 hand inertial properties
 # Mass from scale measurement. COM + inertia from URDF hand_base_link, scaled.
 # -------------------------------------------------------
-INSPIRE_HAND_MASS = 1.6        # kg (scale measurement of real Inspire RH56 hand)
+INSPIRE_HAND_MASS = 1.0        # kg (scale measurement of real Inspire RH56 hand)
 
 _WRIST_MASS    = 0.08457647
 _WRIST_COM_L   = np.array([0.02200, +0.00049, 0.00054])  # left wrist_yaw_link, wrist frame
@@ -120,9 +151,12 @@ def _make_composite_wrist_inertia(side: str) -> pin.Inertia:
 # IK Solver
 # -------------------------------------------------------
 class G1HandIK:
-    def __init__(self, urdf_path=None, visualization=False, gravity_comp_enabled=True):
+    def __init__(self, urdf_path=None, visualization=False, gravity_comp_enabled=True,
+                 tauff_filter_enabled=True, tauff_filter_alpha=0.3):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
         self.gravity_comp_enabled = gravity_comp_enabled
+        self.tauff_filter_enabled = tauff_filter_enabled
+        self.tauff_filter = ExponentialMovingAverageFilter(tauff_filter_alpha, 14)
 
         # -------------------------------------------------------
         # Resolve URDF path
@@ -347,6 +381,7 @@ class G1HandIK:
         self.smooth_filter = WeightedMovingFilter(
             np.array([0.4, 0.3, 0.2, 0.1]), 14
         )
+        self.ipopt_exhaustion_count = 0
         print("[G1HandIK] Ready.")
 
     def _apply_hand_inertia_correction(self) -> None:
@@ -399,7 +434,8 @@ class G1HandIK:
             self.opti.solve()
             sol_q = self.opti.value(self.var_q)
         except Exception as e:
-            print(f"[G1HandIK] IK warning: {e}")
+            self.ipopt_exhaustion_count += 1
+            print(f"[G1HandIK] IK warning (exhaustion #{self.ipopt_exhaustion_count}): {e}")
             sol_q = self.opti.debug.value(self.var_q)
 
         self.smooth_filter.add_data(sol_q)
@@ -415,6 +451,10 @@ class G1HandIK:
             sol_q, v,
             np.zeros(self.reduced.model.nv),
         )
+
+        if self.tauff_filter_enabled:
+            self.tauff_filter.add_data(sol_tauff)
+            sol_tauff = self.tauff_filter.filtered_data.copy()
 
         return sol_q, sol_tauff
 
