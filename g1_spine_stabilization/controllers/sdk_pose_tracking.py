@@ -59,8 +59,16 @@ def _rpy_deg(R):
     return np.degrees(_Rot.from_matrix(R).as_euler('xyz'))
 
 
-def _log_marker_info(source, theta, elapsed, preview):
-    """Print augmented per-step marker diagnostics and optionally push to Rerun."""
+def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=None):
+    """Print augmented per-step marker diagnostics and optionally push to Rerun.
+
+    L_target/R_target (optional): the actual computed compute_hand_targets()
+    output for this step, logged as a distinctly-colored Rerun entity
+    (targets/L_hand, targets/R_hand) separate from the raw marker triads
+    (markers/object, markers/target) and the robot's own rendered mesh --
+    lets a human directly compare "where is the IK target" vs. "where is the
+    marker" vs. "where does the arm actually end up" in the live Rerun view.
+    """
     print(f"[SDKController] t={elapsed:.1f}s  "
           f"theta_Rx (target marker rot about robot X axis) = {math.degrees(theta):+.1f}°")
 
@@ -93,6 +101,30 @@ def _log_marker_info(source, theta, elapsed, preview):
         print(f"  Tracking delta: q=[x={q[0]:+.3f}, y={q[1]:+.3f}, "
               f"z={q[2]:+.3f}, w={q[3]:+.3f}]  angle={angle_deg:.1f}°")
 
+    # Transform-chain diagnostic -- helps isolate WHICH stage (raw solvePnP
+    # optical-frame reading, d435-mount frame, or final pelvis frame) is
+    # responsible for a real-world calibration discrepancy (e.g. a marker
+    # appearing at a different height in Rerun than its physical position).
+    # Only available when source wraps a real MarkerTracker with
+    # get_diagnostic_pose (not SineSource, and not MockMarkerTracker, which
+    # has no transform chain to report -- --source mock/sine simply won't
+    # print this section).
+    tracker = getattr(source, 'tracker', None)
+    get_diagnostic_pose = getattr(tracker, 'get_diagnostic_pose', None)
+    if get_diagnostic_pose is not None:
+        obj_id = getattr(source, 'obj_id', None)
+        tgt_id = getattr(source, 'tgt_id', None)
+        for _label, _mid in [("Object", obj_id), ("Target", tgt_id)]:
+            diag = get_diagnostic_pose(_mid) if _mid is not None else None
+            if diag is not None:
+                p_opt = diag["optical"][:3, 3]
+                p_mnt = diag["d435_mount"][:3, 3]
+                p_pel = diag["pelvis"][:3, 3]
+                print(f"  {_label} marker transform chain:")
+                print(f"    optical:    pos=[{p_opt[0]:+.3f}, {p_opt[1]:+.3f}, {p_opt[2]:+.3f}]")
+                print(f"    d435 mount: pos=[{p_mnt[0]:+.3f}, {p_mnt[1]:+.3f}, {p_mnt[2]:+.3f}]")
+                print(f"    pelvis:     pos=[{p_pel[0]:+.3f}, {p_pel[1]:+.3f}, {p_pel[2]:+.3f}]")
+
     _AXIS_LEN = 0.05
     if _HAS_RERUN and preview is not None:
         for _name, _obs in [("markers/object", obj_obs), ("markers/target", tgt_obs)]:
@@ -107,6 +139,21 @@ def _log_marker_info(source, theta, elapsed, preview):
                     colors=[[255, 0, 0, 255],
                             [0, 255, 0, 255],
                             [0, 0, 255, 255]],
+                ))
+
+        for _name, _T, _color in [
+            ("targets/L_hand", L_target, [0, 255, 255, 255]),   # cyan
+            ("targets/R_hand", R_target, [255, 0, 255, 255]),   # magenta
+        ]:
+            if _T is not None:
+                _t = _T[:3, 3]
+                _R = _T[:3, :3]
+                rr.log(_name, rr.Arrows3D(
+                    origins=[_t, _t, _t],
+                    vectors=[_R[:, 0] * _AXIS_LEN,
+                             _R[:, 1] * _AXIS_LEN,
+                             _R[:, 2] * _AXIS_LEN],
+                    colors=[_color, _color, _color],
                 ))
 
 
@@ -220,7 +267,8 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
 
                 if time.monotonic() - _last_log_t >= 1.0:
                     _last_log_t = time.monotonic()
-                    _log_marker_info(source, theta, elapsed, preview)
+                    _log_marker_info(source, theta, elapsed, preview,
+                                      L_target=L_target, R_target=R_target)
                     if _HAS_RERUN and gravity_comp_enabled:
                         _TAUFF_JOINT_NAMES = [
                             "L_shoulder_pitch", "L_shoulder_roll", "L_shoulder_yaw", "L_elbow",

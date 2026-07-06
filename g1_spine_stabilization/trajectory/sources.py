@@ -53,9 +53,24 @@ class MarkerSource:
 
     Two tracking modes:
       "orient-only" — box_center is captured from the object marker once at
-          startup and held fixed; theta follows the target marker's X-rotation.
-      "6dof"        — box_center tracks the target marker's position each step;
-          theta still follows the target marker's X-rotation.
+          startup and held fixed; theta tracks the target marker's rotation
+          RELATIVE TO the target's own starting orientation (not the target's
+          absolute orientation -- see below).
+      "6dof"        — box_center tracks the object's own starting position,
+          offset by however far the target marker has moved from ITS OWN
+          starting position (a relative/delta displacement, not the target's
+          absolute position); theta is the same relative-rotation tracking
+          as orient-only.
+
+    Both modes track the target's DISPLACEMENT from where it was when
+    tracking began, not its absolute pose. This matters because the object
+    (held in the robot's hands) and the target (e.g. held by a person) are
+    generally in different physical locations -- if box_center were simply
+    set to the target's raw absolute position, the hands would be commanded
+    to wherever the target physically is in space, not to the object's own
+    position shifted by how far the target has moved. (This was a real bug,
+    found via a live-hardware test with a real object and target in
+    different locations -- see docs/followups.md.)
 
     Args:
         tracker:           a MarkerTracker or duck-typed equivalent whose step()
@@ -81,7 +96,10 @@ class MarkerSource:
         self._mode = mode
         self._countdown = countdown
         self._control_dt = control_dt
-        self._box_center = None      # set by startup()
+        self._object_start_pos = None  # object's own position, set once by startup(), never changes
+        self._target_start_pos = None  # target's position when tracking began (Phase B)
+        self._target_start_rot = None  # target's rotation when tracking began (Phase B)
+        self._box_center = None        # live returned value; == object_start_pos in orient-only mode
         self._last_theta = 0.0
         self._last_obj_obs = None
         self._last_tgt_obs = None
@@ -94,11 +112,21 @@ class MarkerSource:
         self._object_warned_2s = False
         self._object_warned_5s = False
 
+    def _theta_from_target_rotation(self, R_current: np.ndarray) -> float:
+        """Target's roll relative to its own starting orientation (not absolute)."""
+        R_delta = self._target_start_rot.T @ R_current
+        return float(np.arctan2(R_delta[2, 1], R_delta[2, 2]))
+
+    def _box_center_from_target_position(self, pos_current: np.ndarray) -> np.ndarray:
+        """Object's own start position, shifted by the target's displacement from its own start."""
+        return self._object_start_pos + (pos_current - self._target_start_pos)
+
     def startup(self, timeout=10.0) -> np.ndarray:
         """Block until both markers are detected, then optionally count down.
 
-        Phase A: waits for the object marker → records box_center.
-        Phase B: waits for the target marker → pre-seeds _last_theta.
+        Phase A: waits for the object marker → records the object's own start position.
+        Phase B: waits for the target marker → records its start pose (position + rotation)
+                 as the reference for relative tracking; _last_theta starts at 0.0.
         Phase C: counts down self._countdown seconds while continuously
                  refreshing readings; skipped when countdown=0.0.
 
@@ -112,7 +140,8 @@ class MarkerSource:
             current = self._tracker.step()
             obj_obs = next((o for o in current if o.marker_id == self._obj_id), None)
             if obj_obs is not None:
-                self._box_center = obj_obs.pose_in_pelvis[:3, 3].copy()
+                self._object_start_pos = obj_obs.pose_in_pelvis[:3, 3].copy()
+                self._box_center = self._object_start_pos.copy()
                 print(f"[MarkerSource] Object marker detected: box_center={np.round(self._box_center, 4)}")
                 found_obj = True
                 break
@@ -130,11 +159,10 @@ class MarkerSource:
             current = self._tracker.step()
             tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
             if tgt_obs is not None:
-                R = tgt_obs.pose_in_pelvis[:3, :3]
-                self._last_theta = float(np.arctan2(R[2, 1], R[2, 2]))
-                if self._mode == "6dof":
-                    self._box_center = tgt_obs.pose_in_pelvis[:3, 3].copy()
-                print(f"[MarkerSource] Target marker detected: theta={math.degrees(self._last_theta):.1f}°")
+                self._target_start_pos = tgt_obs.pose_in_pelvis[:3, 3].copy()
+                self._target_start_rot = tgt_obs.pose_in_pelvis[:3, :3].copy()
+                self._last_theta = 0.0  # no displacement yet -- this IS the target's start
+                print(f"[MarkerSource] Target marker detected (start reference recorded)")
                 found_tgt = True
                 break
             time.sleep(0.05)
@@ -158,10 +186,9 @@ class MarkerSource:
                 current = self._tracker.step()
                 tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
                 if tgt_obs is not None:
-                    R = tgt_obs.pose_in_pelvis[:3, :3]
-                    self._last_theta = float(np.arctan2(R[2, 1], R[2, 2]))
+                    self._last_theta = self._theta_from_target_rotation(tgt_obs.pose_in_pelvis[:3, :3])
                     if self._mode == "6dof":
-                        self._box_center = tgt_obs.pose_in_pelvis[:3, 3].copy()
+                        self._box_center = self._box_center_from_target_position(tgt_obs.pose_in_pelvis[:3, 3])
                 time.sleep(0.05)
             print("[MarkerSource] Go!")
 
@@ -177,7 +204,7 @@ class MarkerSource:
 
         Returns:
             box_center: (3,) ndarray in pelvis frame
-            theta:      float, Rx rotation angle in radians
+            theta:      float, target's rotation relative to its own start (radians)
         """
         if self._box_center is None:
             raise RuntimeError("Call startup() before step()")
@@ -188,10 +215,9 @@ class MarkerSource:
         tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
         self._last_tgt_obs = tgt_obs
         if tgt_obs is not None:
-            R = tgt_obs.pose_in_pelvis[:3, :3]
-            self._last_theta = float(np.arctan2(R[2, 1], R[2, 2]))
+            self._last_theta = self._theta_from_target_rotation(tgt_obs.pose_in_pelvis[:3, :3])
             if self._mode == "6dof":
-                self._box_center = tgt_obs.pose_in_pelvis[:3, 3].copy()
+                self._box_center = self._box_center_from_target_position(tgt_obs.pose_in_pelvis[:3, 3])
             self._target_stale_frames = 0
             self._stale_warned_05 = False
             self._stale_warned_3 = False
@@ -243,6 +269,22 @@ class MarkerSource:
     def object_lost(self) -> bool:
         """True if object marker has not been seen for more than 2s during tracking."""
         return self._object_stale_frames * self._control_dt > 2.0
+
+    @property
+    def tracker(self):
+        """The wrapped tracker (e.g. MarkerTracker), for diagnostics such as
+        get_diagnostic_pose(). Not available on SineSource."""
+        return self._tracker
+
+    @property
+    def obj_id(self):
+        """AprilTag ID of the object marker."""
+        return self._obj_id
+
+    @property
+    def tgt_id(self):
+        """AprilTag ID of the target marker."""
+        return self._tgt_id
 
 
 class RateLimitedSource:

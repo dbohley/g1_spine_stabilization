@@ -275,6 +275,10 @@ def main():
             distortion=np.asarray(native["distortion"]),
         )
         detector = AprilTagDetector(perception["marker_dict"], perception["marker_size"])
+        print(f"[preview] Configured marker_size={perception['marker_size']:.4f}m — "
+              f"verify this matches your real printed marker's physical size; "
+              f"a mismatch here scales solvePnP's recovered translation and can look "
+              f"like a calibration error.")
         T_opt_to_d435  = optical_to_d435_from_config(perception["d435_link_to_optical"])
         T_d435_to_pelvis = d435_to_pelvis_from_pinocchio(ik=ik)
         tracker = MarkerTracker(

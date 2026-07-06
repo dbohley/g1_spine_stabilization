@@ -56,19 +56,60 @@ class _RepeatTracker:
         return self._obs.get(marker_id)
 
 
+class _SequenceTracker:
+    """Returns obj+tgt readings from a caller-supplied per-call sequence.
+
+    Each entry in `frames` is (obj_pos, tgt_pos, tgt_theta) for that call.
+    After the sequence is exhausted: repeats the last entry (repeat_last=True,
+    the default) or goes silent, returning [] (repeat_last=False).
+    """
+    def __init__(self, frames, repeat_last=True):
+        self._frames = frames
+        self._repeat_last = repeat_last
+        self._call = 0
+        self._latest = {}
+
+    def step(self):
+        idx = min(self._call, len(self._frames) - 1) if self._repeat_last else self._call
+        self._call += 1
+        if idx >= len(self._frames):
+            return []
+        obj_pos, tgt_pos, tgt_theta = self._frames[idx]
+        obj_obs = _make_obs(OBJ_ID, obj_pos)
+        tgt_obs = _make_obs(TGT_ID, tgt_pos, theta=tgt_theta)
+        self._latest[OBJ_ID] = obj_obs
+        self._latest[TGT_ID] = tgt_obs
+        return [obj_obs, tgt_obs]
+
+    def get_latest(self, marker_id):
+        return self._latest.get(marker_id)
+
+
 # ---------------------------------------------------------------------------
 # MarkerSource tests
 # ---------------------------------------------------------------------------
 
-def test_orient_only_theta_from_target_marker():
-    """theta extracted from target marker matches arctan2(R[2,1], R[2,2])."""
-    expected_theta = 0.4
-    tracker = _RepeatTracker(obj_pos=BOX_CENTER, tgt_theta=expected_theta)
-    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only")
+def test_orient_only_theta_tracks_relative_rotation_not_absolute():
+    """theta is the target's rotation CHANGE since tracking began, not its
+    absolute rotation (regression test for the 6dof/orient-only absolute-
+    teleport-to-target bug -- see docs/followups.md)."""
+    start_theta = 0.2
+    step_theta = 0.6  # absolute; delta from start = 0.4
+    frames = [
+        (BOX_CENTER, BOX_CENTER, start_theta),  # Phase A (object found)
+        (BOX_CENTER, BOX_CENTER, start_theta),  # Phase B (target start reference)
+        (BOX_CENTER, BOX_CENTER, step_theta),   # step(): target has rotated
+    ]
+    tracker = _SequenceTracker(frames)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0)
     source.startup()
     _, theta = source.step()
-    assert abs(theta - expected_theta) < 1e-6, (
-        f"Expected theta {expected_theta}, got {theta}"
+    expected_delta = step_theta - start_theta
+    assert abs(theta - expected_delta) < 1e-6, (
+        f"Expected theta delta {expected_delta}, got {theta}"
+    )
+    assert abs(theta - step_theta) > 1e-3, (
+        "theta should not equal the target's absolute rotation"
     )
 
 
@@ -99,16 +140,29 @@ def test_orient_only_box_center_fixed_after_startup():
                                    err_msg="box_center should remain fixed in orient-only mode")
 
 
-def test_6dof_box_center_tracks_target_marker():
-    """In 6dof mode, box_center matches the target marker's position each step."""
+def test_6dof_box_center_tracks_target_displacement_not_absolute_position():
+    """In 6dof mode, box_center is the object's own start position shifted by
+    the target's DISPLACEMENT from its own start -- not the target's raw
+    absolute position (regression test for the absolute-teleport-to-target
+    bug -- see docs/followups.md). Object and target start in DIFFERENT
+    physical locations, as they would be in a real grasp/tracking setup."""
     obj_pos = BOX_CENTER.copy()
-    tgt_pos = np.array([0.40, 0.05, 0.15])
-    tracker = _RepeatTracker(obj_pos=obj_pos, tgt_pos=tgt_pos)
-    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="6dof")
+    tgt_start_pos = np.array([0.60, 0.20, 0.30])
+    tgt_step_pos = tgt_start_pos + np.array([0.05, -0.02, 0.01])
+    frames = [
+        (obj_pos, tgt_start_pos, 0.0),  # Phase A
+        (obj_pos, tgt_start_pos, 0.0),  # Phase B: target start reference
+        (obj_pos, tgt_step_pos, 0.0),   # step(): target has moved
+    ]
+    tracker = _SequenceTracker(frames)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="6dof", countdown=0.0)
     source.startup()
     bc, _ = source.step()
-    np.testing.assert_allclose(bc, tgt_pos, atol=1e-6,
-                                err_msg="In 6dof mode, box_center should match target marker position")
+    expected = obj_pos + (tgt_step_pos - tgt_start_pos)
+    np.testing.assert_allclose(bc, expected, atol=1e-6)
+    assert not np.allclose(bc, tgt_step_pos, atol=1e-3), (
+        "box_center should not equal the target's raw absolute position"
+    )
 
 
 def test_step_returns_last_known_on_empty_frame():
@@ -188,17 +242,28 @@ def test_marker_source_invalid_mode():
 # Startup pre-seeding, stale detection, object monitoring
 # ---------------------------------------------------------------------------
 
-def test_startup_preseeds_theta_from_target_marker():
-    """startup() pre-seeds _last_theta from the target marker; step() with no
-    detection returns that value (not 0.0)."""
-    expected_theta = 0.7
-    tracker = _StartupOnlyTracker(BOX_CENTER, tgt_theta=expected_theta)
+def test_startup_preseeds_nonzero_theta_delta_and_it_persists_when_stale():
+    """A nonzero theta delta established right after startup persists through
+    subsequent stale (no-detection) steps, rather than resetting to 0.0."""
+    start_theta = 0.1
+    moved_theta = 0.8  # delta = 0.7
+    frames = [
+        (BOX_CENTER, BOX_CENTER, start_theta),  # Phase A
+        (BOX_CENTER, BOX_CENTER, start_theta),  # Phase B: start reference
+        (BOX_CENTER, BOX_CENTER, moved_theta),  # one live step -> nonzero delta
+    ]
+    tracker = _SequenceTracker(frames, repeat_last=False)  # goes silent after
     source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0)
     source.startup()
-    # step 3 onward: no detection → should return pre-seeded theta
-    _, theta = source.step()
-    assert abs(theta - expected_theta) < 1e-6, (
-        f"Expected pre-seeded theta {expected_theta}, got {theta}"
+    _, first_theta = source.step()
+    expected_delta = moved_theta - start_theta
+    assert abs(first_theta - expected_delta) < 1e-6, (
+        f"Expected theta delta {expected_delta}, got {first_theta}"
+    )
+    # tracker is now silent -- delta should be held, not reset
+    _, second_theta = source.step()
+    assert abs(second_theta - first_theta) < 1e-6, (
+        "Nonzero theta delta should persist across stale/silent steps"
     )
 
 

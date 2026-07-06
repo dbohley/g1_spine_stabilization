@@ -1046,3 +1046,118 @@ except one (GIL contention), documented and deliberately deferred.
   left as pure stateless geometry; noise filtering lives one layer up, in
   the source wrapper.
 
+## SDK-6 marker-tracking fix follow-ups
+
+### What was done
+
+A live test with real AprilTag markers using `--tracking 6dof` showed the
+robot's hands positioning themselves around the target marker instead of
+the object marker. Investigation (three parallel research agents, direct
+code verification, and back-and-forth with the user correcting several
+initial hypotheses) found a real bug in `MarkerSource`, fixed it, and ruled
+out two other suspected causes along the way.
+
+**Files changed:**
+- `g1_spine_stabilization/trajectory/sources.py` — `MarkerSource` restructured:
+  new `self._object_start_pos` (captured once from the object marker,
+  Phase A), `self._target_start_pos`/`self._target_start_rot` (captured once
+  from the target marker, Phase B). New helpers `_theta_from_target_rotation()`
+  (target's roll relative to its own starting orientation) and
+  `_box_center_from_target_position()` (object's start position shifted by
+  the target's displacement from its own start). Both `startup()`'s Phase C
+  countdown and `step()` now use these helpers instead of assigning the
+  target's raw absolute pose. Also added `tracker`/`obj_id`/`tgt_id`
+  properties (used by the new diagnostics below).
+- `g1_spine_stabilization/perception/tracker.py` — `MarkerTracker.step()` now
+  keeps the intermediate `pose_in_optical`/`d435_mount`-frame poses (not just
+  the final `pose_in_pelvis`) per marker, exposed via a new
+  `get_diagnostic_pose(marker_id)` method. Internally computes the
+  optical→d435→pelvis composition as two explicit matrix multiplies instead
+  of one `compose_to_pelvis()` call (same math, exposes the intermediate);
+  `compose_to_pelvis` itself is unchanged and still tested independently in
+  `tests/test_perception_frames.py`.
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` — `_log_marker_info`
+  gained two additions: (1) logs the actual computed `L_target`/`R_target`
+  (already computed each Phase-2 iteration) to Rerun as `targets/L_hand`
+  (cyan) / `targets/R_hand` (magenta), distinct from the raw marker triads
+  and the robot's rendered mesh; (2) prints the marker's pose at each
+  transform-chain stage (optical, d435-mount, pelvis) via the new
+  `get_diagnostic_pose()`, to help isolate a separately-reported ~10cm
+  marker-height discrepancy.
+- `scripts/run_pose_tracking_preview.py` — marker-mode setup now prints the
+  configured `perception.marker_size` with a reminder to verify it against
+  the real printed marker's physical size (a mismatch would scale
+  `solvePnP`'s recovered translation).
+- `tests/test_marker_source.py` — three tests rewritten for delta semantics
+  (`test_orient_only_theta_tracks_relative_rotation_not_absolute`,
+  `test_6dof_box_center_tracks_target_displacement_not_absolute_position`,
+  `test_startup_preseeds_nonzero_theta_delta_and_it_persists_when_stale`);
+  new `_SequenceTracker` test helper (per-call scripted readings, needed
+  since a static reading now correctly produces a zero delta). All other
+  existing tests confirmed unaffected (staleness/monitoring behavior is
+  orthogonal to absolute-vs-delta semantics) and still pass unchanged.
+- `CLAUDE.md` — corrected four stale occurrences of the `d435_link_to_optical`
+  calibration value, corrected the Project Goal's "runtime arguments" claim
+  for object dimensions, rewrote the "Orientation-only vs 6-DoF" Resolved
+  bullet to describe the corrected delta semantics, removed two File
+  Structure entries for docs that don't exist (`frame_conventions.md`,
+  `architecture.md`), added the missing `gravity_comp_reference.md` entry.
+
+**Key findings:**
+- **The actual bug**: `MarkerSource.step()`/`startup()` set `box_center =
+  tgt_obs.pose_in_pelvis[:3, 3]` directly in 6dof mode — the target marker's
+  raw absolute position, not a delta. If the object (in the robot's hands)
+  and the target (e.g. held by a person) are in different physical
+  locations — the realistic setup — this sends the hands to wherever the
+  target physically is, not to the object shifted by how far the target has
+  moved. Confirmed by the user: this is exactly what they saw, running
+  `--tracking 6dof`. `orient-only` mode was unaffected (it never touches
+  `box_center` after startup), which is why the bug only showed up in 6dof.
+- **Ruled out: wrist-vs-palm IK targeting.** Verified directly that
+  `solve_ik()`'s cost function computes error against
+  `self.cdata.oMf[self.L_ee_id/self.R_ee_id].translation`
+  (`ik_solver.py:295-296`), where those IDs are
+  `self.reduced.model.getFrameId('L_ee_link'/'R_ee_link')`
+  (`ik_solver.py:244-245`) — the palm frame, not the wrist joint. The user's
+  observation that the marker sits exactly on the line between the two
+  wrists is mathematically guaranteed by `compute_hand_targets`'s
+  construction (`box_center` is always the midpoint of `L_pos`/`R_pos`)
+  regardless of `box_half_width`, so it didn't indicate a targeting bug —
+  the real issue was the 6dof position math above.
+- **Ruled out: `d435_link_to_optical` calibration error.** The config's
+  current rotation (`[-1.5708, 0.0, -1.5708]`) is correct — a prior Claude
+  session had changed it to `[3.14159, 0.0, 1.5708]` and that turned out
+  wrong, so it was reverted. CLAUDE.md was the stale one (still claiming the
+  old value in four places), now corrected.
+- **Ruled out: object dimensions as CLI runtime args.** CLAUDE.md's Project
+  Goal claimed "object width and depth are passed as runtime arguments" —
+  checked directly, this was never implemented anywhere (including the
+  original CoppeliaSim entry point) and the user's actual preference is for
+  box size to stay in `configs/default.yaml` (an object is selected once and
+  used for a while). Corrected the doc to match.
+
+### Out of scope for this fix
+
+- **The ~10cm "markers appear lower in Rerun than physically" discrepancy
+  remains unresolved.** With the calibration rotation now confirmed correct,
+  remaining candidates (a `perception.marker_size` mismatch against the real
+  printed marker, the URDF's fixed `d435_joint` mount origin not matching the
+  physical bracket, or `d435_link_to_optical.xyz`'s translation, currently
+  `[0,0,0]`) all require physical measurement against the real robot. The
+  new transform-chain diagnostic print (`get_diagnostic_pose`) is meant to
+  help the user isolate which stage is responsible, not a blind fix.
+- No fix attempted for anything inside `~/g1_inspire_sdk` (none was needed
+  here — the bug was entirely in our own `MarkerSource`).
+
+### Things not modified
+
+- `~/g1_inspire_sdk` — SDK not modified.
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights — unchanged.
+- `g1_spine_stabilization/perception/frames.py` (`compose_to_pelvis`) —
+  unchanged; `tracker.py` now computes the same composition as two explicit
+  steps internally, but the pure-function utility itself and its tests are
+  untouched.
+- `configs/default.yaml`'s `d435_link_to_optical.rpy` — left as-is; confirmed
+  correct by the user, only CLAUDE.md's documentation of it was wrong.
+
