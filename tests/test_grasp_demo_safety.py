@@ -116,6 +116,37 @@ def test_grasp_phases_recovers_from_keyboard_interrupt_during_phase0(dry_robot, 
     assert "Settling for" in out
 
 
+def test_grasp_phases_settles_after_interrupt_during_phase_r(dry_robot, ik, cfg_fast, monkeypatch, capsys):
+    """A KeyboardInterrupt during Phase R's own return-motion loop must still
+    reach the settle-before-shutdown pause -- previously the loop's exception
+    jumped straight to the outer except, skipping the settle sleep entirely
+    (see docs/followups.md)."""
+    ctrl_l, ctrl_r = _controllers(cfg_fast)
+
+    n_phase0_steps = int(cfg_fast["control"]["interpolation_time"] / cfg_fast["control"]["dt"])
+    call_count = {"n": 0}
+    original_solve_ik = ik.solve_ik
+
+    def fault_solve_ik(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == n_phase0_steps + 1:  # first call inside Phase R
+            raise KeyboardInterrupt()
+        return original_solve_ik(*args, **kwargs)
+
+    monkeypatch.setattr(ik, "solve_ik", fault_solve_ik)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_grasp_phases(
+            dry_robot, ik, cfg_fast,
+            ctrl_l=ctrl_l, ctrl_r=ctrl_r, do_left=True, do_right=True,
+            hold_time=0.05, rate=50.0, preview_enabled=False, dry_run=True,
+        )
+
+    out = capsys.readouterr().out
+    assert "Phase: arm return to default" in out
+    assert "Settling for" in out
+
+
 def test_settle_time_config_key():
     """configs/default.yaml must define a positive shutdown.settle_time."""
     cfg = load_config()

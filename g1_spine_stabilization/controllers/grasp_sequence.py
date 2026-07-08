@@ -278,20 +278,29 @@ def run_grasp_phases(
 
         n_steps = int(interp_time / interp_dt)
         return_q = hold_arm_q
-        for i in range(n_steps):
-            alpha = smoothstep(i / n_steps)
-            L_pos = (1 - alpha) * L_start_pos + alpha * L_EE_DEFAULT
-            R_pos = (1 - alpha) * R_start_pos + alpha * R_EE_DEFAULT
-            L_R   = slerp_rotation(L_start_rot, R_L_BASE, alpha)
-            R_R   = slerp_rotation(R_start_rot, R_R_BASE, alpha)
-            sol_q, sol_tauff = ik.solve_ik(
-                make_se3(L_pos, L_R), make_se3(R_pos, R_R),
-                return_q, np.zeros(14),
-            )
-            robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
-            return_q = sol_q
-            time.sleep(interp_dt)
+        try:
+            for i in range(n_steps):
+                alpha = smoothstep(i / n_steps)
+                L_pos = (1 - alpha) * L_start_pos + alpha * L_EE_DEFAULT
+                R_pos = (1 - alpha) * R_start_pos + alpha * R_EE_DEFAULT
+                L_R   = slerp_rotation(L_start_rot, R_L_BASE, alpha)
+                R_R   = slerp_rotation(R_start_rot, R_R_BASE, alpha)
+                sol_q, sol_tauff = ik.solve_ik(
+                    make_se3(L_pos, L_R), make_se3(R_pos, R_R),
+                    return_q, np.zeros(14),
+                )
+                robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
+                return_q = sol_q
+                time.sleep(interp_dt)
+        except (KeyboardInterrupt, Exception) as exc:
+            print(f"[grasp_demo] WARNING: {exc!r} during arm-return motion -- "
+                  f"proceeding directly to settle.")
+            if pending_exc is None:
+                pending_exc = exc
 
+        # Always settle, even if the return motion above was interrupted --
+        # otherwise a Ctrl-C mid-return skips the settle pause that's supposed
+        # to hold the final pose before the SDK's fixed shutdown-damping kicks in.
         print("[grasp_demo] Trajectory done.")
         settle_time = cfg.get("shutdown", {}).get("settle_time", 0.4)
         print(f"[grasp_demo] Settling for {settle_time:.2f}s before shutdown...")

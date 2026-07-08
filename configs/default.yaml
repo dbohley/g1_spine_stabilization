@@ -70,11 +70,13 @@ perception:
     distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
     resolution: [640, 480]
   # Transform from d435_link (URDF mount frame) to camera optical frame.
-  # NEEDS CALIBRATION against the real robot. Default below is standard
-  # ROS optical-frame convention: rotate -90° about Z, then -90° about X.
+  # Calibrated via scripts/calibrate_camera_extrinsics.py against marker
+  # ID=0 physically measured at pelvis-frame (0.40, 0.0, 0.0). TENTATIVE:
+  # being verified against a second marker before treating as final --
+  # see docs/followups.md.
   d435_link_to_optical:
-    xyz: [0.0, 0.0, 0.0]
-    rpy: [-1.5708, 0.0, -1.5708] # hand calibrated
+    xyz: [-0.0860, -0.0002, -0.0384] #  xyz: [0.0, 0.0, 0.0] urdf non-calibrated
+    rpy: [-1.4118, 0.0076, -1.5896]  #  rpy: [-1.5708, 0.0, -1.5708] urdf non-calibrated
 
 gravity_comp:
   enabled: true  # Runtime Pinocchio inertia correction for 1.0 kg Inspire hands
@@ -104,6 +106,7 @@ shutdown:
   settle_time: 0.4
 
 grip_force:
+  enabled: true             # apply grip during grasp_demo.py AND pose tracking (sdk_pose_tracking.py)
   tau_baseline: 0.25        # target grip force per finger (N); light hold
   kappa: 0.05               # TransportGraspController coupling gain
   delta_q_max: 1.0          # max additional closure beyond grasp pose (rad)

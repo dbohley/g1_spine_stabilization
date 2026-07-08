@@ -4,11 +4,21 @@ Bimanual pose-tracking controller (SDK / Rerun preview path).
 Mirrors run_pose_tracking_sim but drives G1InspireRobot instead of CoppeliaSim.
 CoppeliaSim path (pose_tracking.py) is unchanged.
 
-Three-phase routine:
+Three-phase routine (arms), with a config-driven grip wrapped around Phase 2
+(hands, gated by grip_force.enabled -- default True):
   1. Interpolate EE targets from default standing pose to grasp pose.
+  1.5. Close both hands to a light grip (grip_force.tau_baseline) and arm
+       the force-feedback controller. Skipped if Phase 1 was interrupted.
   2. Drive both hands via the trajectory source until duration expires or
      KeyboardInterrupt (use None duration for marker-driven interactive mode).
-  3. Interpolate EE targets back to default standing pose.
+     The grip force-feedback loop runs alongside the arm every step.
+  Release. Guaranteed hand-release back to open, run whenever grip was
+       engaged, regardless of how Phase 1.5/2 ended (normally or via
+       KeyboardInterrupt) -- mirrors grasp_sequence.py's guaranteed
+       release-before-return discipline (SDK-6-safety), applied to the
+       fingers here instead of the arm.
+  3. Interpolate EE targets back to default standing pose (hands already
+     open by this point).
 
 The caller owns the robot lifecycle: call connect/initialize/start_streaming
 before this function, and shutdown in a finally block after.
@@ -26,6 +36,7 @@ try:
 except ImportError:
     _HAS_RERUN = False
 
+from g1_spine_stabilization.controllers.grip_force import GraspController
 from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep
 from g1_spine_stabilization.trajectory.targets import (
     compute_hand_targets,
@@ -34,6 +45,22 @@ from g1_spine_stabilization.trajectory.targets import (
     L_EE_DEFAULT,
     R_EE_DEFAULT,
 )
+
+# Hand lerp durations (s) -- match grasp_sequence.py's Phase B/settle/D values
+# exactly, for consistency between the two hand-grip call sites.
+_HAND_CLOSE_TIME   = 1.5
+_HAND_SETTLE_TIME  = 0.5
+_HAND_RELEASE_TIME = 1.0
+
+
+def _lerp_hand_pose(robot, control_dt, q_from, q_to, duration):
+    """Smoothstep both hands together from q_from to q_to over duration seconds."""
+    n_steps = max(1, int(duration / control_dt))
+    for s in range(n_steps + 1):
+        t = smoothstep(s / n_steps)
+        q_hand = (1 - t) * q_from + t * q_to
+        robot.hand.set_joint_targets(q_left=q_hand, q_right=q_hand)
+        time.sleep(control_dt)
 
 # Default q used when the robot state isn't available yet (e.g. dry_run startup)
 ARM_DEFAULT_Q = np.array([
@@ -181,6 +208,11 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         duration = cfg["control"]["rotation_duration"]
     gravity_comp_enabled = cfg.get("gravity_comp", {}).get("enabled", True)
 
+    grip_cfg     = cfg.get("grip_force", {})
+    grip_enabled = grip_cfg.get("enabled", True)
+    ctrl_l = GraspController(grip_cfg) if grip_enabled else None
+    ctrl_r = GraspController(grip_cfg) if grip_enabled else None
+
     # ---------------------------------------------------------------
     # Source startup — detect object marker or initialise sine timer
     # ---------------------------------------------------------------
@@ -239,6 +271,22 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         print("[SDKController] At grasp pose.")
 
         # ---------------------------------------------------------------
+        # Phase 1.5: Close hands to a light grip
+        # ---------------------------------------------------------------
+        if grip_enabled:
+            print("[SDKController] Phase 1.5: closing hands to grip pose...")
+            try:
+                _lerp_hand_pose(robot, control_dt, ctrl_l.open_pose, ctrl_l.close_pose, _HAND_CLOSE_TIME)
+                time.sleep(_HAND_SETTLE_TIME)
+                state_l = robot.hand.get_state("left")
+                state_r = robot.hand.get_state("right")
+                ctrl_l.arm(np.asarray(state_l["q"], dtype=float))
+                ctrl_r.arm(np.asarray(state_r["q"], dtype=float))
+                print("[SDKController] Hands gripped.")
+            except KeyboardInterrupt:
+                print("\n[SDKController] KeyboardInterrupt — exiting hand-close early.")
+
+        # ---------------------------------------------------------------
         # Phase 2: Track target
         # ---------------------------------------------------------------
         print(f"[SDKController] Phase 2: tracking target (duration={duration}s)…")
@@ -261,6 +309,16 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                 sol_q, sol_tauff = ik.solve_ik(L_target, R_target, current_q, current_dq)
                 robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
                 current_q = sol_q
+
+                if grip_enabled:
+                    state_l = robot.hand.get_state("left")
+                    state_r = robot.hand.get_state("right")
+                    q_cmd_l = ctrl_l.step(np.asarray(state_l["force"], dtype=float),
+                                          np.asarray(state_l["q"], dtype=float), control_dt)
+                    q_cmd_r = ctrl_r.step(np.asarray(state_r["force"], dtype=float),
+                                          np.asarray(state_r["q"], dtype=float), control_dt)
+                    robot.hand.set_joint_targets(q_left=q_cmd_l, q_right=q_cmd_r)
+
                 if cam_for_preview is not None:
                     cam_for_preview.capture()
                 time.sleep(control_dt)
@@ -282,6 +340,20 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         except KeyboardInterrupt:
             print("\n[SDKController] KeyboardInterrupt — exiting Phase 2.")
 
+        # ---------------------------------------------------------------
+        # Guaranteed hand release -- runs whenever grip was engaged,
+        # regardless of how Phase 1.5/2 ended, before Phase 3 begins.
+        # ---------------------------------------------------------------
+        if grip_enabled:
+            print("[SDKController] Releasing hands...")
+            try:
+                ctrl_l.reset()
+                ctrl_r.reset()
+                _lerp_hand_pose(robot, control_dt, ctrl_l.close_pose, ctrl_l.open_pose, _HAND_RELEASE_TIME)
+                print("[SDKController] Hands released.")
+            except KeyboardInterrupt:
+                print("\n[SDKController] KeyboardInterrupt during hand release — proceeding to Phase 3.")
+
     # ---------------------------------------------------------------
     # Phase 3: Return to default pose
     # ---------------------------------------------------------------
@@ -295,29 +367,32 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
 
     steps_return = int(interpolation_time / control_dt)
     _last_log_t = time.monotonic() - 1.0   # fire on first step
-    for i in range(steps_return):
-        alpha = smoothstep(i / steps_return)
+    try:
+        for i in range(steps_return):
+            alpha = smoothstep(i / steps_return)
 
-        L_pos = (1 - alpha) * L_start_pos + alpha * L_EE_DEFAULT
-        R_pos = (1 - alpha) * R_start_pos + alpha * R_EE_DEFAULT
-        L_R   = slerp_rotation(L_start_rot, R_L_BASE, alpha)
-        R_R   = slerp_rotation(R_start_rot, R_R_BASE, alpha)
+            L_pos = (1 - alpha) * L_start_pos + alpha * L_EE_DEFAULT
+            R_pos = (1 - alpha) * R_start_pos + alpha * R_EE_DEFAULT
+            L_R   = slerp_rotation(L_start_rot, R_L_BASE, alpha)
+            R_R   = slerp_rotation(R_start_rot, R_R_BASE, alpha)
 
-        current_dq = np.zeros(14)
-        sol_q, sol_tauff = ik.solve_ik(
-            make_se3(L_pos, L_R),
-            make_se3(R_pos, R_R),
-            current_q, current_dq,
-        )
-        robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
-        current_q = sol_q
-        if cam_for_preview is not None:
-            cam_for_preview.capture()
-        time.sleep(control_dt)
+            current_dq = np.zeros(14)
+            sol_q, sol_tauff = ik.solve_ik(
+                make_se3(L_pos, L_R),
+                make_se3(R_pos, R_R),
+                current_q, current_dq,
+            )
+            robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
+            current_q = sol_q
+            if cam_for_preview is not None:
+                cam_for_preview.capture()
+            time.sleep(control_dt)
 
-        if time.monotonic() - _last_log_t >= 1.0:
-            _last_log_t = time.monotonic()
-            print(f"  {alpha * 100:.0f}%")
+            if time.monotonic() - _last_log_t >= 1.0:
+                _last_log_t = time.monotonic()
+                print(f"  {alpha * 100:.0f}%")
+    except KeyboardInterrupt:
+        print("\n[SDKController] KeyboardInterrupt — exiting Phase 3 early, proceeding to settle/shutdown.")
 
     settle_time = cfg.get("shutdown", {}).get("settle_time", 0.4)
     print(f"[SDKController] Settling for {settle_time:.2f}s before shutdown...")

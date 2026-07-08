@@ -84,10 +84,23 @@ class MarkerSource:
                            (use for mock trackers and unit tests).
         control_dt:        control loop period in seconds; used for stale-time
                            calculations (does not introduce delays in step()).
+        box_half_height:   the object marker is mounted on TOP of the held
+                           object, not at its center -- half the box's height
+                           (meters), subtracted along the object marker's own
+                           measured "out of the surface" axis (column 2 of its
+                           rotation matrix, per detector.py's solvePnP object
+                           points convention) at startup() Phase A, to recover
+                           the box's true geometric center. Uses the marker's
+                           actual measured orientation rather than assuming
+                           world-up, so it's still correct if the box isn't
+                           placed perfectly level. Default 0.0 preserves the
+                           old behavior (marker position taken as box_center
+                           directly).
     """
 
     def __init__(self, tracker, object_marker_id, target_marker_id,
-                 mode="orient-only", countdown=0.0, control_dt=0.02):
+                 mode="orient-only", countdown=0.0, control_dt=0.02,
+                 box_half_height=0.0):
         if mode not in ("orient-only", "6dof"):
             raise ValueError(f"mode must be 'orient-only' or '6dof', got {mode!r}")
         self._tracker = tracker
@@ -96,6 +109,7 @@ class MarkerSource:
         self._mode = mode
         self._countdown = countdown
         self._control_dt = control_dt
+        self._box_half_height = float(box_half_height)
         self._object_start_pos = None  # object's own position, set once by startup(), never changes
         self._target_start_pos = None  # target's position when tracking began (Phase B)
         self._target_start_rot = None  # target's rotation when tracking began (Phase B)
@@ -140,7 +154,11 @@ class MarkerSource:
             current = self._tracker.step()
             obj_obs = next((o for o in current if o.marker_id == self._obj_id), None)
             if obj_obs is not None:
-                self._object_start_pos = obj_obs.pose_in_pelvis[:3, 3].copy()
+                marker_pos = obj_obs.pose_in_pelvis[:3, 3]
+                marker_R   = obj_obs.pose_in_pelvis[:3, :3]
+                # Marker sits on top of the object -- shift down along its own
+                # measured "out of the surface" axis to recover the true center.
+                self._object_start_pos = marker_pos - self._box_half_height * marker_R[:, 2]
                 self._box_center = self._object_start_pos.copy()
                 print(f"[MarkerSource] Object marker detected: box_center={np.round(self._box_center, 4)}")
                 found_obj = True

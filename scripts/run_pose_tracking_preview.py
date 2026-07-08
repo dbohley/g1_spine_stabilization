@@ -55,15 +55,19 @@ class _AnimatedMockTracker:
     """Time-varying mock tracker for headless preview testing.
 
     Returns both markers on every step:
-    - Object marker (id from config): fixed at the natural box-center position.
+    - Object marker (id from config): fixed, simulating a marker mounted on
+      TOP of the box (box_center + box_half_height, identity rotation) --
+      mirrors the real physical setup so this mock exercises the same
+      marker-on-top correction MarkerSource applies to a real reading.
     - Target marker (id from config): rotates about X with a sine wave.
     """
 
     def __init__(self, object_marker_id, target_marker_id, box_center,
-                 amplitude=0.4, freq=0.2):
+                 amplitude=0.4, freq=0.2, box_half_height=0.0):
         self._obj_id = object_marker_id
         self._tgt_id = target_marker_id
         self._box_center = np.asarray(box_center, dtype=float)
+        self._box_half_height = box_half_height
         self._amplitude = amplitude
         self._freq = freq
         self._latest: dict = {}
@@ -73,7 +77,7 @@ class _AnimatedMockTracker:
         t = time.monotonic() - self._t_start
 
         obj_pose = np.eye(4)
-        obj_pose[:3, 3] = self._box_center
+        obj_pose[:3, 3] = self._box_center + np.array([0.0, 0.0, self._box_half_height])
         obs_obj = MarkerObservation(
             marker_id=self._obj_id,
             pose_in_pelvis=obj_pose,
@@ -213,6 +217,7 @@ def main():
 
     # Default box center in pelvis frame (same as run_pose_tracking_sim)
     box_size = list(cfg["box"]["size"])
+    box_half_height = box_size[2] / 2   # object marker sits on TOP of the box, not its center
     box_center_pelvis = np.array([
         L_EE_DEFAULT[0], 0.0, L_EE_DEFAULT[2],
     ])
@@ -258,8 +263,10 @@ def main():
             box_center=box_center_pelvis,
             amplitude=cfg["trajectory"]["sine"]["amplitude"],
             freq=cfg["trajectory"]["sine"]["frequency"],
+            box_half_height=box_half_height,
         )
-        source = MarkerSource(mock_tracker, obj_id, tgt_id, mode=args.tracking, countdown=0.0)
+        source = MarkerSource(mock_tracker, obj_id, tgt_id, mode=args.tracking, countdown=0.0,
+                              box_half_height=box_half_height)
         duration = None   # use config default
         cam_for_preview = RealSenseCamera(dry_run=True)
         cam_for_preview.connect()
@@ -284,7 +291,8 @@ def main():
         tracker = MarkerTracker(
             frame_source, detector, intrinsics, T_opt_to_d435, T_d435_to_pelvis
         )
-        source = MarkerSource(tracker, obj_id, tgt_id, mode=args.tracking, countdown=3.0)
+        source = MarkerSource(tracker, obj_id, tgt_id, mode=args.tracking, countdown=3.0,
+                              box_half_height=box_half_height)
         duration = float("inf")   # run until Ctrl+C
         # cam_for_preview stays None: RealSenseSource.read() auto-pushes frames via the SDK
 

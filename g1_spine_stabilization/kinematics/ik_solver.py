@@ -434,6 +434,16 @@ class G1HandIK:
             self.opti.solve()
             sol_q = self.opti.value(self.var_q)
         except Exception as e:
+            if "NonIpopt_Exception_Thrown" in str(e):
+                # CasADi/Ipopt checks for a pending SIGINT during long solves and
+                # aborts by throwing its own C++ KeyboardInterruptException, which
+                # crosses into Python as a plain Exception (not a real
+                # KeyboardInterrupt -- that's a BaseException, so it would skip this
+                # clause entirely). Re-raise as the real thing so callers looping on
+                # solve_ik() stop immediately instead of the Ctrl-C being silently
+                # absorbed as an ordinary solver failure.
+                print("[G1HandIK] Solve interrupted (Ctrl-C) -- propagating KeyboardInterrupt.")
+                raise KeyboardInterrupt("IK solve interrupted") from e
             self.ipopt_exhaustion_count += 1
             print(f"[G1HandIK] IK warning (exhaustion #{self.ipopt_exhaustion_count}): {e}")
             sol_q = self.opti.debug.value(self.var_q)

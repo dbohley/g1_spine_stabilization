@@ -1161,3 +1161,255 @@ out two other suspected causes along the way.
 - `configs/default.yaml`'s `d435_link_to_optical.rpy` — left as-is; confirmed
   correct by the user, only CLAUDE.md's documentation of it was wrong.
 
+## Ctrl-C interrupt-swallowing fix
+
+### What was done
+
+Fixed a real responsiveness bug reported directly from a live-hardware run:
+stopping `run_pose_tracking_preview.py` with Ctrl-C could take 8+ presses over
+several seconds before the script actually entered its shutdown sequence,
+each press instead printing `[G1HandIK] IK warning (exhaustion #N)` and the
+control loop continuing as if nothing happened.
+
+**The actual bug**: `solve_ik()`'s `except Exception as e:`
+(`ik_solver.py:436`) was catching more than genuine IPOPT convergence
+failures. CasADi's Ipopt interface checks for a pending SIGINT *during* a
+long solve and aborts it by throwing its own C++ `KeyboardInterruptException`
+(visible in the log as `CasADi ... WARNING("KeyboardInterruptException")`).
+That crosses into Python as a plain exception — not a real Python
+`KeyboardInterrupt` (a `BaseException`, so it would never have reached this
+`except Exception` clause in the first place) — with a message containing
+`return_status is 'NonIpopt_Exception_Thrown'`. The existing code treated
+this identically to an ordinary solver failure: incremented
+`ipopt_exhaustion_count`, printed a warning, fell back to
+`opti.debug.value()`, and returned normally, completely absorbing the Ctrl-C.
+Since `solve_ik()` costs ~70-160ms/call and dominates each loop iteration's
+wall time (documented "Known timing floor"), most Ctrl-C presses land
+*inside* an active solve and get swallowed this way — matching exactly what
+was observed.
+
+**Fix**: `solve_ik()` now checks for the `NonIpopt_Exception_Thrown` signature
+before falling into the exhaustion-counting path. When present: skip the
+counter, print a distinct "interrupted" message, and re-raise as a real
+`KeyboardInterrupt` so it propagates to the caller's existing (already
+correctly structured, per SDK-6-safety) interrupt handling. Any other
+exception text is unaffected — genuine solver failures still fall back to
+`opti.debug.value()` exactly as before.
+
+Fixing this centrally in `ik_solver.py` exposed two related gaps in callers
+that loop over `solve_ik()`, both fixed in the same pass:
+- `sdk_pose_tracking.py`'s Phase 3 (return-to-default) had no
+  `try/except KeyboardInterrupt` at all, unlike Phase 1/2 in the same file —
+  added the same pattern, falling through unconditionally to the existing
+  settle-sleep + "Done." lines.
+- `grasp_sequence.py`'s Phase R wrapped the return-motion loop *and* the
+  trailing settle-sleep in the same `try` — an interrupt during the loop
+  jumped straight past the settle-sleep to the outer `except`. This was
+  previously unreachable in practice only because the ik_solver.py bug was
+  swallowing these interrupts too. Restructured so only the loop itself is
+  wrapped, and the settle-sleep always runs afterward regardless of how the
+  loop ended (mirrors the existing Phase D pattern already in this file).
+
+### Tests
+
+- New `tests/test_ik_interrupt_handling.py` (3 tests): the
+  `NonIpopt_Exception_Thrown` signature raises `KeyboardInterrupt` and does
+  *not* increment `ipopt_exhaustion_count`; an ordinary solver failure
+  (different message) still increments the counter and falls back normally,
+  unchanged.
+- `tests/test_sdk_transport.py`: new test interrupting the 4th `solve_ik()`
+  call (deterministically the first call inside Phase 3, given `cfg_fast`'s
+  known Phase-1 step count and `duration=0.0` skipping Phase 2 entirely) —
+  confirms `run_pose_tracking_sdk` doesn't raise and still settles.
+- `tests/test_grasp_demo_safety.py`: new test interrupting the first
+  `solve_ik()` call inside Phase R — confirms the settle-before-shutdown
+  pause still runs even though the interruption happened inside Phase R's
+  loop, not before it.
+
+### Things not modified
+
+- No signal-handling code (`signal.signal(SIGINT, ...)`) was added — CasADi
+  already interrupts long solves responsively on its own; the bug was purely
+  that our own broad `except Exception` re-labeled that interrupt as an
+  ordinary solver failure instead of letting it propagate.
+- `pose_tracking.py` (CoppeliaSim path) benefits from the `ik_solver.py` fix
+  automatically (a real `KeyboardInterrupt` now propagates instead of being
+  swallowed) but has no `try/except` of its own — left as-is, since it's the
+  sim path, not the hardware-safety-critical one, and an uncaught interrupt
+  there is a strict improvement (immediate stop) over the previous silent
+  swallow-and-continue behavior.
+
+## Light grip during pose tracking
+
+### What was done
+
+`run_pose_tracking_sdk` (`sdk_pose_tracking.py`) previously only drove the
+arms — it never commanded the Inspire hands, even though
+`run_pose_tracking_preview.py` already constructs the robot with
+`hand_side="both"`. Grip control (`GraspController`, `grip_force.py`) existed
+only in the separate, static `grasp_demo.py`/`grasp_sequence.py` hold-in-place
+demo. Wired the same controller into the actual tracking flow so the hands
+hold a light, config-driven grip (`grip_force.tau_baseline`, already
+config-driven — the ask was to make sure it's actually applied during
+tracking, not to add a new tunable) while the arms track a moving target.
+
+New "Phase 1.5" between Phase 1 (arm to grasp) and Phase 2 (track): lerp both
+hands from `open_pose` to `close_pose` (1.5s, matching `grasp_sequence.py`'s
+Phase B), settle 0.5s, then `ctrl.arm(q_measured)` to snapshot the
+force-feedback baseline. During Phase 2, `ctrl_l.step()`/`ctrl_r.step()` run
+every iteration alongside the arm's `solve_ik()`/`set_joint_targets()`. A
+guaranteed-release step runs immediately after Phase 2 (regardless of how it
+ended — clean finish or `KeyboardInterrupt`), lerping both hands back to
+`open_pose` over 1.0s, *before* Phase 3's arm-return begins — mirrors
+`grasp_sequence.py`'s existing Phase D-before-R order (user's explicit
+choice: release where tracking left off, don't carry the object through the
+arm-return motion still gripped). All of this is gated by a new
+`grip_force.enabled` config flag (default `true`), following the same
+on/off convention as `trajectory.rate_limit.enabled` /
+`trajectory.noise_filter.enabled` / `gravity_comp.enabled`.
+
+`GraspController.step()` is already safe to call before `arm()` has been
+reached (returns a static `close_pose` hold per its existing docstring), so
+no extra state flag was needed to guard Phase 2's grip step against a
+Ctrl-C that landed mid-close during Phase 1.5.
+
+### Tests
+
+Three new tests in `tests/test_sdk_transport.py`: grip engages (records a
+closed-ish hand command) and releases (last command ≈ `HAND_OPEN_POSE`) on a
+normal run; `grip_force.enabled=False` issues zero hand commands, preserving
+today's arm-only behavior exactly; and a `KeyboardInterrupt` injected inside
+Phase 2 still ends with the hands released.
+
+### Things not modified
+
+- Acceleration-coupled grip tightening (`tau_des = tau_baseline +
+  k_a*||a_arm||`) — user explicitly chose a fixed light grip for now; the
+  extension point already documented in `grip_force.py`'s docstring remains
+  unused.
+- Hand-close/settle/release durations (1.5s/0.5s/1.0s) are hardcoded in
+  `sdk_pose_tracking.py`, matching `grasp_sequence.py`'s existing values
+  exactly rather than adding new config keys — the user only asked for the
+  grip *amount* to be tunable, which `grip_force.tau_baseline` already was.
+- `grasp_demo.py`/`grasp_sequence.py` — unchanged; still the standalone
+  static hold-in-place validation path, independent of this integration.
+
+## d435_link_to_optical calibration (resolves the ~10cm marker-height discrepancy)
+
+### What was done
+
+Added `perception/calibration.py` (pure math: `solve_optical_to_d435`,
+`se3_to_xyz_rpy`, `pose_error`) and `scripts/calibrate_camera_extrinsics.py`
+(camera-only CLI, reuses the existing `RealSenseSource`/`AprilTagDetector`/
+`MarkerTracker` stack) to solve for `perception.d435_link_to_optical`'s
+xyz + rpy from one marker placed at a physically-measured, known pelvis-frame
+position (assumed identity orientation). `T_d435_to_pelvis` (Pinocchio FK
+against the URDF) is trusted and not solved for. Default mode prints the
+computed correction for manual paste into the YAML (no auto-write, per the
+existing caution around this value — see "SDK-6 marker-tracking fix" above).
+A `--verify` mode checks the *current* config's residual error against a
+second known point without doing any correction math, to catch a
+`perception.marker_size` scale error masquerading as a mounting offset (the
+two look identical at one distance, diverge at another).
+
+**Result, run against the two markers already in the robot's field of view**
+(object marker ID=0 at physically-measured pelvis position (0.40, 0, 0),
+target marker ID=2 at (0.50, 0, 0), both close to identity orientation):
+
+- Calibrating off marker ID=0: measured error with the old
+  `xyz: [0,0,0]` / `rpy: [-1.5708, 0.0, -1.5708]` was **10.06cm position,
+  9.19° rotation** — matches the previously-reported ~10cm discrepancy
+  closely enough to confirm it as the root cause. Computed correction:
+  `xyz: [-0.0860, -0.0002, -0.0384]`, `rpy: [-1.4118, 0.0076, -1.5896]`.
+- Applied that correction to `configs/default.yaml`, then `--verify`'d
+  against marker ID=2 (a different marker, different distance, never used
+  in the fit): **6mm position error, 4.05° rotation error.** The position
+  residual dropped by an order of magnitude and shows no sign of the
+  distance-dependent growth a `marker_size` scale error would produce
+  (50cm is 25% farther than 40cm; a proportional scale error would show up
+  much larger than 6mm) — the position fix generalizes. The remaining 4°
+  rotation residual is plausibly just physical marker-placement imprecision
+  (the user's own caveat when placing them: "close to identity with some
+  room for error, I can't set them perfectly"), not a code/calibration bug.
+
+**Left applied in `configs/default.yaml`** pending the user's final review —
+a large, consistent improvement, but flagged as tentative until confirmed
+(see the config comment).
+
+### Tests
+
+5 new hardware-free tests in `tests/test_calibration.py`: `solve_optical_to_d435`
+recovers a known synthetic transform exactly; `se3_to_xyz_rpy` round-trips
+against `optical_to_d435_from_config`; `pose_error` matches known synthetic
+position/rotation offsets.
+
+### Out of scope / not modified
+
+- `perception.marker_size` — not touched; the verify-mode result argues
+  against it being a significant factor here, but wasn't ruled out with a
+  dedicated distance-sweep test.
+- URDF `d435_link` mount origin — not touched (Hard Rule: URDF changes need
+  explicit approval); any real CAD mounting error is absorbed into the
+  `d435_link_to_optical` correction instead, which is the intended,
+  config-tunable place for it.
+
+## box_half_height: correcting for the object marker sitting on top of the box
+
+### What was done
+
+The object marker is physically mounted on **top** of the held object, but
+`MarkerSource` was treating the marker's raw measured position as the box's
+geometric center directly. `compute_hand_targets` already offsets each hand
+by `box_half_width` from `box_center` in Y — confirmed (via `grep`) to be
+the *only* place `box.size` was read anywhere in the package; `box_size[2]`
+(height) was read nowhere. So every hand target was too high by however far
+the marker sits above the true center (8cm with the default `0.16` cube).
+
+Fixed at the source: `MarkerSource.__init__` gained a `box_half_height`
+kwarg (default `0.0`, preserving old behavior for any caller that doesn't
+pass it), applied once in `startup()` Phase A where `self._object_start_pos`
+is first captured — subtracting `box_half_height * marker_R[:, 2]` (the
+marker's own measured "out of the surface" axis — `detector.py`'s solvePnP
+object points are documented "Z out of marker" — expressed in the pelvis
+frame, not a hardcoded world-Z). Using the marker's actual measured
+orientation rather than assuming it's level was a deliberate choice
+confirmed with the user, and costs nothing extra since the full pose
+(including rotation) is already read at that moment. Fixing it here (not
+just at the `run_pose_tracking_preview.py` call site) matters because
+`6dof` mode's ongoing delta-tracking uses this same internal value as its
+base reference for the rest of a session, not just the one-shot returned
+`box_center`.
+
+`run_pose_tracking_preview.py` now computes `box_half_height =
+box_size[2] / 2` and passes it into both `MarkerSource(...)` construction
+sites (`--source mock` and `--source marker`). `_AnimatedMockTracker` was
+also updated to simulate a marker mounted on top of the box (offset by
+`box_half_height` in Z) rather than handing back the ground-truth center
+directly — makes the mock a more faithful stand-in for a real marker
+reading and means `--source mock --tracking 6dof` dry-run testing actually
+exercises the new correction path end-to-end (verified: with
+`box.size=[0.16,0.16,0.08]` temporarily set, the dry-run round-trip
+correctly reproduced the original intended `box_center`, confirming the
+mock's added offset and `MarkerSource`'s new correction cancel out exactly
+as designed).
+
+### Tests
+
+3 new tests in `tests/test_marker_source.py`: identity-rotation marker case
+(offset subtracts along world Z); a 90°-tilted marker case (offset follows
+the marker's measured Z axis into world -Y instead, proving it isn't
+hardcoded to world-up); and `box_half_height=0.0` reproduces the exact
+pre-change behavior (regression guard). All 12 pre-existing tests in the
+file pass unchanged (none pass `box_half_height`, so they exercise the new
+default).
+
+### Things not modified
+
+- `compute_hand_targets`/`trajectory/targets.py` — unchanged; the width
+  offset there was already correct, this fix is orthogonal (corrects where
+  `box_center` itself comes from, not how hands are offset from it).
+- `pose_tracking.py` (CoppeliaSim path) and `grasp_sequence.py`'s Phase 0 —
+  unchanged; both use a synthetic `box_center` (`[L_EE_DEFAULT[0], 0.0,
+  L_EE_DEFAULT[2]]`), never derived from a marker reading, so there's no
+  marker-on-top offset to correct there.
+

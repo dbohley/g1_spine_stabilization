@@ -165,6 +165,68 @@ def test_6dof_box_center_tracks_target_displacement_not_absolute_position():
     )
 
 
+class _StaticObjTracker:
+    """Single-shot tracker: object marker at a given position/rotation, plus
+    a fixed target marker -- used for box_half_height correction tests."""
+
+    def __init__(self, obj_pos, obj_theta, tgt_pos):
+        self._obj_obs = _make_obs(OBJ_ID, obj_pos, theta=obj_theta)
+        self._tgt_obs = _make_obs(TGT_ID, tgt_pos)
+        self._latest = {OBJ_ID: self._obj_obs, TGT_ID: self._tgt_obs}
+
+    def step(self):
+        return [self._obj_obs, self._tgt_obs]
+
+    def get_latest(self, marker_id):
+        return self._latest.get(marker_id)
+
+
+def test_box_half_height_world_z_case():
+    """With an identity-rotation object marker, box_half_height subtracts
+    straight down along world/pelvis Z -- the marker-on-top correction."""
+    obj_pos = np.array([0.35, 0.0, 0.20])
+    H = 0.08
+    tracker = _StaticObjTracker(obj_pos, obj_theta=0.0, tgt_pos=BOX_CENTER)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0,
+                          box_half_height=H)
+    box_center = source.startup()
+    expected = obj_pos - np.array([0.0, 0.0, H])
+    np.testing.assert_allclose(box_center, expected, atol=1e-9)
+
+
+def test_box_half_height_follows_tilted_marker_orientation():
+    """With a tilted object marker (90 deg about X), the correction follows
+    the marker's own measured Z axis (now pointing along -Y, not world Z),
+    proving it doesn't assume world-up."""
+    obj_pos = np.array([0.35, 0.0, 0.20])
+    H = 0.08
+    theta = math.pi / 2
+    tracker = _StaticObjTracker(obj_pos, obj_theta=theta, tgt_pos=BOX_CENTER)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0,
+                          box_half_height=H)
+    box_center = source.startup()
+
+    ct, st = math.cos(theta), math.sin(theta)
+    R = np.array([[1, 0, 0], [0, ct, -st], [0, st, ct]])
+    expected = obj_pos - H * R[:, 2]
+    np.testing.assert_allclose(box_center, expected, atol=1e-9)
+
+    world_z_expected = obj_pos - np.array([0.0, 0.0, H])
+    assert not np.allclose(box_center, world_z_expected, atol=1e-3), (
+        "box_center should follow the marker's tilted orientation, not assume world Z"
+    )
+
+
+def test_box_half_height_zero_default_matches_pre_change_behavior():
+    """box_half_height=0.0 (default) reproduces the exact old behavior:
+    box_center equals the raw marker position, no offset."""
+    obj_pos = np.array([0.35, 0.0, 0.20])
+    tracker = _StaticObjTracker(obj_pos, obj_theta=0.3, tgt_pos=BOX_CENTER)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0)
+    box_center = source.startup()
+    np.testing.assert_allclose(box_center, obj_pos, atol=1e-9)
+
+
 def test_step_returns_last_known_on_empty_frame():
     """When no new detection, step() returns the previously seen values."""
     class _TwoShotThenEmpty:
