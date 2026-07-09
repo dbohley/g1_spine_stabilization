@@ -53,9 +53,24 @@ class MarkerSource:
 
     Two tracking modes:
       "orient-only" — box_center is captured from the object marker once at
-          startup and held fixed; theta follows the target marker's X-rotation.
-      "6dof"        — box_center tracks the target marker's position each step;
-          theta still follows the target marker's X-rotation.
+          startup and held fixed; theta tracks the target marker's rotation
+          RELATIVE TO the target's own starting orientation (not the target's
+          absolute orientation -- see below).
+      "6dof"        — box_center tracks the object's own starting position,
+          offset by however far the target marker has moved from ITS OWN
+          starting position (a relative/delta displacement, not the target's
+          absolute position); theta is the same relative-rotation tracking
+          as orient-only.
+
+    Both modes track the target's DISPLACEMENT from where it was when
+    tracking began, not its absolute pose. This matters because the object
+    (held in the robot's hands) and the target (e.g. held by a person) are
+    generally in different physical locations -- if box_center were simply
+    set to the target's raw absolute position, the hands would be commanded
+    to wherever the target physically is in space, not to the object's own
+    position shifted by how far the target has moved. (This was a real bug,
+    found via a live-hardware test with a real object and target in
+    different locations -- see docs/followups.md.)
 
     Args:
         tracker:           a MarkerTracker or duck-typed equivalent whose step()
@@ -69,10 +84,23 @@ class MarkerSource:
                            (use for mock trackers and unit tests).
         control_dt:        control loop period in seconds; used for stale-time
                            calculations (does not introduce delays in step()).
+        box_half_height:   the object marker is mounted on TOP of the held
+                           object, not at its center -- half the box's height
+                           (meters), subtracted along the object marker's own
+                           measured "out of the surface" axis (column 2 of its
+                           rotation matrix, per detector.py's solvePnP object
+                           points convention) at startup() Phase A, to recover
+                           the box's true geometric center. Uses the marker's
+                           actual measured orientation rather than assuming
+                           world-up, so it's still correct if the box isn't
+                           placed perfectly level. Default 0.0 preserves the
+                           old behavior (marker position taken as box_center
+                           directly).
     """
 
     def __init__(self, tracker, object_marker_id, target_marker_id,
-                 mode="orient-only", countdown=0.0, control_dt=0.02):
+                 mode="orient-only", countdown=0.0, control_dt=0.02,
+                 box_half_height=0.0):
         if mode not in ("orient-only", "6dof"):
             raise ValueError(f"mode must be 'orient-only' or '6dof', got {mode!r}")
         self._tracker = tracker
@@ -81,7 +109,11 @@ class MarkerSource:
         self._mode = mode
         self._countdown = countdown
         self._control_dt = control_dt
-        self._box_center = None      # set by startup()
+        self._box_half_height = float(box_half_height)
+        self._object_start_pos = None  # object's own position, set once by startup(), never changes
+        self._target_start_pos = None  # target's position when tracking began (Phase B)
+        self._target_start_rot = None  # target's rotation when tracking began (Phase B)
+        self._box_center = None        # live returned value; == object_start_pos in orient-only mode
         self._last_theta = 0.0
         self._last_obj_obs = None
         self._last_tgt_obs = None
@@ -94,11 +126,21 @@ class MarkerSource:
         self._object_warned_2s = False
         self._object_warned_5s = False
 
+    def _theta_from_target_rotation(self, R_current: np.ndarray) -> float:
+        """Target's roll relative to its own starting orientation (not absolute)."""
+        R_delta = self._target_start_rot.T @ R_current
+        return float(np.arctan2(R_delta[2, 1], R_delta[2, 2]))
+
+    def _box_center_from_target_position(self, pos_current: np.ndarray) -> np.ndarray:
+        """Object's own start position, shifted by the target's displacement from its own start."""
+        return self._object_start_pos + (pos_current - self._target_start_pos)
+
     def startup(self, timeout=10.0) -> np.ndarray:
         """Block until both markers are detected, then optionally count down.
 
-        Phase A: waits for the object marker → records box_center.
-        Phase B: waits for the target marker → pre-seeds _last_theta.
+        Phase A: waits for the object marker → records the object's own start position.
+        Phase B: waits for the target marker → records its start pose (position + rotation)
+                 as the reference for relative tracking; _last_theta starts at 0.0.
         Phase C: counts down self._countdown seconds while continuously
                  refreshing readings; skipped when countdown=0.0.
 
@@ -112,7 +154,12 @@ class MarkerSource:
             current = self._tracker.step()
             obj_obs = next((o for o in current if o.marker_id == self._obj_id), None)
             if obj_obs is not None:
-                self._box_center = obj_obs.pose_in_pelvis[:3, 3].copy()
+                marker_pos = obj_obs.pose_in_pelvis[:3, 3]
+                marker_R   = obj_obs.pose_in_pelvis[:3, :3]
+                # Marker sits on top of the object -- shift down along its own
+                # measured "out of the surface" axis to recover the true center.
+                self._object_start_pos = marker_pos - self._box_half_height * marker_R[:, 2]
+                self._box_center = self._object_start_pos.copy()
                 print(f"[MarkerSource] Object marker detected: box_center={np.round(self._box_center, 4)}")
                 found_obj = True
                 break
@@ -130,11 +177,10 @@ class MarkerSource:
             current = self._tracker.step()
             tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
             if tgt_obs is not None:
-                R = tgt_obs.pose_in_pelvis[:3, :3]
-                self._last_theta = float(np.arctan2(R[2, 1], R[2, 2]))
-                if self._mode == "6dof":
-                    self._box_center = tgt_obs.pose_in_pelvis[:3, 3].copy()
-                print(f"[MarkerSource] Target marker detected: theta={math.degrees(self._last_theta):.1f}°")
+                self._target_start_pos = tgt_obs.pose_in_pelvis[:3, 3].copy()
+                self._target_start_rot = tgt_obs.pose_in_pelvis[:3, :3].copy()
+                self._last_theta = 0.0  # no displacement yet -- this IS the target's start
+                print(f"[MarkerSource] Target marker detected (start reference recorded)")
                 found_tgt = True
                 break
             time.sleep(0.05)
@@ -158,10 +204,9 @@ class MarkerSource:
                 current = self._tracker.step()
                 tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
                 if tgt_obs is not None:
-                    R = tgt_obs.pose_in_pelvis[:3, :3]
-                    self._last_theta = float(np.arctan2(R[2, 1], R[2, 2]))
+                    self._last_theta = self._theta_from_target_rotation(tgt_obs.pose_in_pelvis[:3, :3])
                     if self._mode == "6dof":
-                        self._box_center = tgt_obs.pose_in_pelvis[:3, 3].copy()
+                        self._box_center = self._box_center_from_target_position(tgt_obs.pose_in_pelvis[:3, 3])
                 time.sleep(0.05)
             print("[MarkerSource] Go!")
 
@@ -177,7 +222,7 @@ class MarkerSource:
 
         Returns:
             box_center: (3,) ndarray in pelvis frame
-            theta:      float, Rx rotation angle in radians
+            theta:      float, target's rotation relative to its own start (radians)
         """
         if self._box_center is None:
             raise RuntimeError("Call startup() before step()")
@@ -188,10 +233,9 @@ class MarkerSource:
         tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
         self._last_tgt_obs = tgt_obs
         if tgt_obs is not None:
-            R = tgt_obs.pose_in_pelvis[:3, :3]
-            self._last_theta = float(np.arctan2(R[2, 1], R[2, 2]))
+            self._last_theta = self._theta_from_target_rotation(tgt_obs.pose_in_pelvis[:3, :3])
             if self._mode == "6dof":
-                self._box_center = tgt_obs.pose_in_pelvis[:3, 3].copy()
+                self._box_center = self._box_center_from_target_position(tgt_obs.pose_in_pelvis[:3, 3])
             self._target_stale_frames = 0
             self._stale_warned_05 = False
             self._stale_warned_3 = False
@@ -243,3 +287,161 @@ class MarkerSource:
     def object_lost(self) -> bool:
         """True if object marker has not been seen for more than 2s during tracking."""
         return self._object_stale_frames * self._control_dt > 2.0
+
+    @property
+    def tracker(self):
+        """The wrapped tracker (e.g. MarkerTracker), for diagnostics such as
+        get_diagnostic_pose(). Not available on SineSource."""
+        return self._tracker
+
+    @property
+    def obj_id(self):
+        """AprilTag ID of the object marker."""
+        return self._obj_id
+
+    @property
+    def tgt_id(self):
+        """AprilTag ID of the target marker."""
+        return self._tgt_id
+
+
+class RateLimitedSource:
+    """Slew-rate-limits (box_center, theta) from any wrapped trajectory source.
+
+    Clamped against the ACTUAL measured wall-clock dt between step() calls
+    (not the assumed control_dt). The control loop's true period is set by
+    IK solve cost (~90-180ms measured), not control_dt (0.02s/50Hz), so a
+    source sampling a real-time signal (SineSource's sine, or a live/mock
+    marker's rotation) produces per-step deltas much larger than a properly
+    -paced loop would, which IK's warm start then chases abruptly. This
+    decouples "how fast the commanded target is allowed to move" from "how
+    slowly the control loop happens to actually run" -- a slew-rate-limiter
+    on the INPUT target, architecturally distinct from G1HandIK's
+    WeightedMovingFilter (a moving average on the IK's OUTPUT), so the two
+    do not double-filter.
+
+    Duck-types the same .startup()/.step() contract as SineSource/MarkerSource,
+    so it wraps either uniformly. Unknown attributes (e.g. MarkerSource's
+    last_obj_obs/object_lost/target_stale_seconds) are proxied to the
+    wrapped source via __getattr__.
+    """
+
+    def __init__(self, inner, max_theta_rate, max_pos_rate, clock=time.monotonic):
+        self._inner = inner
+        self._max_theta_rate = float(max_theta_rate)  # rad/s
+        self._max_pos_rate = float(max_pos_rate)       # m/s
+        self._clock = clock
+        self._last_t = None
+        self._last_box_center = None
+        self._last_theta = None
+
+    def startup(self, *args, **kwargs):
+        box_center = self._inner.startup(*args, **kwargs)
+        self._last_t = None  # next step() is always unclamped (fresh seed)
+        return box_center
+
+    def step(self) -> tuple:
+        box_center, theta = self._inner.step()
+        box_center = np.asarray(box_center, dtype=float)
+        theta = float(theta)
+        now = self._clock()
+
+        if self._last_t is None:
+            self._last_box_center = box_center.copy()
+            self._last_theta = theta
+            self._last_t = now
+            return box_center.copy(), theta
+
+        dt = max(now - self._last_t, 1e-6)
+        self._last_t = now
+
+        dtheta = theta - self._last_theta
+        max_dtheta = self._max_theta_rate * dt
+        if abs(dtheta) > max_dtheta:
+            dtheta = math.copysign(max_dtheta, dtheta)
+        self._last_theta = self._last_theta + dtheta
+
+        delta = box_center - self._last_box_center
+        dist = np.linalg.norm(delta)
+        max_dist = self._max_pos_rate * dt
+        if dist > max_dist and dist > 0.0:
+            delta = delta * (max_dist / dist)
+        self._last_box_center = self._last_box_center + delta
+
+        return self._last_box_center.copy(), self._last_theta
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class NoiseFilteredSource:
+    """Smooths real-sensor (box_center, theta) noise from a wrapped source.
+
+    Two stages, deliberately in this order:
+      1. Median-of-N (per-DOF): rejects a single-frame outlier (e.g. a
+         partially-occluded/motion-blurred AprilTag misdecode for exactly one
+         frame) that an EMA alone would partially incorporate.
+      2. Single-pole EMA: smooths the remaining small, continuous jitter that
+         solvePnP produces even for a stationary marker -- noise well BELOW
+         RateLimitedSource's clamp threshold, which only engages on deltas
+         LARGER than its configured rate.
+
+    Architecturally distinct from RateLimitedSource (cleans the raw signal
+    vs. bounds the rate of the already-clean signal) and from G1HandIK's
+    WeightedMovingFilter (smooths solve_ik's OUTPUT sol_q; this smooths the
+    trajectory's INPUT before compute_hand_targets/solve_ik ever see it).
+    Intended composition: source -> NoiseFilteredSource -> RateLimitedSource
+    -> controller (noise-filtering innermost since it cleans the raw signal;
+    slew-limiting outermost since it bounds the rate of that cleaned signal,
+    including any real fast motion that follows).
+
+    Duck-types .startup()/.step(); proxies unknown attributes to the wrapped
+    source via __getattr__, matching RateLimitedSource's pattern.
+    """
+
+    def __init__(self, inner, median_window=5, ema_alpha=0.3):
+        if median_window < 1 or median_window % 2 == 0:
+            raise ValueError(
+                f"median_window must be a positive odd integer, got {median_window}"
+            )
+        self._inner = inner
+        self._median_window = int(median_window)
+        self._ema_alpha = float(ema_alpha)
+        self._box_hist = []
+        self._theta_hist = []
+        self._ema_box = None
+        self._ema_theta = None
+
+    def startup(self, *args, **kwargs):
+        box_center = self._inner.startup(*args, **kwargs)
+        self._box_hist, self._theta_hist = [], []
+        self._ema_box, self._ema_theta = None, None
+        return box_center
+
+    def step(self) -> tuple:
+        box_center, theta = self._inner.step()
+        box_center = np.asarray(box_center, dtype=float)
+        theta = float(theta)
+
+        self._box_hist.append(box_center.copy())
+        self._theta_hist.append(theta)
+        if len(self._box_hist) > self._median_window:
+            self._box_hist.pop(0)
+            self._theta_hist.pop(0)
+
+        if len(self._box_hist) < self._median_window:
+            med_box, med_theta = box_center, theta
+        else:
+            med_box = np.median(np.stack(self._box_hist, axis=0), axis=0)
+            med_theta = float(np.median(self._theta_hist))
+
+        if self._ema_box is None:
+            self._ema_box, self._ema_theta = med_box.copy(), med_theta
+        else:
+            self._ema_box = self._ema_alpha * med_box + (1.0 - self._ema_alpha) * self._ema_box
+            self._ema_theta = self._ema_alpha * med_theta + (1.0 - self._ema_alpha) * self._ema_theta
+
+        return self._ema_box.copy(), self._ema_theta
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)

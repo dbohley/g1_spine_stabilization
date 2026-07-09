@@ -7,7 +7,6 @@ from g1_spine_stabilization.perception.types import MarkerObservation
 from g1_spine_stabilization.perception.detector import (
     AprilTagDetector, CameraIntrinsics
 )
-from g1_spine_stabilization.perception.frames import compose_to_pelvis
 
 
 class MarkerTracker:
@@ -28,6 +27,12 @@ class MarkerTracker:
         self._T_optical_to_d435 = T_optical_to_d435
         self._T_d435_to_pelvis = T_d435_to_pelvis
         self._latest: dict[int, MarkerObservation] = {}
+        # Intermediate transform-chain stages, kept per marker for diagnostics
+        # (see get_diagnostic_pose) -- isolating a real-world calibration
+        # error (e.g. the ~10cm marker-height discrepancy) needs comparing
+        # physical measurements against each stage, not just the final pose.
+        self._last_optical: dict[int, np.ndarray] = {}
+        self._last_d435_mount: dict[int, np.ndarray] = {}
 
     def step(self) -> list[MarkerObservation]:
         """Read one frame, detect markers, return current-frame observations."""
@@ -38,11 +43,10 @@ class MarkerTracker:
         raw = self._detector.detect(frame, self._intrinsics)
         observations = []
         for det in raw:
-            pose_pelvis = compose_to_pelvis(
-                det.pose_in_optical,
-                self._T_optical_to_d435,
-                self._T_d435_to_pelvis,
-            )
+            pose_d435_mount = self._T_optical_to_d435 @ det.pose_in_optical
+            pose_pelvis = self._T_d435_to_pelvis @ pose_d435_mount
+            self._last_optical[det.marker_id] = det.pose_in_optical
+            self._last_d435_mount[det.marker_id] = pose_d435_mount
             obs = MarkerObservation(
                 marker_id=det.marker_id,
                 pose_in_pelvis=pose_pelvis,
@@ -55,6 +59,20 @@ class MarkerTracker:
 
     def get_latest(self, marker_id: int) -> Optional[MarkerObservation]:
         return self._latest.get(marker_id)
+
+    def get_diagnostic_pose(self, marker_id: int) -> Optional[dict]:
+        """Return {'optical', 'd435_mount', 'pelvis'} 4x4 poses for the most
+        recent detection of marker_id, or None if never seen. Lets a human
+        compare a physical measurement against each transform stage to
+        isolate which one introduces a calibration error, rather than only
+        seeing the final composed pelvis-frame pose."""
+        if marker_id not in self._latest:
+            return None
+        return {
+            "optical": self._last_optical[marker_id],
+            "d435_mount": self._last_d435_mount[marker_id],
+            "pelvis": self._latest[marker_id].pose_in_pelvis,
+        }
 
 
 class MockMarkerTracker:

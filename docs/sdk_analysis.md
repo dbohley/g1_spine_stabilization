@@ -310,6 +310,22 @@ Split ownership:
 So: keep `step_realtime` for the sim controller; for hardware, set targets in a
 self-paced loop and let the SDK's 250 Hz thread handle motor I/O.
 
+**Update (SDK-6 pre-bringup hardening session) — the "~60 Hz" figure above
+describes the SDK's own example scripts, not our controller.** Measured
+directly: our `ik.solve_ik()` costs ~100ms/call (CasADi/IPOPT re-solve from
+warm start; `n=55 mean=104.30ms median=100.89ms min=67.97ms max=161.97ms`),
+so our actual Phase-2 loop rate is ~6-10Hz — see CLAUDE.md's "Known timing
+floor" and `docs/followups.md` for the full measurement and the
+`RateLimitedSource` mitigation. Separately, also confirmed empirically this
+session: the SDK's own "250 Hz" publisher thread does not actually sustain
+250 Hz while a solve is in-flight, because (a) CasADi/IPOPT holds the Python
+GIL for effectively 100% of the solve's wall-clock duration, stalling the
+publisher thread (same process, same GIL), and (b) `_clip_to_velocity_limit()`
+uses a fixed assumed `_motor_dt=1/250` rather than measured elapsed time, so
+it doesn't compensate for ticks that fire late. This is documented, not
+fixed — it lives inside the vendored SDK (git-pull-only) and is architecture-
+level, same deferral category as IK-solve-speed work.
+
 **Extra filtering caveat:** `set_ee_targets` applies an output LPF
 (`alpha = dt/(arm_filter_tau+dt)`, `arm_filter_tau=0.30`) *on top of* the IK's
 internal `WeightedMovingFilter` → **double-filtered** (`g1_arm.py`). Another
@@ -482,3 +498,25 @@ MotorMode.PR = 0; MotorMode.AB = 1
 - **`set_ee_targets` double-filters** — prefer `set_joint_targets` (Section E).
 - **`hand_mass_kg = 0.0` is a TODO** — measure before trusting force estimates
   (Section D).
+
+---
+
+## SDK-5.5 findings: tau feedforward channel (gravity compensation)
+
+**Confirmed in `g1_arm.py`:** `G1Arm.set_joint_targets(q14, tau_ff14=None)` accepts
+an optional 14-vector of feedforward torques. When `None`, defaults to zeros (pure PD
+hold). The live publisher loop reads `_tauff_target` and writes it directly to
+`motor_cmd.tau` in the DDS `LowCmd` message — the motor controller applies
+`τ = τ_ff + kp·(q_des − q) + kd·(0 − dq)`.
+
+**No SDK-internal arm gravity compensation exists** — the position control path sends
+`tau=0` by default. No double-compensation risk.
+
+**`G1InspireRobot.step()` does NOT forward tau** — its `q_arm` branch calls
+`self.arm.set_joint_targets(q_arm)` without a tau argument. SDK class, cannot be
+modified. SDK-5.5 bypasses `robot.step()` and calls `robot.arm.set_joint_targets(sol_q, tau)`
+directly for the arm, which is already the intended call pattern per Hard Rules
+("drive the arm by feeding our solve_ik output to arm.set_joint_targets(q14)").
+
+**ArmAdmittance and `hand_mass_kg`** exist in the SDK for a separate admittance
+control path that we do not use. These do not affect our position control flow.

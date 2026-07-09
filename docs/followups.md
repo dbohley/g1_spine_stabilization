@@ -688,3 +688,728 @@ flipping `dry_run=False` for SDK-6.
 
 - `ik_solver.py`, tests, perception modules, trajectory modules, sim controller — untouched.
 - `docs/sdk_analysis.md`, `docs/ik_weight_analysis.md` — untouched.
+
+---
+
+## SDK-5.5 follow-ups
+
+### What was done
+
+Gravity compensation for the Inspire RH56 hands: runtime Pinocchio inertia
+correction + tau feedforward wiring.
+
+**Files changed:**
+- `configs/default.yaml` — added `gravity_comp.enabled: true`
+- `g1_spine_stabilization/kinematics/ik_solver.py` — module-level constants
+  (`INSPIRE_HAND_MASS=1.0`, wrist/hand URDF inertia constants), `_make_composite_wrist_inertia()`
+  helper, `gravity_comp_enabled` parameter in `G1HandIK.__init__`, `_apply_hand_inertia_correction()`
+  method inserted before CasADi graph compilation
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` — all 3 phase loops
+  now capture `sol_tauff`; `robot.step(q_arm=sol_q)` replaced with
+  `robot.arm.set_joint_targets(sol_q, sol_tauff)` (SDK tau feedforward channel);
+  Phase 2 logs `tauff/` scalars to Rerun
+- `scripts/run_pose_tracking_preview.py` — passes `gravity_comp_enabled` from cfg to IK
+- `tests/test_gravity_comp.py` — 5 new hardware-free tests (56 total)
+- `docs/sdk_analysis.md`, `docs/ik_weight_analysis.md` — updated
+
+**Key findings:**
+- URDF hand_base_link is 0.141 kg; real Inspire RH56 is **1.0 kg** (scale measurement)
+- `G1Arm.set_joint_targets(q14, tau_ff14=None)` already existed; SDK sends tau=0 by default (no SDK internal gravity comp)
+- `G1InspireRobot.step()` doesn't forward tau — we bypass to `robot.arm.set_joint_targets()` directly
+- Inertia correction confirmed by potential-energy gradient cross-check (Test 2)
+
+### Out of scope for SDK-5.5
+
+- Acceleration coupling (`tau_des = tau_baseline + k_a*||a_arm||`) for grip force — deferred
+- SDK-6 live bringup — human-run only; gated on gravity comp
+
+### Things not modified
+
+- `assets/g1_with_hands.urdf` — runtime correction, no URDF change needed
+- `~/g1_inspire_sdk` — SDK not modified
+- EE frame defs, shoulder_roll bounds, IK cost weights — unchanged
+
+## SDK-6-safety follow-ups
+
+### What was done
+
+Guaranteed safe shutdown phase-out, plus live-mode capability for
+`run_pose_tracking_preview.py`. Trigger: reports that `grasp_demo.py`'s arms
+fell to the table more aggressively at the end of a run than the vendored
+SDK's own example scripts.
+
+**Files changed:**
+- `g1_spine_stabilization/controllers/grasp_sequence.py` — new file. Moved
+  `grasp_demo.py`'s Phase 0/A/B/C/D/R logic into `run_grasp_phases(...)`,
+  restructured so Phase D (hand release) and Phase R (arm return-to-default)
+  always run — even after Ctrl-C/exceptions during Phase 0/A/B/C — followed
+  by a settle pause before returning. Re-raises the first exception
+  encountered after cleanup, so failures are never silently swallowed.
+- `scripts/grasp_demo.py` — reduced to a thin wrapper: arg parsing, config/IK
+  load, robot lifecycle, and a single call to `run_grasp_phases(...)`.
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` — Phase 1
+  (interpolate to grasp) now catches `KeyboardInterrupt` and falls through to
+  Phase 3, mirroring Phase 2's existing precedent. Phase 3 ends with a settle
+  pause (`time.sleep(settle_time)`) before returning to the caller.
+- `scripts/run_pose_tracking_preview.py` — added `--net`, `--dry-run`,
+  `--no-dry-run` flags (mirroring `grasp_demo.py`'s convention) plus the same
+  human confirmation gate, so `mock`/`marker` sources can now actually be run
+  live. Also closes `frame_source` in the `finally` block for `--source
+  marker` (was previously never closed on any exit path).
+- `configs/default.yaml` — added `shutdown.settle_time: 0.4`.
+- `tests/test_grasp_demo_safety.py` — new file, 4 hardware-free tests
+  (baseline completion, fault-during-hold recovery, KeyboardInterrupt-during-
+  Phase-0 recovery, config key present).
+- `tests/test_sdk_transport.py` — 2 new tests (settle pause doesn't hang,
+  Phase 1 KeyboardInterrupt falls through to Phase 3). 62 tests total.
+- `CLAUDE.md` — Current Status, Session Roadmap, File Structure, Standard
+  Verification Workflow step 9 updated; corrected stale references to a
+  `run_pose_tracking_sdk.py` file that was never built.
+
+**Key findings:**
+- Root cause: `grasp_demo.py`'s `main()` had no `except` clause at all — any
+  fault during the grasp/hold phases skipped hand-release and arm-return
+  entirely, jumping straight from an actively-loaded grasp pose into the
+  SDK's fixed damping cutoff.
+- The SDK's own damping command (`G1Arm.shutdown()` → `create_damping_cmd`:
+  `kp=0, kd=8, tau=0`, sent once) is fixed and cannot be changed (vendored
+  SDK, git-pull-only). All of the SDK's own live examples (03/04/05/06)
+  already follow `try: <motion> finally: robot.shutdown()`, matching our
+  scripts' existing top-level structure — the gap was specifically the
+  missing safe-return guarantee inside that structure, not the shutdown
+  mechanism itself.
+- Verified directly in `~/g1_inspire_sdk/g1_inspire_sdk/g1_arm.py`: the 250 Hz
+  publisher thread continuously re-publishes whatever was last passed to
+  `set_joint_targets()` until `stop_streaming()` runs (only reachable via
+  `robot.shutdown()`). So the settle pause needs no repeated command loop —
+  a plain `time.sleep()` holds the arm (with gravity-comp tau feedforward)
+  for free.
+- `G1Arm`/`InspireHand` raise `ValueError` if `dry_run=False` and
+  `network_interface is None` — adding `--no-dry-run` to
+  `run_pose_tracking_preview.py` therefore also required adding `--net`.
+- `scripts/` is excluded from packaging (`setup.py`), so `grasp_demo.py`'s
+  phase logic wasn't testable in place — moved to `controllers/` to match
+  the pattern `sdk_pose_tracking.py` already established.
+
+### Out of scope for SDK-6-safety
+
+- No new "rest pose" with lower gravity torque was designed — Phase R still
+  returns to the existing standing-default pose. The settle pause only
+  guarantees the arm is stationary and gravity-comp-supported immediately
+  before the SDK's fixed damping cutoff, not that the cutoff itself is gentler.
+- No gradual tau-feedforward ramp-down was implemented (deliberately, per
+  user decision — minimal fix scope).
+- SDK-6 live bringup itself — still human-run only.
+
+### Things not modified
+
+- `~/g1_inspire_sdk` — SDK not modified.
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights — unchanged.
+- `docs/gravity_comp_reference.md` — no change needed; the settle pause
+  relies on the already-correctly-routed last `set_joint_targets()` call.
+
+## SDK-6 jerk/smoothness fixes follow-ups
+
+### What was done
+
+First-ever live hardware test (`python scripts/run_pose_tracking_preview.py
+--source mock --tracking 6dof --no-dry-run --net enx6c6e072d3ca1`) surfaced
+two distinct problems: (1) a violent jerk right after startup settles, before
+the arms converge on the mock object, and (2) visibly jumpy/jerky motion
+during tracking, traced to the mock marker "moving in big jumps." Both are
+fixed.
+
+**Files changed:**
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` — Phase 1 now
+  reads `ik.fk(current_q)` right after `current_q = _get_q(robot)` and
+  interpolates from that actual current pose to the grasp target, instead of
+  the hardcoded `L_EE_DEFAULT`/`R_EE_DEFAULT` constants. Mirrors Phase 3's
+  existing pattern in the same file, and the identical fix already applied
+  to `grasp_sequence.py`'s Phase 0 during SDK-5 (see "SDK-5 jerk fix" above)
+  — that fix was simply never ported to this file until now.
+- `g1_spine_stabilization/trajectory/sources.py` — new `RateLimitedSource`
+  class: slew-rate-limits `(box_center, theta)` from any wrapped source
+  (`SineSource`/`MarkerSource`), clamped against the ACTUAL measured
+  wall-clock dt between `.step()` calls (via an injectable `clock`
+  parameter, default `time.monotonic`), not the assumed `control_dt`.
+  Duck-types the same `.startup()`/`.step()` contract; proxies unknown
+  attributes (`object_lost`, `last_obj_obs`, etc.) via `__getattr__`.
+- `configs/default.yaml` — new `trajectory.rate_limit` block
+  (`enabled`, `max_theta_rate_deg_s: 60.0`, `max_pos_rate_m_s: 0.3`);
+  `trajectory.sine.frequency` lowered `0.3` → `0.1` Hz (amplitude unchanged);
+  comment added to `control.dt` cross-referencing the timing finding below.
+- `scripts/run_pose_tracking_preview.py` — wraps `source` in
+  `RateLimitedSource` (config-gated, default on) uniformly across all three
+  `--source` modes, right after source construction and before
+  `robot.connect()`.
+- `tests/test_sdk_transport.py` — new regression test
+  (`test_pose_tracking_sdk_phase1_starts_from_actual_current_pose`) proving
+  Phase 1's first IK target equals `ik.fk(fake_q)`, not `L_EE_DEFAULT`; fails
+  on the old code, passes now.
+- `tests/test_rate_limited_source.py` — new file, 9 hardware-free tests
+  (pass-through when under the limit, clamp when over — both theta and
+  box_center with direction preservation, first-call-unclamped,
+  measured-dt-not-assumed-dt, `__getattr__` proxying, `startup()` reseeding).
+  72 tests total.
+- `CLAUDE.md` — new "Known timing floor" note in the IK Solver section;
+  "Target filtering" Open Design Question de-duplicated (was accidentally
+  repeated verbatim) and moved to "Resolved"; Current Status, Session
+  Roadmap, File Structure updated.
+
+**Key findings:**
+- Root cause 1 (startup jerk): exact same bug class as the already-fixed
+  "SDK-5 jerk fix" (see above) — hardcoded interpolation start instead of
+  the real current pose — just present in a second file (`sdk_pose_tracking.py`
+  Phase 1) that never got the fix ported to it.
+- Root cause 2 (jerky tracking), measured directly: `ik.solve_ik()` costs
+  ~100ms/call (`n=55 mean=104.30ms median=100.89ms min=67.97ms max=161.97ms`,
+  measured running the real code path in the `g1_inspire_sdk` env). Against
+  the assumed `control_dt=0.02s` (50Hz) with an unconditional
+  `time.sleep(control_dt)` (no compute-time compensation anywhere in the
+  repo), the real Phase-2 loop rate is ~6-10Hz. `SineSource`/the mock both
+  sample a real-time sine (`theta = amplitude*sin(2*pi*freq*(monotonic()-t0))`)
+  — correct math, but each `.step()` call samples across a ~90-180ms gap
+  instead of ~20ms, producing per-step deltas 5-9x bigger than intended,
+  which IK's warm-started solve then chases abruptly.
+- Confirmed this is not 6dof-specific: the mock's target marker position
+  never moves in `_AnimatedMockTracker` (only its rotation does), so the
+  jumpiness is purely rotational and would equally affect `--tracking
+  orient-only` or a real live marker feed (a human moving a real marker
+  "smoothly" would still get chopped into big jumps by a 6-10Hz effective
+  loop rate).
+- Confirmed the existing smoothing stack before this fix: only the IK's own
+  output-side 4-tap `WeightedMovingFilter` (on `sol_q`, after the solve) and
+  the SDK's joint-level velocity clip (`G1Arm._clip_to_velocity_limit`,
+  20-30 rad/s in the 250Hz publisher thread) — nothing touched the target
+  *before* the solve. `RateLimitedSource` is architecturally distinct from
+  both (a rate limit on the input vs. a moving average on the output), so it
+  resolves the "double-filtering" concern rather than adding to it.
+- Phase 1/3's `smoothstep(i / steps_interp)` ramp is indexed by iteration
+  count, not wall-clock time, so the slow-loop mechanism above does NOT
+  affect those phases' jerkiness — only their total real-world duration
+  (they just take longer than `interpolation_time` when the loop is slow).
+
+### Out of scope for this fix (deliberate, per user decision)
+
+- Speeding up `ik.solve_ik()` itself (IPOPT `max_iter`/tolerances) — the
+  measured ~100ms/call cost is documented, not addressed. This touches core
+  IK solver behavior with a documented ~1.8mm regularization floor and 5mm
+  round-trip test tolerance; any change needs its own careful validation
+  pass, deferred to a separate future effort.
+- Tuning `max_theta_rate_deg_s`/`max_pos_rate_m_s` against real marker
+  motion data — no real AprilTag marker speed measurement exists yet;
+  current defaults are reasoned placeholders (see comments in
+  `configs/default.yaml`).
+- Live re-test on hardware to confirm the fix — human-run only.
+
+### Things not modified
+
+- `~/g1_inspire_sdk` — SDK not modified.
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights, IPOPT solver settings — unchanged.
+- `g1_spine_stabilization/trajectory/targets.py` (`compute_hand_targets`) —
+  left as pure stateless geometry; rate limiting lives one layer up, in the
+  source wrapper, specifically to avoid injecting state into this function.
+
+## SDK-6 pre-bringup hardening follow-ups
+
+### What was done
+
+User asked for a deeper analysis of remaining jerk/jitter causes beyond the
+previous fix, and specifically how the pipeline changes once it moves from
+the mock source to real AprilTag markers. Three parallel research agents
+plus direct verification found five new issues; the user separately caught
+a sixth (a leftover test edit to the modeled hand mass). All six addressed
+except one (GIL contention), documented and deliberately deferred.
+
+**Files changed:**
+- `g1_spine_stabilization/kinematics/ik_solver.py`:
+  - `INSPIRE_HAND_MASS` reverted from `1.6` (leftover local test edit) back
+    to `1.0` kg (the measured value documented everywhere else, including
+    this same file's own docstrings, which never got updated to match the
+    `1.6` value).
+  - `WeightedMovingFilter.add_data()` fixed: `zip(self.weights, self.queue)`
+    → `zip(self.weights, reversed(self.queue))`. `self.queue` is FIFO
+    (oldest at index 0); the old code paired the largest weight (0.4) with
+    the *oldest* sample instead of the newest.
+  - New `ExponentialMovingAverageFilter` class (single-pole EMA), and a new
+    `self.tauff_filter` instance smoothing `sol_tauff` right before
+    `solve_ik()` returns it (`tauff_filter_enabled`/`tauff_filter_alpha`
+    constructor kwargs, default `alpha=0.3`).
+  - New `self.ipopt_exhaustion_count` counter, incremented in `solve_ik()`'s
+    `except` branch alongside an enriched print.
+- `g1_spine_stabilization/trajectory/sources.py` — new `NoiseFilteredSource`
+  class: median-of-N then EMA on `(box_center, theta)`, composed *before*
+  `RateLimitedSource` in the wrapping chain.
+- `configs/default.yaml` — new `gravity_comp.tauff_filter` block
+  (`enabled`, `alpha: 0.3`) and `trajectory.noise_filter` block (`enabled`,
+  `median_window: 5`, `ema_alpha: 0.3`).
+- `scripts/run_pose_tracking_preview.py` / `scripts/grasp_demo.py` —
+  `G1HandIK(...)` construction gains `tauff_filter_enabled`/
+  `tauff_filter_alpha` read from config. `run_pose_tracking_preview.py`
+  additionally wraps `source` in `NoiseFilteredSource` for `--source marker`
+  only, before the existing `RateLimitedSource` wrapping.
+- Four new test files: `tests/test_weighted_moving_filter.py` (5 tests),
+  `tests/test_ipopt_diagnostics.py` (4 tests), `tests/test_tauff_filter.py`
+  (7 tests), `tests/test_noise_filtered_source.py` (8 tests). 96 tests total.
+- `CLAUDE.md` — IK Solver section ("Smoothing", "Known timing floor",
+  new "Diagnostics" bullet), Open Design Questions (split "Target
+  filtering" into jump/slew, now correctly scoped, and a new sensor-noise
+  entry), Current Status, Session Roadmap, File Structure updated.
+- `docs/sdk_analysis.md` — Section E's "~60 Hz achievable cadence" statement
+  caveated (see below).
+
+**Key findings:**
+- **Hand-mass bug (found by the user, not the research agents):**
+  `INSPIRE_HAND_MASS = 1.6` in `ik_solver.py` was a leftover local test
+  edit — the file's own docstrings at lines 98/354/357 still said "1.0 kg
+  measured hand," directly contradicting the constant two lines above them.
+  Gravity-comp torque scales linearly with this constant, so `sol_tauff` had
+  been ~60% too strong system-wide since whatever session this was changed
+  in — a very plausible contributor to wrist jitter given the SDK's low
+  wrist damping (`kd=1`).
+- **`WeightedMovingFilter` reversed recency weighting (verified directly):**
+  confirmed by reading the vendored SDK's own reference implementation
+  (`~/g1_inspire_sdk/g1_inspire_sdk/_common/weighted_moving_filter.py`),
+  which uses the identical weight vector `[0.4,0.3,0.2,0.1]` via
+  `np.convolve(..., mode="valid")` — convolution flips the kernel, so its
+  newest sample correctly gets weight 0.4. A background agent measured
+  steady-state group delay on a ramp input: 2.0 samples (our buggy version)
+  vs. 1.0 sample (correct). At the real ~6-10Hz loop rate this was
+  ~250-300ms of unintended lag instead of ~125-150ms.
+- **GIL contention (confirmed empirically, documented only — see "Out of
+  scope" below):** a background agent ran a counting thread concurrently
+  with a real IPOPT `opti.solve()` call; the thread's throughput dropped to
+  2.2% of baseline during a 195ms solve, confirming CasADi/IPOPT holds the
+  GIL for effectively the entire solve. Since `G1Arm`'s "250Hz" publisher
+  thread runs in the same process, it's paused during every IK solve.
+  Separately verified via grep: `G1Arm._clip_to_velocity_limit()`
+  (`~/g1_inspire_sdk/g1_inspire_sdk/g1_arm.py:113,426`) uses a fixed
+  `self._motor_dt = 1.0/250.0`, never measured elapsed time — the exact
+  bug class already fixed in-repo via `RateLimitedSource`, but this
+  instance lives inside the vendored SDK.
+- **IPOPT `max_iter` exhaustion is plausible in practice:** a background
+  agent empirically measured IPOPT's iteration count scaling with
+  warm-start distance (4 iters at 0°, 7 at 10°, 8 at 20°, 11 at 45°, on a
+  fixed warm start) — legitimate large tracking jumps could plausibly push
+  iteration count toward `max_iter=30` in messier real bimanual geometry.
+  No prior test/log had ever checked for `solve_ik()`'s `except` branch
+  firing; there is now a counter.
+- **SDK applies `tauff` as an unfiltered zero-order hold:** verified in
+  `G1Arm._live_publisher_loop()` — `q_target` is velocity-clipped every
+  250Hz tick, but `tauff_target` is passed straight through with no
+  interpolation at all. Given gravity-comp torque ~1 N·m at the wrist and
+  low wrist `kd=1`, an un-smoothed `sol_tauff` step every ~100-150ms could
+  produce a small torque "kick" — mitigated by smoothing `sol_tauff`
+  ourselves (fully in our own code, not the vendored SDK) before handoff.
+- **`RateLimitedSource` cannot catch real sensor noise (this is the main
+  finding tying directly to the mock-vs-real-marker question):** verified
+  directly — its clamp only engages on deltas *larger* than the configured
+  rate; anything smaller passes straight through by design (see its own
+  test `test_theta_within_limit_passes_through_unchanged`). Real
+  `solvePnP` detection jitter for a stationary marker is small and
+  continuous, sitting below that threshold (which was deliberately set
+  *above* the trajectory's own peak natural rate). `--source mock`/
+  `--source sine` are perfectly noiseless and have never exercised this —
+  it is a structural gap that only becomes visible with real markers.
+  `NoiseFilteredSource` (median-of-N to reject single-frame misdetection
+  spikes, then EMA to smooth continuous jitter) directly addresses this,
+  applied *before* `RateLimitedSource` in the wrapping chain (clean the
+  signal first, then bound the rate of the clean signal).
+
+### Out of scope for this fix (deliberate, per user decision)
+
+- **GIL contention / SDK publisher-thread starvation** — documented only,
+  not fixed. This is architecture-level (would require running the IK
+  solve without sharing the GIL with the publisher thread — a separate
+  process, or a GIL-releasing extension — both much bigger changes) and
+  lives partly inside the vendored SDK's own fixed-`_motor_dt` assumption,
+  which cannot be modified (git-pull-only). Same deferral category as the
+  IK-solve-speed item from the previous session.
+- Tuning `tauff_filter.alpha`/`noise_filter.median_window`/
+  `noise_filter.ema_alpha` against real hardware/marker data — all three
+  are reasoned placeholders, not measurements (see comments in
+  `configs/default.yaml`).
+- Live re-test on hardware to confirm the mass fix and filter fix reduce
+  visible jitter, and that the noise filter helps on real markers — human-
+  run only.
+
+### Things not modified
+
+- `~/g1_inspire_sdk` — SDK not modified (the GIL-contention and
+  fixed-`_motor_dt` findings live here but cannot be fixed without
+  modifying the vendored clone).
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights, IPOPT solver settings — unchanged.
+- `g1_spine_stabilization/trajectory/targets.py` (`compute_hand_targets`) —
+  left as pure stateless geometry; noise filtering lives one layer up, in
+  the source wrapper.
+
+## SDK-6 marker-tracking fix follow-ups
+
+### What was done
+
+A live test with real AprilTag markers using `--tracking 6dof` showed the
+robot's hands positioning themselves around the target marker instead of
+the object marker. Investigation (three parallel research agents, direct
+code verification, and back-and-forth with the user correcting several
+initial hypotheses) found a real bug in `MarkerSource`, fixed it, and ruled
+out two other suspected causes along the way.
+
+**Files changed:**
+- `g1_spine_stabilization/trajectory/sources.py` — `MarkerSource` restructured:
+  new `self._object_start_pos` (captured once from the object marker,
+  Phase A), `self._target_start_pos`/`self._target_start_rot` (captured once
+  from the target marker, Phase B). New helpers `_theta_from_target_rotation()`
+  (target's roll relative to its own starting orientation) and
+  `_box_center_from_target_position()` (object's start position shifted by
+  the target's displacement from its own start). Both `startup()`'s Phase C
+  countdown and `step()` now use these helpers instead of assigning the
+  target's raw absolute pose. Also added `tracker`/`obj_id`/`tgt_id`
+  properties (used by the new diagnostics below).
+- `g1_spine_stabilization/perception/tracker.py` — `MarkerTracker.step()` now
+  keeps the intermediate `pose_in_optical`/`d435_mount`-frame poses (not just
+  the final `pose_in_pelvis`) per marker, exposed via a new
+  `get_diagnostic_pose(marker_id)` method. Internally computes the
+  optical→d435→pelvis composition as two explicit matrix multiplies instead
+  of one `compose_to_pelvis()` call (same math, exposes the intermediate);
+  `compose_to_pelvis` itself is unchanged and still tested independently in
+  `tests/test_perception_frames.py`.
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` — `_log_marker_info`
+  gained two additions: (1) logs the actual computed `L_target`/`R_target`
+  (already computed each Phase-2 iteration) to Rerun as `targets/L_hand`
+  (cyan) / `targets/R_hand` (magenta), distinct from the raw marker triads
+  and the robot's rendered mesh; (2) prints the marker's pose at each
+  transform-chain stage (optical, d435-mount, pelvis) via the new
+  `get_diagnostic_pose()`, to help isolate a separately-reported ~10cm
+  marker-height discrepancy.
+- `scripts/run_pose_tracking_preview.py` — marker-mode setup now prints the
+  configured `perception.marker_size` with a reminder to verify it against
+  the real printed marker's physical size (a mismatch would scale
+  `solvePnP`'s recovered translation).
+- `tests/test_marker_source.py` — three tests rewritten for delta semantics
+  (`test_orient_only_theta_tracks_relative_rotation_not_absolute`,
+  `test_6dof_box_center_tracks_target_displacement_not_absolute_position`,
+  `test_startup_preseeds_nonzero_theta_delta_and_it_persists_when_stale`);
+  new `_SequenceTracker` test helper (per-call scripted readings, needed
+  since a static reading now correctly produces a zero delta). All other
+  existing tests confirmed unaffected (staleness/monitoring behavior is
+  orthogonal to absolute-vs-delta semantics) and still pass unchanged.
+- `CLAUDE.md` — corrected four stale occurrences of the `d435_link_to_optical`
+  calibration value, corrected the Project Goal's "runtime arguments" claim
+  for object dimensions, rewrote the "Orientation-only vs 6-DoF" Resolved
+  bullet to describe the corrected delta semantics, removed two File
+  Structure entries for docs that don't exist (`frame_conventions.md`,
+  `architecture.md`), added the missing `gravity_comp_reference.md` entry.
+
+**Key findings:**
+- **The actual bug**: `MarkerSource.step()`/`startup()` set `box_center =
+  tgt_obs.pose_in_pelvis[:3, 3]` directly in 6dof mode — the target marker's
+  raw absolute position, not a delta. If the object (in the robot's hands)
+  and the target (e.g. held by a person) are in different physical
+  locations — the realistic setup — this sends the hands to wherever the
+  target physically is, not to the object shifted by how far the target has
+  moved. Confirmed by the user: this is exactly what they saw, running
+  `--tracking 6dof`. `orient-only` mode was unaffected (it never touches
+  `box_center` after startup), which is why the bug only showed up in 6dof.
+- **Ruled out: wrist-vs-palm IK targeting.** Verified directly that
+  `solve_ik()`'s cost function computes error against
+  `self.cdata.oMf[self.L_ee_id/self.R_ee_id].translation`
+  (`ik_solver.py:295-296`), where those IDs are
+  `self.reduced.model.getFrameId('L_ee_link'/'R_ee_link')`
+  (`ik_solver.py:244-245`) — the palm frame, not the wrist joint. The user's
+  observation that the marker sits exactly on the line between the two
+  wrists is mathematically guaranteed by `compute_hand_targets`'s
+  construction (`box_center` is always the midpoint of `L_pos`/`R_pos`)
+  regardless of `box_half_width`, so it didn't indicate a targeting bug —
+  the real issue was the 6dof position math above.
+- **Ruled out: `d435_link_to_optical` calibration error.** The config's
+  current rotation (`[-1.5708, 0.0, -1.5708]`) is correct — a prior Claude
+  session had changed it to `[3.14159, 0.0, 1.5708]` and that turned out
+  wrong, so it was reverted. CLAUDE.md was the stale one (still claiming the
+  old value in four places), now corrected.
+- **Ruled out: object dimensions as CLI runtime args.** CLAUDE.md's Project
+  Goal claimed "object width and depth are passed as runtime arguments" —
+  checked directly, this was never implemented anywhere (including the
+  original CoppeliaSim entry point) and the user's actual preference is for
+  box size to stay in `configs/default.yaml` (an object is selected once and
+  used for a while). Corrected the doc to match.
+
+### Out of scope for this fix
+
+- **The ~10cm "markers appear lower in Rerun than physically" discrepancy
+  remains unresolved.** With the calibration rotation now confirmed correct,
+  remaining candidates (a `perception.marker_size` mismatch against the real
+  printed marker, the URDF's fixed `d435_joint` mount origin not matching the
+  physical bracket, or `d435_link_to_optical.xyz`'s translation, currently
+  `[0,0,0]`) all require physical measurement against the real robot. The
+  new transform-chain diagnostic print (`get_diagnostic_pose`) is meant to
+  help the user isolate which stage is responsible, not a blind fix.
+- No fix attempted for anything inside `~/g1_inspire_sdk` (none was needed
+  here — the bug was entirely in our own `MarkerSource`).
+
+### Things not modified
+
+- `~/g1_inspire_sdk` — SDK not modified.
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights — unchanged.
+- `g1_spine_stabilization/perception/frames.py` (`compose_to_pelvis`) —
+  unchanged; `tracker.py` now computes the same composition as two explicit
+  steps internally, but the pure-function utility itself and its tests are
+  untouched.
+- `configs/default.yaml`'s `d435_link_to_optical.rpy` — left as-is; confirmed
+  correct by the user, only CLAUDE.md's documentation of it was wrong.
+
+## Ctrl-C interrupt-swallowing fix
+
+### What was done
+
+Fixed a real responsiveness bug reported directly from a live-hardware run:
+stopping `run_pose_tracking_preview.py` with Ctrl-C could take 8+ presses over
+several seconds before the script actually entered its shutdown sequence,
+each press instead printing `[G1HandIK] IK warning (exhaustion #N)` and the
+control loop continuing as if nothing happened.
+
+**The actual bug**: `solve_ik()`'s `except Exception as e:`
+(`ik_solver.py:436`) was catching more than genuine IPOPT convergence
+failures. CasADi's Ipopt interface checks for a pending SIGINT *during* a
+long solve and aborts it by throwing its own C++ `KeyboardInterruptException`
+(visible in the log as `CasADi ... WARNING("KeyboardInterruptException")`).
+That crosses into Python as a plain exception — not a real Python
+`KeyboardInterrupt` (a `BaseException`, so it would never have reached this
+`except Exception` clause in the first place) — with a message containing
+`return_status is 'NonIpopt_Exception_Thrown'`. The existing code treated
+this identically to an ordinary solver failure: incremented
+`ipopt_exhaustion_count`, printed a warning, fell back to
+`opti.debug.value()`, and returned normally, completely absorbing the Ctrl-C.
+Since `solve_ik()` costs ~70-160ms/call and dominates each loop iteration's
+wall time (documented "Known timing floor"), most Ctrl-C presses land
+*inside* an active solve and get swallowed this way — matching exactly what
+was observed.
+
+**Fix**: `solve_ik()` now checks for the `NonIpopt_Exception_Thrown` signature
+before falling into the exhaustion-counting path. When present: skip the
+counter, print a distinct "interrupted" message, and re-raise as a real
+`KeyboardInterrupt` so it propagates to the caller's existing (already
+correctly structured, per SDK-6-safety) interrupt handling. Any other
+exception text is unaffected — genuine solver failures still fall back to
+`opti.debug.value()` exactly as before.
+
+Fixing this centrally in `ik_solver.py` exposed two related gaps in callers
+that loop over `solve_ik()`, both fixed in the same pass:
+- `sdk_pose_tracking.py`'s Phase 3 (return-to-default) had no
+  `try/except KeyboardInterrupt` at all, unlike Phase 1/2 in the same file —
+  added the same pattern, falling through unconditionally to the existing
+  settle-sleep + "Done." lines.
+- `grasp_sequence.py`'s Phase R wrapped the return-motion loop *and* the
+  trailing settle-sleep in the same `try` — an interrupt during the loop
+  jumped straight past the settle-sleep to the outer `except`. This was
+  previously unreachable in practice only because the ik_solver.py bug was
+  swallowing these interrupts too. Restructured so only the loop itself is
+  wrapped, and the settle-sleep always runs afterward regardless of how the
+  loop ended (mirrors the existing Phase D pattern already in this file).
+
+### Tests
+
+- New `tests/test_ik_interrupt_handling.py` (3 tests): the
+  `NonIpopt_Exception_Thrown` signature raises `KeyboardInterrupt` and does
+  *not* increment `ipopt_exhaustion_count`; an ordinary solver failure
+  (different message) still increments the counter and falls back normally,
+  unchanged.
+- `tests/test_sdk_transport.py`: new test interrupting the 4th `solve_ik()`
+  call (deterministically the first call inside Phase 3, given `cfg_fast`'s
+  known Phase-1 step count and `duration=0.0` skipping Phase 2 entirely) —
+  confirms `run_pose_tracking_sdk` doesn't raise and still settles.
+- `tests/test_grasp_demo_safety.py`: new test interrupting the first
+  `solve_ik()` call inside Phase R — confirms the settle-before-shutdown
+  pause still runs even though the interruption happened inside Phase R's
+  loop, not before it.
+
+### Things not modified
+
+- No signal-handling code (`signal.signal(SIGINT, ...)`) was added — CasADi
+  already interrupts long solves responsively on its own; the bug was purely
+  that our own broad `except Exception` re-labeled that interrupt as an
+  ordinary solver failure instead of letting it propagate.
+- `pose_tracking.py` (CoppeliaSim path) benefits from the `ik_solver.py` fix
+  automatically (a real `KeyboardInterrupt` now propagates instead of being
+  swallowed) but has no `try/except` of its own — left as-is, since it's the
+  sim path, not the hardware-safety-critical one, and an uncaught interrupt
+  there is a strict improvement (immediate stop) over the previous silent
+  swallow-and-continue behavior.
+
+## Light grip during pose tracking
+
+### What was done
+
+`run_pose_tracking_sdk` (`sdk_pose_tracking.py`) previously only drove the
+arms — it never commanded the Inspire hands, even though
+`run_pose_tracking_preview.py` already constructs the robot with
+`hand_side="both"`. Grip control (`GraspController`, `grip_force.py`) existed
+only in the separate, static `grasp_demo.py`/`grasp_sequence.py` hold-in-place
+demo. Wired the same controller into the actual tracking flow so the hands
+hold a light, config-driven grip (`grip_force.tau_baseline`, already
+config-driven — the ask was to make sure it's actually applied during
+tracking, not to add a new tunable) while the arms track a moving target.
+
+New "Phase 1.5" between Phase 1 (arm to grasp) and Phase 2 (track): lerp both
+hands from `open_pose` to `close_pose` (1.5s, matching `grasp_sequence.py`'s
+Phase B), settle 0.5s, then `ctrl.arm(q_measured)` to snapshot the
+force-feedback baseline. During Phase 2, `ctrl_l.step()`/`ctrl_r.step()` run
+every iteration alongside the arm's `solve_ik()`/`set_joint_targets()`. A
+guaranteed-release step runs immediately after Phase 2 (regardless of how it
+ended — clean finish or `KeyboardInterrupt`), lerping both hands back to
+`open_pose` over 1.0s, *before* Phase 3's arm-return begins — mirrors
+`grasp_sequence.py`'s existing Phase D-before-R order (user's explicit
+choice: release where tracking left off, don't carry the object through the
+arm-return motion still gripped). All of this is gated by a new
+`grip_force.enabled` config flag (default `true`), following the same
+on/off convention as `trajectory.rate_limit.enabled` /
+`trajectory.noise_filter.enabled` / `gravity_comp.enabled`.
+
+`GraspController.step()` is already safe to call before `arm()` has been
+reached (returns a static `close_pose` hold per its existing docstring), so
+no extra state flag was needed to guard Phase 2's grip step against a
+Ctrl-C that landed mid-close during Phase 1.5.
+
+### Tests
+
+Three new tests in `tests/test_sdk_transport.py`: grip engages (records a
+closed-ish hand command) and releases (last command ≈ `HAND_OPEN_POSE`) on a
+normal run; `grip_force.enabled=False` issues zero hand commands, preserving
+today's arm-only behavior exactly; and a `KeyboardInterrupt` injected inside
+Phase 2 still ends with the hands released.
+
+### Things not modified
+
+- Acceleration-coupled grip tightening (`tau_des = tau_baseline +
+  k_a*||a_arm||`) — user explicitly chose a fixed light grip for now; the
+  extension point already documented in `grip_force.py`'s docstring remains
+  unused.
+- Hand-close/settle/release durations (1.5s/0.5s/1.0s) are hardcoded in
+  `sdk_pose_tracking.py`, matching `grasp_sequence.py`'s existing values
+  exactly rather than adding new config keys — the user only asked for the
+  grip *amount* to be tunable, which `grip_force.tau_baseline` already was.
+- `grasp_demo.py`/`grasp_sequence.py` — unchanged; still the standalone
+  static hold-in-place validation path, independent of this integration.
+
+## d435_link_to_optical calibration (resolves the ~10cm marker-height discrepancy)
+
+### What was done
+
+Added `perception/calibration.py` (pure math: `solve_optical_to_d435`,
+`se3_to_xyz_rpy`, `pose_error`) and `scripts/calibrate_camera_extrinsics.py`
+(camera-only CLI, reuses the existing `RealSenseSource`/`AprilTagDetector`/
+`MarkerTracker` stack) to solve for `perception.d435_link_to_optical`'s
+xyz + rpy from one marker placed at a physically-measured, known pelvis-frame
+position (assumed identity orientation). `T_d435_to_pelvis` (Pinocchio FK
+against the URDF) is trusted and not solved for. Default mode prints the
+computed correction for manual paste into the YAML (no auto-write, per the
+existing caution around this value — see "SDK-6 marker-tracking fix" above).
+A `--verify` mode checks the *current* config's residual error against a
+second known point without doing any correction math, to catch a
+`perception.marker_size` scale error masquerading as a mounting offset (the
+two look identical at one distance, diverge at another).
+
+**Result, run against the two markers already in the robot's field of view**
+(object marker ID=0 at physically-measured pelvis position (0.40, 0, 0),
+target marker ID=2 at (0.50, 0, 0), both close to identity orientation):
+
+- Calibrating off marker ID=0: measured error with the old
+  `xyz: [0,0,0]` / `rpy: [-1.5708, 0.0, -1.5708]` was **10.06cm position,
+  9.19° rotation** — matches the previously-reported ~10cm discrepancy
+  closely enough to confirm it as the root cause. Computed correction:
+  `xyz: [-0.0860, -0.0002, -0.0384]`, `rpy: [-1.4118, 0.0076, -1.5896]`.
+- Applied that correction to `configs/default.yaml`, then `--verify`'d
+  against marker ID=2 (a different marker, different distance, never used
+  in the fit): **6mm position error, 4.05° rotation error.** The position
+  residual dropped by an order of magnitude and shows no sign of the
+  distance-dependent growth a `marker_size` scale error would produce
+  (50cm is 25% farther than 40cm; a proportional scale error would show up
+  much larger than 6mm) — the position fix generalizes. The remaining 4°
+  rotation residual is plausibly just physical marker-placement imprecision
+  (the user's own caveat when placing them: "close to identity with some
+  room for error, I can't set them perfectly"), not a code/calibration bug.
+
+**Left applied in `configs/default.yaml`** pending the user's final review —
+a large, consistent improvement, but flagged as tentative until confirmed
+(see the config comment).
+
+### Tests
+
+5 new hardware-free tests in `tests/test_calibration.py`: `solve_optical_to_d435`
+recovers a known synthetic transform exactly; `se3_to_xyz_rpy` round-trips
+against `optical_to_d435_from_config`; `pose_error` matches known synthetic
+position/rotation offsets.
+
+### Out of scope / not modified
+
+- `perception.marker_size` — not touched; the verify-mode result argues
+  against it being a significant factor here, but wasn't ruled out with a
+  dedicated distance-sweep test.
+- URDF `d435_link` mount origin — not touched (Hard Rule: URDF changes need
+  explicit approval); any real CAD mounting error is absorbed into the
+  `d435_link_to_optical` correction instead, which is the intended,
+  config-tunable place for it.
+
+## box_half_height: correcting for the object marker sitting on top of the box
+
+### What was done
+
+The object marker is physically mounted on **top** of the held object, but
+`MarkerSource` was treating the marker's raw measured position as the box's
+geometric center directly. `compute_hand_targets` already offsets each hand
+by `box_half_width` from `box_center` in Y — confirmed (via `grep`) to be
+the *only* place `box.size` was read anywhere in the package; `box_size[2]`
+(height) was read nowhere. So every hand target was too high by however far
+the marker sits above the true center (8cm with the default `0.16` cube).
+
+Fixed at the source: `MarkerSource.__init__` gained a `box_half_height`
+kwarg (default `0.0`, preserving old behavior for any caller that doesn't
+pass it), applied once in `startup()` Phase A where `self._object_start_pos`
+is first captured — subtracting `box_half_height * marker_R[:, 2]` (the
+marker's own measured "out of the surface" axis — `detector.py`'s solvePnP
+object points are documented "Z out of marker" — expressed in the pelvis
+frame, not a hardcoded world-Z). Using the marker's actual measured
+orientation rather than assuming it's level was a deliberate choice
+confirmed with the user, and costs nothing extra since the full pose
+(including rotation) is already read at that moment. Fixing it here (not
+just at the `run_pose_tracking_preview.py` call site) matters because
+`6dof` mode's ongoing delta-tracking uses this same internal value as its
+base reference for the rest of a session, not just the one-shot returned
+`box_center`.
+
+`run_pose_tracking_preview.py` now computes `box_half_height =
+box_size[2] / 2` and passes it into both `MarkerSource(...)` construction
+sites (`--source mock` and `--source marker`). `_AnimatedMockTracker` was
+also updated to simulate a marker mounted on top of the box (offset by
+`box_half_height` in Z) rather than handing back the ground-truth center
+directly — makes the mock a more faithful stand-in for a real marker
+reading and means `--source mock --tracking 6dof` dry-run testing actually
+exercises the new correction path end-to-end (verified: with
+`box.size=[0.16,0.16,0.08]` temporarily set, the dry-run round-trip
+correctly reproduced the original intended `box_center`, confirming the
+mock's added offset and `MarkerSource`'s new correction cancel out exactly
+as designed).
+
+### Tests
+
+3 new tests in `tests/test_marker_source.py`: identity-rotation marker case
+(offset subtracts along world Z); a 90°-tilted marker case (offset follows
+the marker's measured Z axis into world -Y instead, proving it isn't
+hardcoded to world-up); and `box_half_height=0.0` reproduces the exact
+pre-change behavior (regression guard). All 12 pre-existing tests in the
+file pass unchanged (none pass `box_half_height`, so they exercise the new
+default).
+
+### Things not modified
+
+- `compute_hand_targets`/`trajectory/targets.py` — unchanged; the width
+  offset there was already correct, this fix is orthogonal (corrects where
+  `box_center` itself comes from, not how hands are offset from it).
+- `pose_tracking.py` (CoppeliaSim path) and `grasp_sequence.py`'s Phase 0 —
+  unchanged; both use a synthetic `box_center` (`[L_EE_DEFAULT[0], 0.0,
+  L_EE_DEFAULT[2]]`), never derived from a marker reading, so there's no
+  marker-on-top offset to correct there.
+

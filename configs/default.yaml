@@ -1,4 +1,9 @@
 control:
+  # dt=0.02 (50Hz) is the configured control-period assumption; measured
+  # Phase-2 loop rate is ~6-10Hz because ik.solve_ik() costs ~100ms/call
+  # (CasADi/IPOPT re-solve from warm start), uncompensated (time.sleep(dt) is
+  # unconditional). See docs/followups.md for the measurement and
+  # trajectory.rate_limit below for the mitigation.
   dt: 0.02
   interpolation_time: 3.0
   rotation_duration: 10.0
@@ -6,7 +11,38 @@ control:
 trajectory:
   sine:
     amplitude: 0.524    # ~30 degrees
-    frequency: 0.3      # Hz
+    frequency: 0.1      # Hz — slowed from 0.3 per live-test feedback
+  rate_limit:
+    enabled: true
+    # >6x the sine's own peak angular rate (0.524*2*pi*0.1 ~= 0.33 rad/s ~= 18.8 deg/s)
+    # so it never clips the intended test signal's own shape -- it only engages
+    # on jumps inflated by the actual ~6-10Hz (not 50Hz) loop rate. See
+    # docs/followups.md for the measured IK solve cost behind that gap.
+    max_theta_rate_deg_s: 60.0
+    # 6dof-mode only (box_center tracking). No measurement of real hand-held
+    # marker motion speed exists yet -- starting placeholder, tune with real data.
+    max_pos_rate_m_s: 0.3
+  noise_filter:
+    # Smooths real AprilTag solvePnP jitter BEFORE the rate limiter above.
+    # Complementary, not a replacement: the rate limiter only clamps deltas
+    # LARGER than its threshold and passes everything smaller straight
+    # through by design -- this stage handles the small deltas the rate
+    # limiter structurally ignores. Applied only to --source marker (sine and
+    # mock are noiseless by construction; a median+EMA filter is not a no-op
+    # on a clean synthetic signal the way the rate limiter is, so applying it
+    # there would only add avoidable lag/distortion for no benefit).
+    # UNMEASURED: no real AprilTag noise amplitude has been characterized on
+    # this rig yet -- docs/ik_weight_analysis.md's "~5-15mm" and CLAUDE.md's
+    # "~2-5mm" marker-error guesses are informal, inconsistent, never-measured
+    # placeholders (see docs/followups.md). Defaults below are reasoned
+    # starting points, not measurements -- retune with real marker data.
+    enabled: true
+    # Median-of-N window (must be odd). Rejects a single-frame misdetection
+    # spike that an EMA alone would partially incorporate.
+    median_window: 5
+    # Single-pole EMA factor in (0, 1], applied after the median stage.
+    # Lower = more smoothing/lag.
+    ema_alpha: 0.3
 
 box:
   size: [0.16, 0.16, 0.16]
@@ -34,13 +70,43 @@ perception:
     distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
     resolution: [640, 480]
   # Transform from d435_link (URDF mount frame) to camera optical frame.
-  # NEEDS CALIBRATION against the real robot. Default below is standard
-  # ROS optical-frame convention: rotate -90° about Z, then -90° about X.
+  # Calibrated via scripts/calibrate_camera_extrinsics.py against marker
+  # ID=0 physically measured at pelvis-frame (0.40, 0.0, 0.0). TENTATIVE:
+  # being verified against a second marker before treating as final --
+  # see docs/followups.md.
   d435_link_to_optical:
-    xyz: [0.0, 0.0, 0.0]
-    rpy: [-1.5708, 0.0, -1.5708] # hand calibrated
+    xyz: [-0.0860, -0.0002, -0.0384] #  xyz: [0.0, 0.0, 0.0] urdf non-calibrated
+    rpy: [-1.4118, 0.0076, -1.5896]  #  rpy: [-1.5708, 0.0, -1.5708] urdf non-calibrated
+
+gravity_comp:
+  enabled: true  # Runtime Pinocchio inertia correction for 1.0 kg Inspire hands
+  tauff_filter:
+    # Single-pole EMA on sol_tauff before it reaches set_joint_targets.
+    # Motivation: sol_tauff is recomputed fresh every ~100-150ms IK solve and
+    # can step discontinuously between calls; unlike sol_q (smoothed by
+    # WeightedMovingFilter + ramped by the SDK's 250Hz velocity clip),
+    # G1Arm._live_publisher_loop applies tauff as an unfiltered zero-order
+    # hold every 250Hz tick (vendored SDK, cannot be changed -- see
+    # docs/followups.md). Low wrist kd (=1, see docs/gravity_comp_reference.md)
+    # means this step could produce a small torque "kick" at the wrist absent
+    # this stage.
+    enabled: true
+    # (0, 1]; lower = more smoothing/lag. Per-CALL smoothing (one sample =
+    # one solve_ik() call), matching WeightedMovingFilter's existing
+    # per-call (not per-time) convention -- solve_ik() has no dt input.
+    # UNMEASURED: no real torque-kick amplitude characterized on hardware;
+    # 0.3 reaches ~90% of a step change in ~6-7 calls as a conservative start.
+    alpha: 0.3
+
+shutdown:
+  # Seconds to hold the final pose (arm held via the SDK's 250 Hz publisher
+  # thread re-publishing the last set_joint_targets call) immediately before
+  # robot.shutdown() sends the SDK's one-shot damping command (kp=0, kd=8,
+  # tau=0). Used by grasp_demo.py (Phase R) and sdk_pose_tracking.py (Phase 3).
+  settle_time: 0.4
 
 grip_force:
+  enabled: true             # apply grip during grasp_demo.py AND pose tracking (sdk_pose_tracking.py)
   tau_baseline: 0.25        # target grip force per finger (N); light hold
   kappa: 0.05               # TransportGraspController coupling gain
   delta_q_max: 1.0          # max additional closure beyond grasp pose (rad)

@@ -21,7 +21,13 @@ import casadi
 # Smoothing filter
 # -------------------------------------------------------
 class WeightedMovingFilter:
-    """Weighted moving average filter for smoothing joint commands."""
+    """Weighted moving average filter for smoothing joint commands.
+
+    Weights are recency-ordered: weights[0] applies to the newest sample,
+    weights[-1] to the oldest. self.queue is FIFO (oldest at index 0), so
+    the newest sample is the last element -- zip against reversed(queue) to
+    pair weights[0] with the newest sample.
+    """
 
     def __init__(self, weights, data_size=14):
         self.weights     = np.array(weights)
@@ -40,12 +46,37 @@ class WeightedMovingFilter:
             self.filtered = self.queue[-1].copy()
         else:
             self.filtered = sum(
-                w * d for w, d in zip(self.weights, self.queue)
+                w * d for w, d in zip(self.weights, reversed(self.queue))
             )
 
     @property
     def filtered_data(self):
         return self.filtered
+
+
+class ExponentialMovingAverageFilter:
+    """Single-pole EMA: y = alpha*x + (1-alpha)*y_prev.
+
+    First call passes through unchanged (seeds y_prev) -- matching
+    WeightedMovingFilter's fill-in-window convention, so steady-state
+    accuracy is unaffected by filter start-up.
+    """
+
+    def __init__(self, alpha, data_size=14):
+        assert 0.0 < alpha <= 1.0, "alpha must be in (0, 1]"
+        self.alpha = float(alpha)
+        self.data_size = data_size
+        self._value = None
+
+    def add_data(self, new_data):
+        new_data = np.asarray(new_data, dtype=float)
+        self._value = new_data.copy() if self._value is None \
+            else self.alpha * new_data + (1.0 - self.alpha) * self._value
+        return self._value
+
+    @property
+    def filtered_data(self):
+        return self._value
 
 
 # -------------------------------------------------------
@@ -61,11 +92,71 @@ R_SHOULDER_ROLL_MAX = -0.15   # right can't go above this (inward = bad)
 
 
 # -------------------------------------------------------
+# Gravity compensation: Inspire RH56 hand inertial properties
+# Mass from scale measurement. COM + inertia from URDF hand_base_link, scaled.
+# -------------------------------------------------------
+INSPIRE_HAND_MASS = 1.0        # kg (scale measurement of real Inspire RH56 hand)
+
+_WRIST_MASS    = 0.08457647
+_WRIST_COM_L   = np.array([0.02200, +0.00049, 0.00054])  # left wrist_yaw_link, wrist frame
+_WRIST_COM_R   = np.array([0.02200, -0.00049, 0.00054])  # right (Y sign flip)
+_WRIST_INERTIA_L = np.array([
+    [4.929e-5, -4.574e-7,  4.459e-6],
+    [-4.574e-7, 5.973e-5,  4.322e-7],
+    [4.459e-6,  4.322e-7,  3.928e-5],
+])
+_WRIST_INERTIA_R = np.array([
+    [4.929e-5, +4.574e-7,  4.459e-6],
+    [+4.574e-7, 5.973e-5, -4.322e-7],
+    [4.459e-6, -4.322e-7,  3.928e-5],
+])
+
+_HAND_BASE_MASS_URDF = 0.14143   # kg — URDF nominal, used as shape reference only
+_HAND_BASE_COM_L     = np.array([-0.0025264, -0.066047, -0.0019598])  # in hand_base frame
+_HAND_BASE_COM_R     = np.array([-0.0025264, -0.066047, +0.0019598])  # Z sign flip
+_HAND_BASE_INERTIA_URDF = np.array([
+    [1.2281e-4, 2.1711e-6,  1.7709e-6],
+    [2.1711e-6, 8.3832e-5, -1.6551e-6],
+    [1.7709e-6, -1.6551e-6, 7.6663e-5],
+])
+# URDF attachment joints (wrist_yaw_link → hand_base_link):
+#   Left:  xyz=[0.0415, 0.003, 0], rpy=[0, 0, pi/2]    → Rz(90°)
+#   Right: xyz=[0.0415, 0.003, 0], rpy=[pi, 0, -pi/2]  → Rx(180°)·Rz(-90°)
+_ATTACH_XYZ = np.array([0.0415, 0.003, 0.0])
+
+
+def _make_composite_wrist_inertia(side: str) -> pin.Inertia:
+    """Bare wrist_yaw_link + 1.0 kg measured hand, both in wrist_yaw frame."""
+    is_left = (side == "left")
+    I_wrist_bare = pin.Inertia(
+        _WRIST_MASS,
+        _WRIST_COM_L if is_left else _WRIST_COM_R,
+        _WRIST_INERTIA_L if is_left else _WRIST_INERTIA_R,
+    )
+    scale = INSPIRE_HAND_MASS / _HAND_BASE_MASS_URDF  # ~7.07
+    I_hand_in_handbase = pin.Inertia(
+        INSPIRE_HAND_MASS,
+        _HAND_BASE_COM_L if is_left else _HAND_BASE_COM_R,
+        _HAND_BASE_INERTIA_URDF * scale,
+    )
+    # URDF rpy convention: R = Rz(yaw)·Ry(pitch)·Rx(roll)
+    R_attach = pin.rpy.rpyToMatrix(0.0, 0.0, np.pi / 2) if is_left \
+        else pin.rpy.rpyToMatrix(np.pi, 0.0, -np.pi / 2)
+    T_wrist_to_hand = pin.SE3(R_attach, _ATTACH_XYZ)
+    # SE3.act(Inertia) transforms I from hand_base frame into wrist_yaw frame.
+    return I_wrist_bare + T_wrist_to_hand.act(I_hand_in_handbase)
+
+
+# -------------------------------------------------------
 # IK Solver
 # -------------------------------------------------------
 class G1HandIK:
-    def __init__(self, urdf_path=None, visualization=False):
+    def __init__(self, urdf_path=None, visualization=False, gravity_comp_enabled=True,
+                 tauff_filter_enabled=True, tauff_filter_alpha=0.3):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
+        self.gravity_comp_enabled = gravity_comp_enabled
+        self.tauff_filter_enabled = tauff_filter_enabled
+        self.tauff_filter = ExponentialMovingAverageFilter(tauff_filter_alpha, 14)
 
         # -------------------------------------------------------
         # Resolve URDF path
@@ -178,6 +269,12 @@ class G1HandIK:
             print(f"    Z (fingers):    {np.round(R[:,2], 3)}")
 
         # -------------------------------------------------------
+        # Gravity compensation: correct wrist body inertias before CasADi compile
+        # -------------------------------------------------------
+        if self.gravity_comp_enabled:
+            self._apply_hand_inertia_correction()
+
+        # -------------------------------------------------------
         # Build CasADi symbolic model
         # -------------------------------------------------------
         print("\n[G1HandIK] Building CasADi model...")
@@ -284,7 +381,28 @@ class G1HandIK:
         self.smooth_filter = WeightedMovingFilter(
             np.array([0.4, 0.3, 0.2, 0.1]), 14
         )
+        self.ipopt_exhaustion_count = 0
         print("[G1HandIK] Ready.")
+
+    def _apply_hand_inertia_correction(self) -> None:
+        """
+        Overwrite wrist_yaw body inertias with (bare wrist link + 1.0 kg Inspire hand).
+        Must be called before CasADi graph compilation so RNEA uses corrected inertias.
+        Replaces the lumped URDF value (wrist + 0.14 kg hand + fingers ≈ 0.28 kg)
+        with (wrist + 1.0 kg measured hand ≈ 1.08 kg).
+        """
+        for side, jname in [("left",  "left_wrist_yaw_joint"),
+                             ("right", "right_wrist_yaw_joint")]:
+            jid = self.reduced.model.getJointId(jname)
+            if jid == self.reduced.model.njoints:
+                raise RuntimeError(
+                    f"[G1HandIK] Joint '{jname}' not found in reduced model. "
+                    f"model.names={list(self.reduced.model.names)}"
+                )
+            self.reduced.model.inertias[jid] = _make_composite_wrist_inertia(side)
+            m = self.reduced.model.inertias[jid].mass
+            print(f"[G1HandIK] Gravity comp: {side} wrist composite mass = {m:.4f} kg")
+        self.reduced.data = self.reduced.model.createData()
 
     def solve_ik(self, L_target, R_target, current_q=None, current_dq=None):
         """
@@ -316,7 +434,18 @@ class G1HandIK:
             self.opti.solve()
             sol_q = self.opti.value(self.var_q)
         except Exception as e:
-            print(f"[G1HandIK] IK warning: {e}")
+            if "NonIpopt_Exception_Thrown" in str(e):
+                # CasADi/Ipopt checks for a pending SIGINT during long solves and
+                # aborts by throwing its own C++ KeyboardInterruptException, which
+                # crosses into Python as a plain Exception (not a real
+                # KeyboardInterrupt -- that's a BaseException, so it would skip this
+                # clause entirely). Re-raise as the real thing so callers looping on
+                # solve_ik() stop immediately instead of the Ctrl-C being silently
+                # absorbed as an ordinary solver failure.
+                print("[G1HandIK] Solve interrupted (Ctrl-C) -- propagating KeyboardInterrupt.")
+                raise KeyboardInterrupt("IK solve interrupted") from e
+            self.ipopt_exhaustion_count += 1
+            print(f"[G1HandIK] IK warning (exhaustion #{self.ipopt_exhaustion_count}): {e}")
             sol_q = self.opti.debug.value(self.var_q)
 
         self.smooth_filter.add_data(sol_q)
@@ -332,6 +461,10 @@ class G1HandIK:
             sol_q, v,
             np.zeros(self.reduced.model.nv),
         )
+
+        if self.tauff_filter_enabled:
+            self.tauff_filter.add_data(sol_tauff)
+            sol_tauff = self.tauff_filter.filtered_data.copy()
 
         return sol_q, sol_tauff
 
