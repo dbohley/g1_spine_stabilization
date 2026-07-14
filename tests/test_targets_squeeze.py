@@ -1,0 +1,124 @@
+"""Unit tests for the `squeeze` (palm-press depth) parameter of compute_hand_targets.
+
+The palm-force press loop presses the two palms together by shrinking the
+hand-to-hand separation via `squeeze`. These tests pin the geometry:
+symmetric inward motion, separation reduced by 2*squeeze, backward
+compatibility at squeeze=0, and clamping when squeeze exceeds the half-width.
+"""
+
+import numpy as np
+
+from g1_spine_stabilization.trajectory.targets import (
+    BOX_CENTER_DEFAULT,
+    BOX_HALF_WIDTH_DEFAULT,
+    compute_hand_targets,
+)
+
+
+def test_squeeze_zero_matches_no_squeeze():
+    """squeeze=0.0 must reproduce the original geometry byte-for-byte."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    for theta in (0.0, 0.3, -0.7):
+        L0, R0 = compute_hand_targets(box_center, 0.11, theta)
+        L1, R1 = compute_hand_targets(box_center, 0.11, theta, squeeze=0.0)
+        np.testing.assert_array_equal(L0, L1)
+        np.testing.assert_array_equal(R0, R1)
+
+
+def test_squeeze_reduces_separation_by_twice_s():
+    """Hand-to-hand distance shrinks by exactly 2*squeeze (both palms move in)."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    hw = 0.11
+    s = 0.02
+    L0, R0 = compute_hand_targets(box_center, hw, 0.0)
+    Ls, Rs = compute_hand_targets(box_center, hw, 0.0, squeeze=s)
+    sep0 = np.linalg.norm(L0[:3, 3] - R0[:3, 3])
+    seps = np.linalg.norm(Ls[:3, 3] - Rs[:3, 3])
+    np.testing.assert_allclose(sep0 - seps, 2 * s, atol=1e-9)
+
+
+def test_squeeze_is_symmetric_about_box_center():
+    """Both palms move inward by `s`; midpoint stays at box_center."""
+    box_center = np.array([0.35, 0.02, 0.10])
+    hw = 0.11
+    s = 0.015
+    Ls, Rs = compute_hand_targets(box_center, hw, 0.0, squeeze=s)
+    mid = 0.5 * (Ls[:3, 3] + Rs[:3, 3])
+    np.testing.assert_allclose(mid, box_center, atol=1e-9)
+    # each palm is (hw - s) from the center along +/- Y at theta=0
+    np.testing.assert_allclose(Ls[:3, 3][1] - box_center[1], hw - s, atol=1e-9)
+    np.testing.assert_allclose(box_center[1] - Rs[:3, 3][1], hw - s, atol=1e-9)
+
+
+def test_squeeze_rotates_with_theta():
+    """The inward direction follows the object rotation about X."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    hw = 0.11
+    s = 0.02
+    theta = 0.5
+    Ls, Rs = compute_hand_targets(box_center, hw, theta, squeeze=s)
+    # effective half-width along the rotated axis
+    Rx = np.array([[1, 0, 0],
+                   [0, np.cos(theta), -np.sin(theta)],
+                   [0, np.sin(theta),  np.cos(theta)]])
+    expected_L = box_center + Rx @ np.array([0.0, hw - s, 0.0])
+    expected_R = box_center + Rx @ np.array([0.0, -(hw - s), 0.0])
+    np.testing.assert_allclose(Ls[:3, 3], expected_L, atol=1e-9)
+    np.testing.assert_allclose(Rs[:3, 3], expected_R, atol=1e-9)
+
+
+def test_squeeze_clamps_at_zero_half_width():
+    """squeeze larger than the half-width clamps both palms to the center."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    hw = 0.05
+    Ls, Rs = compute_hand_targets(box_center, hw, 0.0, squeeze=0.5)  # >> hw
+    np.testing.assert_allclose(Ls[:3, 3], box_center, atol=1e-9)
+    np.testing.assert_allclose(Rs[:3, 3], box_center, atol=1e-9)
+
+
+def test_squeeze_leaves_orientation_untouched():
+    """Only positions change with squeeze; orientations are unaffected."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    L0, R0 = compute_hand_targets(box_center, BOX_HALF_WIDTH_DEFAULT, 0.4)
+    Ls, Rs = compute_hand_targets(box_center, BOX_HALF_WIDTH_DEFAULT, 0.4, squeeze=0.02)
+    np.testing.assert_array_equal(L0[:3, :3], Ls[:3, :3])
+    np.testing.assert_array_equal(R0[:3, :3], Rs[:3, :3])
+
+
+def test_negative_squeeze_widens_for_pregrasp_standoff():
+    """A negative squeeze (the Phase 1a pre-grasp standoff) makes the hands stand
+    off WIDER than the grasp pose, by 2*offset."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    hw = 0.055
+    offset = 0.04
+    Lg, Rg = compute_hand_targets(box_center, hw, 0.0)                    # grasp
+    Lp, Rp = compute_hand_targets(box_center, hw, 0.0, squeeze=-offset)   # standoff
+    sep_grasp = np.linalg.norm(Lg[:3, 3] - Rg[:3, 3])
+    sep_pre = np.linalg.norm(Lp[:3, 3] - Rp[:3, 3])
+    assert sep_pre > sep_grasp
+    np.testing.assert_allclose(sep_pre - sep_grasp, 2 * offset, atol=1e-9)
+
+
+def test_straight_in_close_moves_only_along_inter_palm_axis():
+    """Phase 1b close: sweeping squeeze from -offset to 0 at theta=0 moves each
+    palm PURELY along Y (X and Z stay constant) -- the 'one direction' guarantee."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    hw = 0.055
+    offset = 0.04
+    L_positions = []
+    R_positions = []
+    for alpha in np.linspace(0.0, 1.0, 11):
+        squeeze = (1 - alpha) * (-offset)  # -offset -> 0, matching Phase 1b
+        L, R = compute_hand_targets(box_center, hw, 0.0, squeeze=squeeze)
+        L_positions.append(L[:3, 3])
+        R_positions.append(R[:3, 3])
+    L_positions = np.array(L_positions)
+    R_positions = np.array(R_positions)
+    # X and Z constant across the whole close for both palms
+    np.testing.assert_allclose(L_positions[:, 0], L_positions[0, 0], atol=1e-12)
+    np.testing.assert_allclose(L_positions[:, 2], L_positions[0, 2], atol=1e-12)
+    np.testing.assert_allclose(R_positions[:, 0], R_positions[0, 0], atol=1e-12)
+    np.testing.assert_allclose(R_positions[:, 2], R_positions[0, 2], atol=1e-12)
+    # Y moves monotonically inward (left palm decreasing, right palm increasing)
+    assert np.all(np.diff(L_positions[:, 1]) < 0)
+    assert np.all(np.diff(R_positions[:, 1]) > 0)

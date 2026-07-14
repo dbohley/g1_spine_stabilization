@@ -5,13 +5,20 @@ Mirrors run_pose_tracking_sim but drives G1InspireRobot instead of CoppeliaSim.
 CoppeliaSim path (pose_tracking.py) is unchanged.
 
 Three-phase routine (arms), with a config-driven grip wrapped around Phase 2
-(hands, gated by grip_force.enabled -- default True):
+(hands, gated by grip_force.enabled / palm_press.enabled):
   1. Interpolate EE targets from default standing pose to grasp pose.
-  1.5. Close both hands to a light grip (grip_force.tau_baseline) and arm
-       the force-feedback controller. Skipped if Phase 1 was interrupted.
+  1.5. Close both hands to the grasp pose. If palm_press.enabled, capture the
+       no-contact palm baseline; else (finger-force mode) arm the finger
+       force-feedback controllers. Skipped if Phase 1 was interrupted.
   2. Drive both hands via the trajectory source until duration expires or
      KeyboardInterrupt (use None duration for marker-driven interactive mode).
-     The grip force-feedback loop runs alongside the arm every step.
+     Grip runs alongside the arm every step, in one of two modes:
+       - palm_press.enabled: an outer Cartesian press loop reads palm force and
+         drives a press depth `s` that shrinks the hand-target separation (the
+         IK moves the wrist/elbow to press the palms together); fingers stay at
+         the grasp pose. See controllers/palm_force.py, docs/palm_force_control.md.
+       - else (finger-force mode): the per-finger TransportGraspController loop
+         nudges the fingers toward a target force.
   Release. Guaranteed hand-release back to open, run whenever grip was
        engaged, regardless of how Phase 1.5/2 ended (normally or via
        KeyboardInterrupt) -- mirrors grasp_sequence.py's guaranteed
@@ -37,6 +44,7 @@ except ImportError:
     _HAS_RERUN = False
 
 from g1_spine_stabilization.controllers.grip_force import GraspController
+from g1_spine_stabilization.controllers.palm_force import PalmForceReader, PalmPressController
 from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep
 from g1_spine_stabilization.trajectory.targets import (
     compute_hand_targets,
@@ -210,8 +218,41 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
 
     grip_cfg     = cfg.get("grip_force", {})
     grip_enabled = grip_cfg.get("enabled", True)
-    ctrl_l = GraspController(grip_cfg) if grip_enabled else None
-    ctrl_r = GraspController(grip_cfg) if grip_enabled else None
+
+    palm_press_cfg     = cfg.get("palm_press", {})
+    palm_press_enabled = palm_press_cfg.get("enabled", False)
+
+    # Hands are engaged (fingers close to grasp pose) if EITHER the finger-force
+    # grip or the palm-press loop is on. The finger force-feedback loop runs only
+    # when grip is on AND palm-press is off: palm-press holds the fingers static
+    # and regulates grip force via the wrist/arm press instead (see
+    # controllers/palm_force.py, docs/palm_force_control.md).
+    use_hands    = grip_enabled or palm_press_enabled
+    finger_force = grip_enabled and not palm_press_enabled
+    ctrl_l = GraspController(grip_cfg) if use_hands else None
+    ctrl_r = GraspController(grip_cfg) if use_hands else None
+
+    # Palm-force press loop: outer Cartesian loop driving a scalar press depth s
+    # that shrinks the hand-target separation in compute_hand_targets. Reader is
+    # a pure DDS consumer (dry_run -> 0 N, so this whole path no-ops headlessly).
+    reader = None
+    press_ctrl = None
+    if palm_press_enabled:
+        reader = PalmForceReader(
+            ["left", "right"],
+            dry_run=bool(getattr(robot, "dry_run", False)),
+            counts_per_newton=palm_press_cfg.get("counts_per_newton", 1.0),
+            baseline_frames=palm_press_cfg.get("baseline_frames", 20),
+            noise_threshold=palm_press_cfg.get("noise_threshold", 0.0),
+            signal=palm_press_cfg.get("signal", "min"),
+        )
+        press_ctrl = PalmPressController(
+            kappa=palm_press_cfg.get("kappa", 0.0),
+            s_max=palm_press_cfg.get("squeeze_max", 0.0),
+            force_min=palm_press_cfg.get("force_min", 0.0),
+            force_target=palm_press_cfg.get("force_target", 0.0),
+            force_max=palm_press_cfg.get("force_max", 0.0),
+        )
 
     # ---------------------------------------------------------------
     # Source startup — detect object marker or initialise sine timer
@@ -223,11 +264,23 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     print(f"[SDKController] box_center={np.round(box_center, 4)}, half_width={box_half_width:.4f}")
 
     # ---------------------------------------------------------------
-    # Phase 1: Interpolate to grasp pose
+    # Phase 1: two-stage approach.
+    #   1a. Approach to a PRE-GRASP STANDOFF -- the grasp pose but with the palms
+    #       held `pregrasp_offset` wider than the object (a negative squeeze).
+    #       This absorbs the gross/diagonal gross motion and ends with the hands
+    #       correctly positioned and oriented AROUND the object, standing clear.
+    #   1b. Close STRAIGHT IN along the inter-palm axis by ramping the squeeze
+    #       from -pregrasp_offset to 0. compute_hand_targets translates both palms
+    #       purely along their facing normals, so the object seats flat between
+    #       them instead of the palms coming in diagonally and snagging.
+    # Continuum on one axis: standoff (-offset) -> grasp (0) -> press (+s, Phase 2).
     # ---------------------------------------------------------------
-    print(f"[SDKController] Phase 1: interpolating to grasp pose over {interpolation_time}s…")
-    L_grasp, R_grasp = compute_hand_targets(box_center, box_half_width, 0.0)
+    approach_cfg    = cfg.get("grasp_approach", {})
+    pregrasp_offset = approach_cfg.get("pregrasp_offset", 0.04)
+    close_time      = approach_cfg.get("close_time", 1.5)
+
     steps_interp = int(interpolation_time / control_dt)
+    steps_close  = max(1, int(close_time / control_dt))
 
     current_q = _get_q(robot)
     L_current_pose, R_current_pose = ik.fk(current_q)
@@ -236,16 +289,21 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     L_start_rot = L_current_pose.rotation.copy()
     R_start_rot = R_current_pose.rotation.copy()
 
+    L_pre, R_pre = compute_hand_targets(box_center, box_half_width, 0.0, squeeze=-pregrasp_offset)
+
     _last_log_t = time.monotonic() - 1.0  # fire on first step
     _phase1_interrupted = False
     try:
+        # --- Phase 1a: approach to the wide pre-grasp standoff ---
+        print(f"[SDKController] Phase 1a: approaching pre-grasp standoff "
+              f"(+{pregrasp_offset * 100:.1f}cm wider) over {interpolation_time}s…")
         for i in range(steps_interp):
             alpha = smoothstep(i / steps_interp)
 
-            L_pos = (1 - alpha) * L_start_pos + alpha * L_grasp[:3, 3]
-            R_pos = (1 - alpha) * R_start_pos + alpha * R_grasp[:3, 3]
-            L_R   = slerp_rotation(L_start_rot, L_grasp[:3, :3], alpha)
-            R_R   = slerp_rotation(R_start_rot, R_grasp[:3, :3], alpha)
+            L_pos = (1 - alpha) * L_start_pos + alpha * L_pre[:3, 3]
+            R_pos = (1 - alpha) * R_start_pos + alpha * R_pre[:3, 3]
+            L_R   = slerp_rotation(L_start_rot, L_pre[:3, :3], alpha)
+            R_R   = slerp_rotation(R_start_rot, R_pre[:3, :3], alpha)
 
             current_dq = np.zeros(14)
             sol_q, sol_tauff = ik.solve_ik(
@@ -262,6 +320,28 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
             if time.monotonic() - _last_log_t >= 1.0:
                 _last_log_t = time.monotonic()
                 print(f"  {alpha * 100:.0f}%")
+
+        # --- Phase 1b: straight-in lateral close (squeeze -offset -> 0) ---
+        print(f"[SDKController] Phase 1b: closing straight in along the inter-palm "
+              f"axis over {close_time}s…")
+        for i in range(steps_close):
+            alpha = smoothstep(i / steps_close)
+            squeeze = (1 - alpha) * (-pregrasp_offset)   # -offset -> 0
+
+            L_target, R_target = compute_hand_targets(
+                box_center, box_half_width, 0.0, squeeze=squeeze,
+            )
+            current_dq = np.zeros(14)
+            sol_q, sol_tauff = ik.solve_ik(L_target, R_target, current_q, current_dq)
+            robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
+            current_q = sol_q
+            if cam_for_preview is not None:
+                cam_for_preview.capture()
+            time.sleep(control_dt)
+
+            if time.monotonic() - _last_log_t >= 1.0:
+                _last_log_t = time.monotonic()
+                print(f"  closing {alpha * 100:.0f}%")
     except KeyboardInterrupt:
         _phase1_interrupted = True
         print("\n[SDKController] KeyboardInterrupt — exiting Phase 1 "
@@ -273,15 +353,22 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         # ---------------------------------------------------------------
         # Phase 1.5: Close hands to a light grip
         # ---------------------------------------------------------------
-        if grip_enabled:
+        if use_hands:
             print("[SDKController] Phase 1.5: closing hands to grip pose...")
             try:
                 _lerp_hand_pose(robot, control_dt, ctrl_l.open_pose, ctrl_l.close_pose, _HAND_CLOSE_TIME)
                 time.sleep(_HAND_SETTLE_TIME)
-                state_l = robot.hand.get_state("left")
-                state_r = robot.hand.get_state("right")
-                ctrl_l.arm(np.asarray(state_l["q"], dtype=float))
-                ctrl_r.arm(np.asarray(state_r["q"], dtype=float))
+                if finger_force:
+                    state_l = robot.hand.get_state("left")
+                    state_r = robot.hand.get_state("right")
+                    ctrl_l.arm(np.asarray(state_l["q"], dtype=float))
+                    ctrl_r.arm(np.asarray(state_r["q"], dtype=float))
+                if palm_press_enabled:
+                    # Capture the no-contact palm baseline now: the fingers hold
+                    # the object but the palms are still at nominal separation
+                    # (squeeze=0), i.e. not yet pressing. See
+                    # docs/palm_force_control.md.
+                    reader.capture_baseline()
                 print("[SDKController] Hands gripped.")
             except KeyboardInterrupt:
                 print("\n[SDKController] KeyboardInterrupt — exiting hand-close early.")
@@ -303,14 +390,26 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                 if getattr(source, 'object_lost', False) and not _obj_lost_warned:
                     print("[SDKController] WARNING: object marker lost — box may have fallen! (SDK-6: stop here)")
                     _obj_lost_warned = True
-                L_target, R_target = compute_hand_targets(box_center, box_half_width, theta)
+
+                # Palm-force press loop: read palm force, advance the press-depth
+                # integrator, and shrink the hand-target separation by `squeeze`.
+                # In dry-run the reader returns 0 N, so squeeze stays 0 and the
+                # arm behaves exactly as the pre-palm-press tracking loop.
+                squeeze = 0.0
+                if palm_press_enabled:
+                    F_palm  = reader.target_force()
+                    F_guard = reader.guard_force()
+                    squeeze = press_ctrl.step(F_palm, F_guard)
+                L_target, R_target = compute_hand_targets(
+                    box_center, box_half_width, theta, squeeze=squeeze,
+                )
 
                 current_dq = np.zeros(14)
                 sol_q, sol_tauff = ik.solve_ik(L_target, R_target, current_q, current_dq)
                 robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
                 current_q = sol_q
 
-                if grip_enabled:
+                if finger_force:
                     state_l = robot.hand.get_state("left")
                     state_r = robot.hand.get_state("right")
                     q_cmd_l = ctrl_l.step(np.asarray(state_l["force"], dtype=float),
@@ -318,6 +417,8 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                     q_cmd_r = ctrl_r.step(np.asarray(state_r["force"], dtype=float),
                                           np.asarray(state_r["q"], dtype=float), control_dt)
                     robot.hand.set_joint_targets(q_left=q_cmd_l, q_right=q_cmd_r)
+                # (palm-press mode leaves the fingers at the grasp pose commanded
+                # in Phase 1.5; the SDK's 250 Hz publisher re-sends it for free.)
 
                 if cam_for_preview is not None:
                     cam_for_preview.capture()
@@ -327,6 +428,14 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                     _last_log_t = time.monotonic()
                     _log_marker_info(source, theta, elapsed, preview,
                                       L_target=L_target, R_target=R_target)
+                    if palm_press_enabled:
+                        print(f"  Palm press: s={squeeze * 1000:.1f}mm  "
+                              f"F_target={F_palm:.2f}N  F_guard={F_guard:.2f}N  "
+                              f"(setpoint={press_ctrl.force_target:.2f}N)")
+                        if _HAS_RERUN and preview is not None:
+                            rr.log("palm_press/squeeze_mm", rr.Scalars(float(squeeze * 1000)))
+                            rr.log("palm_press/force_target_N", rr.Scalars(float(F_palm)))
+                            rr.log("palm_press/force_guard_N", rr.Scalars(float(F_guard)))
                     if _HAS_RERUN and gravity_comp_enabled:
                         _TAUFF_JOINT_NAMES = [
                             "L_shoulder_pitch", "L_shoulder_roll", "L_shoulder_yaw", "L_elbow",
@@ -344,11 +453,14 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         # Guaranteed hand release -- runs whenever grip was engaged,
         # regardless of how Phase 1.5/2 ended, before Phase 3 begins.
         # ---------------------------------------------------------------
-        if grip_enabled:
+        if use_hands:
             print("[SDKController] Releasing hands...")
             try:
-                ctrl_l.reset()
-                ctrl_r.reset()
+                if finger_force:
+                    ctrl_l.reset()
+                    ctrl_r.reset()
+                if palm_press_enabled:
+                    press_ctrl.reset()
                 _lerp_hand_pose(robot, control_dt, ctrl_l.close_pose, ctrl_l.open_pose, _HAND_RELEASE_TIME)
                 print("[SDKController] Hands released.")
             except KeyboardInterrupt:
@@ -393,6 +505,9 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                 print(f"  {alpha * 100:.0f}%")
     except KeyboardInterrupt:
         print("\n[SDKController] KeyboardInterrupt — exiting Phase 3 early, proceeding to settle/shutdown.")
+
+    if reader is not None:
+        reader.close()
 
     settle_time = cfg.get("shutdown", {}).get("settle_time", 0.4)
     print(f"[SDKController] Settling for {settle_time:.2f}s before shutdown...")

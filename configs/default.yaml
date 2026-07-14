@@ -45,7 +45,7 @@ trajectory:
     ema_alpha: 0.3
 
 box:
-  size: [0.16, 0.16, 0.16]
+  size: [0.10, 0.11, 0.2]
   color: [0.8, 0.3, 0.2]
   mass: 0.2
 
@@ -107,9 +107,68 @@ shutdown:
 
 grip_force:
   enabled: true             # apply grip during grasp_demo.py AND pose tracking (sdk_pose_tracking.py)
-  tau_baseline: 0.25        # target grip force per finger (N); light hold
+  tau_baseline: 0.2        # target grip force per finger (N); light hold
   kappa: 0.05               # TransportGraspController coupling gain
-  delta_q_max: 1.0          # max additional closure beyond grasp pose (rad)
+  delta_q_max: .2          # max additional closure beyond grasp pose (rad)
   # Soft close — below SDK hard limits [1.47, 1.47, 1.47, 1.47, 1.2, 0.56].
   # Order: [index_mcp, middle_mcp, ring_mcp, little_mcp, thumb_rotate, thumb_flex]
-  grasp_pose: [0.9, 0.9, 0.9, 0.9, 0.7, 0.35]
+  grasp_pose: [0.3, 0.3, 0.3, 0.3, 0.2, 0.2]
+
+# grip_force:
+#   enabled: true             # apply grip during grasp_demo.py AND pose tracking (sdk_pose_tracking.py)
+#   tau_baseline: 0.25        # target grip force per finger (N); light hold
+#   kappa: 0.05               # TransportGraspController coupling gain
+#   delta_q_max: 1.0          # max additional closure beyond grasp pose (rad)
+#   # Soft close — below SDK hard limits [1.47, 1.47, 1.47, 1.47, 1.2, 0.56].
+#   # Order: [index_mcp, middle_mcp, ring_mcp, little_mcp, thumb_rotate, thumb_flex]
+#   grasp_pose: [0.9, 0.9, 0.9, 0.9, 0.7, 0.35]
+
+grasp_approach:
+  # Two-stage Phase 1 approach in sdk_pose_tracking.py. The hands first reach a
+  # PRE-GRASP STANDOFF (the grasp pose but `pregrasp_offset` wider than the
+  # object), then close STRAIGHT IN along the inter-palm axis. This avoids the
+  # old single straight-line approach that brought the palms in diagonally and
+  # snagged on the object edges. The close is a squeeze ramp -pregrasp_offset->0,
+  # continuous with the Phase 2 palm-press squeeze (0 -> +s).
+  pregrasp_offset: 0.04   # m: palms stand off this much wider per side before the
+                          #    straight-in close. MUST be < box_half_width (0.055).
+                          #    Set to 0.0 to disable the standoff (direct approach).
+  close_time: 1.5         # s: duration of the straight-in lateral close (Phase 1b)
+
+palm_press:
+  # Palm-force PRESS control (sdk_pose_tracking.py, --source *). When enabled,
+  # the FINGERS just hold grip_force.grasp_pose (no finger force loop) and the
+  # PALM normal force is regulated by pressing the two palms together: an outer
+  # loop drives a press depth `s` that shrinks the hand-target separation in
+  # compute_hand_targets, and the IK moves the wrist/elbow to press. Full
+  # architecture + math: docs/palm_force_control.md.
+  #
+  # If enabled AND palm_press is on, the finger-force loop in grip_force is
+  # bypassed (fingers static). grip_force.grasp_pose still sets the finger hold.
+  enabled: true
+
+  # --- Calibration: palm counts -> Newtons ---
+  # The palm sensor reports raw int16 counts, NOT Newtons. Obtain this scale with
+  #   python scripts/read_palm_force.py --no-dry-run --baseline --calibrate <N>
+  # (press with a known load). Until calibrated, force_* below are effectively in
+  # raw summed counts (counts_per_newton = 1.0). PLACEHOLDER — must be measured.
+  counts_per_newton: 1.0
+
+  # --- Force targets (Newtons, once counts_per_newton is calibrated) ---
+  # force_target is regulated to; tune by trial-and-error pulling the object out
+  # of the hands at increasing force. force_max = crush guard (back off above it);
+  # force_min = hold floor. PLACEHOLDERS — force_target: 0.0 => NO press until set,
+  # so this is safe to leave enabled before calibration/tuning.
+  force_min: 0.0
+  force_target: 0.0
+  force_max: 5.0
+
+  # --- Press-loop dynamics ---
+  kappa: 0.0005          # integral gain (m/N per step): s += kappa*(F_des - F)
+  squeeze_max: 0.02      # max press depth s (m); MUST be < box_half_width (=0.055)
+
+  # --- Signal conditioning ---
+  baseline_frames: 20    # no-contact frames averaged at Phase 1.5 to zero the palm
+  noise_threshold: 10    # counts above baseline to count a cell as "active" (diagnostic)
+  signal: min            # combine the two palms for the target loop: min | mean
+                         # (min guarantees BOTH palms reach the setpoint)

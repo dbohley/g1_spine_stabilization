@@ -35,6 +35,8 @@ def cfg_fast():
     """Real config with the interpolation/settle durations shrunk for test speed."""
     cfg = load_config()
     cfg["control"]["interpolation_time"] = 0.06
+    # Phase 1b (straight-in close) defaults to 1.5s; shrink it too so tests stay fast.
+    cfg.setdefault("grasp_approach", {})["close_time"] = 0.06
     cfg.setdefault("shutdown", {})["settle_time"] = 0.05
     return cfg
 
@@ -166,13 +168,17 @@ def test_pose_tracking_sdk_phase3_keyboard_interrupt_still_settles(
     call_count = {"n": 0}
     original_solve_ik = ik.solve_ik
 
+    dt = cfg_fast["control"]["dt"]
+    phase1_calls = (int(cfg_fast["control"]["interpolation_time"] / dt)
+                    + max(1, int(cfg_fast["grasp_approach"]["close_time"] / dt)))
+
     def fault_solve_ik(*args, **kwargs):
         call_count["n"] += 1
-        # Phase 1 makes exactly 3 calls with cfg_fast (interpolation_time=0.06,
-        # control.dt=0.02); duration=0.0 makes Phase 2 make zero calls (its
-        # elapsed-time check breaks the loop before the first solve_ik call),
-        # so call #4 is deterministically the first call inside Phase 3.
-        if call_count["n"] == 4:
+        # Phase 1 = Phase 1a (interpolation_time) + Phase 1b (close_time) solve_ik
+        # calls; duration=0.0 makes Phase 2 make zero calls (its elapsed-time check
+        # breaks the loop before the first solve_ik call), so the
+        # (phase1_calls+1)-th call is deterministically the first call in Phase 3.
+        if call_count["n"] == phase1_calls + 1:
             raise KeyboardInterrupt()
         return original_solve_ik(*args, **kwargs)
 
@@ -225,9 +231,11 @@ def test_pose_tracking_sdk_grips_and_releases_hands(dry_robot, ik, cfg_fast, mon
 
 
 def test_pose_tracking_sdk_grip_disabled_skips_hand_commands(dry_robot, ik, cfg_fast, monkeypatch):
-    """grip_force.enabled=False must fully preserve the old arm-only
-    behavior -- zero hand commands issued anywhere in the run."""
+    """Arm-only behavior (zero hand commands anywhere in the run) requires BOTH
+    grip_force AND palm_press disabled -- palm-press mode still closes the
+    fingers to hold the object while it regulates force via the wrist press."""
     cfg_fast["grip_force"]["enabled"] = False
+    cfg_fast.setdefault("palm_press", {})["enabled"] = False
 
     source = SineSource(
         box_center=np.array([0.35, 0.0, 0.1]),
@@ -258,12 +266,16 @@ def test_pose_tracking_sdk_releases_hands_after_interrupt_during_tracking(
     call_count = {"n": 0}
     original_solve_ik = ik.solve_ik
 
+    dt = cfg_fast["control"]["dt"]
+    phase1_calls = (int(cfg_fast["control"]["interpolation_time"] / dt)
+                    + max(1, int(cfg_fast["grasp_approach"]["close_time"] / dt)))
+
     def fault_solve_ik(*args, **kwargs):
         call_count["n"] += 1
-        # Phase 1 makes exactly 3 calls with cfg_fast; Phase 1.5/the release
-        # block never call solve_ik, so call #4 is the first call inside
-        # Phase 2's tracking loop.
-        if call_count["n"] == 4:
+        # Phase 1 = Phase 1a (interpolation_time) + Phase 1b (close_time) solve_ik
+        # calls; Phase 1.5/the release block never call solve_ik, so the
+        # (phase1_calls+1)-th call is the first call inside Phase 2's tracking loop.
+        if call_count["n"] == phase1_calls + 1:
             raise KeyboardInterrupt()
         return original_solve_ik(*args, **kwargs)
 
