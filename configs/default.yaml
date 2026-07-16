@@ -152,7 +152,7 @@ palm_press:
   #   python scripts/read_palm_force.py --no-dry-run --baseline --calibrate <N>
   # (press with a known load). Until calibrated, force_* below are effectively in
   # raw summed counts (counts_per_newton = 1.0). PLACEHOLDER — must be measured.
-  counts_per_newton: 1.0
+  counts_per_newton: 720.0
 
   # --- Force targets (Newtons, once counts_per_newton is calibrated) ---
   # force_target is regulated to; tune by trial-and-error pulling the object out
@@ -160,8 +160,8 @@ palm_press:
   # force_min = hold floor. PLACEHOLDERS — force_target: 0.0 => NO press until set,
   # so this is safe to leave enabled before calibration/tuning.
   force_min: 0.0
-  force_target: 0.0
-  force_max: 5.0
+  force_target: 5.0
+  force_max: 8.0
 
   # --- Press-loop dynamics ---
   kappa: 0.0005          # integral gain (m/N per step): s += kappa*(F_des - F)
@@ -172,3 +172,38 @@ palm_press:
   noise_threshold: 10    # counts above baseline to count a cell as "active" (diagnostic)
   signal: min            # combine the two palms for the target loop: min | mean
                          # (min guarantees BOTH palms reach the setpoint)
+
+  # --- Contact-loss safety watchdog (SDK-6 head-drop guard) ---
+  # Armed once the grip is real (min-palm force crosses touch_threshold, i.e. BOTH
+  # palms loaded); trips if the min-palm force then falls below loss_floor for
+  # loss_frames consecutive frames. On trip the press is frozen (never driven
+  # further inward) and the arm holds its current pose stiffly via kp -- it does
+  # NOT keep squeezing a head that has dropped or slipped out. Complementary to
+  # the vision-based object_lost (marker) signal. No-op in dry-run (reader = 0 N
+  # never arms it). UNMEASURED placeholders in the same Newton units as force_* --
+  # tune with real data after counts_per_newton calibration.
+  touch_threshold: 0.5   # N: min-palm force that counts as "gripped" (arms the watchdog)
+  loss_floor: 0.2        # N: min-palm force below which contact is "lost" (<= touch_threshold)
+  loss_frames: 3         # consecutive below-floor frames to latch the trip (~0.3-0.5s at 6-10Hz)
+
+  # --- Force-control mode (Road 1: Jacobian feedforward) ---
+  # mode selects how the palm grip force is produced:
+  #   position (DEFAULT) -- the s-depth loop above: shrink the hand-target
+  #     separation and let the stiff IK servo turn "aim past the surface" into
+  #     force. Unchanged, safe, the fallback.
+  #   jacobian -- hold a fixed seat separation (NOT force-driven) and produce the
+  #     grip force as torque feedforward tau = J^T W added on top of gravity comp
+  #     (see docs/palm_force_jacobian.md). kp is UNTOUCHED (Road 1). This is the
+  #     faster-responding path; flip to it LIVE (human-run) after the tiny-force
+  #     sign check. Reuses force_target (= F_des setpoint) and force_max (= F_cmd
+  #     clamp) above, plus the S0 watchdog (a trip zeros the wrench).
+  mode: position         # position | jacobian
+  kappa_f: 0.5           # force-loop trim gain (N per step per N error); jacobian mode
+  seat_squeeze: 0.0      # m: fixed "just touching" seat depth held in jacobian mode
+                         #    (0.0 = palms at the object faces, since box_half_width=0.055
+                         #    already sits at the surface). Force comes from tau_ff, not this.
+  f_des_ramp_time: 2.0   # s: ramp F_des 0 -> force_target (soft-start; never step torque on contact)
+  force_feedforward: true # jacobian mode: include the F_des feedforward term (fast). false =
+                          #    pure-integral trim only (slower, position-loop-like transient).
+  tau_press_max: 8.0     # N*m: per-joint saturation on the press feedforward torque tau_press.
+                          #    The SDK does NOT clamp tau_ff in software, so we cap it ourselves.

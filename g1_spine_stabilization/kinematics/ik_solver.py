@@ -474,6 +474,39 @@ class G1HandIK:
         pin.framesForwardKinematics(self.reduced.model, data, q)
         return data.oMf[self.L_ee_id], data.oMf[self.R_ee_id]
 
+    def ee_jacobians(self, q):
+        """End-effector Jacobians (J_L, J_R), each 6x14, at joint config q.
+
+        Frame convention: pin.LOCAL_WORLD_ALIGNED — the Jacobian's operational
+        point is the EE origin (L_ee_link / R_ee_link, the inner-palm contact
+        point) but its axes are aligned to the pelvis/base frame. A Cartesian
+        press wrench W expressed in the pelvis frame therefore maps to joint
+        feedforward torque by tau = J^T W (principle of virtual work, with W the
+        wrench the palm exerts ON the object). W and J MUST share this frame or
+        the torque direction is wrong.
+
+        Purely kinematic (independent of the gravity-comp inertia correction).
+        Each arm's Jacobian is nonzero only in that arm's 7 columns (left 0-6,
+        right 7-13, matching the reduced-model joint order), so summing
+        J_L^T W_L + J_R^T W_R cleanly loads each arm from its own wrench only.
+
+        Args:
+            q: (14,) joint config in reduced-model order.
+
+        Returns:
+            (J_L, J_R): two (6, 14) numpy arrays.
+        """
+        q = np.asarray(q, dtype=float)
+        J_L = pin.computeFrameJacobian(
+            self.reduced.model, self.reduced.data, q,
+            self.L_ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
+        J_R = pin.computeFrameJacobian(
+            self.reduced.model, self.reduced.data, q,
+            self.R_ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
+        return np.asarray(J_L).copy(), np.asarray(J_R).copy()
+
     def get_full_model_and_data(self):
         """Expose the un-reduced (53-DOF) Pinocchio model + a fresh data object.
 

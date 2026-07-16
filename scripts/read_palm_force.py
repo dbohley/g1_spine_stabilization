@@ -32,6 +32,12 @@ Usage:
 
     # One hand only:
     python scripts/read_palm_force.py --side left
+
+    # Calibrate counts_per_newton, one hand at a time, load given as a mass:
+    python scripts/read_palm_force.py --no-dry-run --side left --calibrate-kg 0.5
+    #   keep the palm untouched for the baseline, then rest the known mass flat
+    #   on the central palm pad (face-up, spread like the real object) at the
+    #   prompt. Repeat with --side right.
 """
 
 from __future__ import annotations
@@ -54,6 +60,7 @@ MODBUS_PORT = 6000
 DEVICE_ID = 1
 DEFAULT_LEFT_IP = "192.168.11.210"
 DEFAULT_RIGHT_IP = "192.168.123.210"
+STANDARD_GRAVITY = 9.80665    # m/s^2, to convert a known mass (kg) -> force (N)
 
 # ASCII heatmap ramp, low -> high pressure.
 _RAMP = " .:-=+*#%@"
@@ -184,11 +191,17 @@ def main() -> None:
     parser.add_argument("--noise-threshold", type=float, default=10.0,
                         help="Counts above baseline to count a cell as 'active' (default: 10)")
     parser.add_argument("--calibrate", type=float, default=None, metavar="NEWTONS",
-                        help="Calibration mode: press the palm with a known static load of "
-                             "NEWTONS (e.g. hang a 0.5 kg mass on a level palm -> 4.9), average "
-                             "the baseline-subtracted total counts, and print "
-                             "counts_per_newton = mean_total / NEWTONS, then exit. Pair with "
-                             "--baseline to zero the rest offset first.")
+                        help="Calibration mode: rest a known static load of NEWTONS on the palm, "
+                             "average the baseline-subtracted total counts, and print "
+                             "counts_per_newton = mean_total / NEWTONS, then exit. A baseline is "
+                             "captured automatically. Calibrate ONE hand at a time (--side left / "
+                             "--side right). The load must press NORMAL to the pad (palm face-up) "
+                             "and SPREAD across the central palm like the real grasped object "
+                             "(summing the 112 cells gives total force only in the linear regime).")
+    parser.add_argument("--calibrate-kg", type=float, default=None, metavar="KG",
+                        help="Same as --calibrate but the known load is given as a MASS in kg "
+                             "(converted to force via g=9.80665). E.g. --calibrate-kg 0.5 -> 4.90 N. "
+                             "Mutually exclusive with --calibrate.")
     parser.add_argument("--rate", type=float, default=10.0,
                         help="Read rate in Hz (default: 10)")
     parser.add_argument("--duration", type=float, default=None,
@@ -198,6 +211,21 @@ def main() -> None:
     parser.add_argument("--right-ip", default=DEFAULT_RIGHT_IP,
                         help=f"Right hand Modbus IP (default: {DEFAULT_RIGHT_IP})")
     args = parser.parse_args()
+
+    # Resolve the known calibration load in Newtons from either --calibrate (N)
+    # or --calibrate-kg (mass * g). Mutually exclusive.
+    if args.calibrate is not None and args.calibrate_kg is not None:
+        parser.error("pass only one of --calibrate / --calibrate-kg")
+    force_n = None
+    if args.calibrate is not None:
+        if args.calibrate <= 0.0:
+            parser.error("--calibrate NEWTONS must be positive")
+        force_n = args.calibrate
+    elif args.calibrate_kg is not None:
+        if args.calibrate_kg <= 0.0:
+            parser.error("--calibrate-kg KG must be positive")
+        force_n = args.calibrate_kg * STANDARD_GRAVITY
+    calibrating = force_n is not None
 
     sides = ["left", "right"] if args.side == "both" else [args.side]
     ips = {"left": args.left_ip, "right": args.right_ip}
@@ -219,7 +247,9 @@ def main() -> None:
     for reader in readers.values():
         reader.connect()
 
-    if args.baseline:
+    if args.baseline or calibrating:
+        if calibrating and not args.baseline:
+            print("[PalmForce] Calibration needs a baseline to be valid; capturing one now.")
         baseline = capture_baseline(readers, args.baseline_frames, args.rate)
     else:
         baseline = {side: np.zeros(PALM_SHAPE) for side in sides}
@@ -227,13 +257,19 @@ def main() -> None:
               "offset. Use --baseline to subtract it.")
 
     # --- Calibration mode: average total counts under a known load, print scale ---
-    if args.calibrate is not None:
-        if args.calibrate <= 0.0:
-            parser.error("--calibrate NEWTONS must be positive")
+    if calibrating:
+        load_desc = f"{force_n:.3f} N"
+        if args.calibrate_kg is not None:
+            load_desc = f"{args.calibrate_kg:.3f} kg = {force_n:.3f} N"
         n = args.baseline_frames
         period = 1.0 / args.rate
-        print(f"[PalmForce] Calibrating: press each palm with a KNOWN load of "
-              f"{args.calibrate:.3f} N and hold it steady ({n} frames)...")
+        # Give the user time to place the load AFTER the untouched baseline. Skipped
+        # in dry-run so headless/CI runs don't block (mirrors the live-warning gate).
+        if not args.dry_run:
+            input("[PalmForce] Rest the known load flat on the palm pad (face-up, spread "
+                  "across the central palm like the grasped object), then press Enter to "
+                  "capture...")
+        print(f"[PalmForce] Calibrating against {load_desc}; hold it steady ({n} frames)...")
         totals = {side: 0.0 for side in sides}
         for _ in range(n):
             for side in sides:
@@ -242,11 +278,11 @@ def main() -> None:
             time.sleep(period)
         for side in sides:
             mean_total = totals[side] / max(n, 1)
-            cpn = mean_total / args.calibrate
+            cpn = mean_total / force_n
             print(f"[PalmForce] {side}: mean_total={mean_total:.1f} counts @ "
-                  f"{args.calibrate:.3f} N  ->  counts_per_newton = {cpn:.2f}")
+                  f"{load_desc}  ->  counts_per_newton = {cpn:.2f}")
         print("[PalmForce] Put counts_per_newton into configs/default.yaml "
-              "palm_press.counts_per_newton. Done.")
+              "palm_press.counts_per_newton (calibrate each hand separately). Done.")
         for reader in readers.values():
             reader.close()
         return

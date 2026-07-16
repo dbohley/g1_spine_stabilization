@@ -74,3 +74,33 @@ def compute_hand_targets(box_center, box_half_width, theta, squeeze=0.0):
 
     # Apply object rotation on top of base orientations
     return make_se3(L_pos, R @ R_L_BASE), make_se3(R_pos, R @ R_R_BASE)
+
+
+def compute_press_wrenches(theta, F_cmd):
+    """Desired inter-palm press wrenches for the Jacobian force controller.
+
+    Builds a pure-force, zero-moment wrench per hand pointing INWARD toward the
+    object center along the (rotated) inter-palm axis -- the same axis the
+    ``squeeze`` knob in ``compute_hand_targets`` translates along. These feed the
+    torque feedforward via ``tau = J^T W`` (see G1HandIK.ee_jacobians), where W is
+    the wrench the palm exerts ON the object, expressed in the pelvis frame.
+
+    Geometry: the left palm sits at ``+w`` along ``u = Rx(theta)@[0,1,0]`` (see
+    ``compute_hand_targets``), so to press toward center it exerts ``-F_cmd*u``;
+    the right palm sits at ``-w`` and exerts ``+F_cmd*u``. Both wrenches are in
+    the SAME pelvis frame as the LOCAL_WORLD_ALIGNED Jacobians they multiply.
+
+    Args:
+        theta: object roll about robot X (radians) -- the same theta driving
+               ``compute_hand_targets`` this step.
+        F_cmd: commanded press-force magnitude (N), >= 0.
+
+    Returns:
+        (W_L, W_R): two length-6 numpy arrays [fx, fy, fz, mx, my, mz], zero moment.
+    """
+    u = Rx(theta) @ np.array([0.0, 1.0, 0.0])   # rotated inter-palm axis, pelvis frame
+    W_L = np.zeros(6)
+    W_R = np.zeros(6)
+    W_L[:3] = -float(F_cmd) * u                  # left presses toward center (-u)
+    W_R[:3] = +float(F_cmd) * u                  # right presses toward center (+u)
+    return W_L, W_R

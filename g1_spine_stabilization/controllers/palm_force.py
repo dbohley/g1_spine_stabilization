@@ -264,3 +264,182 @@ class PalmPressController:
 
         self.s = float(np.clip(self.s + update, 0.0, self.s_max))
         return self.s
+
+
+class PalmContactWatchdog:
+    """Contact-loss safety guard for the palm-press grip (SDK-6 head-drop guard).
+
+    The press loops (both the position ``PalmPressController`` and the later
+    Jacobian force controller) have a shared failure mode: if the grasped object
+    -- a head, in the spine-stabilization context -- drops or slips out, the
+    measured palm force falls to ~0, the loop reads a large below-setpoint error,
+    and it keeps driving the palms *inward* against nothing. The position loop
+    claps the palms in to ``squeeze_max`` and holds there; the force loop winds
+    the commanded wrench up to its max and pushes the hands together with nothing
+    to react against. Neither should keep squeezing a head that is no longer
+    there.
+
+    This watchdog is a pure state machine on the combined (min-of-two-palms)
+    force signal, independent of which press controller is active:
+
+      * **Arm** once the grip is real: the min-palm force crosses
+        ``touch_threshold`` (both palms loaded). Before arming it never freezes,
+        so the approach/close-in press can build first contact normally. In
+        dry-run the reader returns 0 N, so it never arms and this whole guard is
+        a no-op (the preview path is unchanged).
+      * **Freeze** the instant a below-``loss_floor`` reading appears after
+        arming (``press_frozen`` True) -- the press must not advance inward while
+        contact looks lost, even before the trip latches. A transient dip that
+        recovers next frame simply resumes pressing.
+      * **Trip** (latched) once the force stays below ``loss_floor`` for
+        ``loss_frames`` consecutive frames -- a confirmed loss. ``tripped`` stays
+        True for the rest of the run; the caller freezes the press, holds the
+        current pose stiffly via the unchanged ``kp`` servo, and alerts the human.
+
+    ``loss_floor <= touch_threshold`` (hysteresis) so arming and loss detection
+    don't chatter. This is complementary to the vision-based ``object_lost``
+    signal (marker gone): a head that drops but is still visible, or slips within
+    the hands, shows up here as a *force* drop, not a marker loss.
+    """
+
+    def __init__(
+        self,
+        *,
+        touch_threshold: float,
+        loss_floor: float,
+        loss_frames: int,
+    ) -> None:
+        if loss_floor > touch_threshold:
+            raise ValueError(
+                f"loss_floor ({loss_floor}) must be <= touch_threshold "
+                f"({touch_threshold}) for hysteresis"
+            )
+        self.touch_threshold = float(touch_threshold)
+        self.loss_floor = float(loss_floor)
+        self.loss_frames = int(loss_frames)
+        self.armed = False
+        self.tripped = False
+        self._loss_count = 0
+        self._below_floor = False
+
+    def reset(self) -> None:
+        """Clear all state. Call before re-grasping."""
+        self.armed = False
+        self.tripped = False
+        self._loss_count = 0
+        self._below_floor = False
+
+    def update(self, F: float) -> None:
+        """Advance the guard one tick with the combined (min) palm force F (N)."""
+        F = float(F)
+        if not self.armed:
+            # Not yet gripped: never freeze (let first contact build), arm on touch.
+            self._below_floor = False
+            if F >= self.touch_threshold:
+                self.armed = True
+            return
+
+        self._below_floor = F < self.loss_floor
+        if self.tripped:
+            return
+        if self._below_floor:
+            self._loss_count += 1
+            if self._loss_count >= self.loss_frames:
+                self.tripped = True
+        else:
+            self._loss_count = 0
+
+    @property
+    def press_frozen(self) -> bool:
+        """True when the press must NOT advance inward (contact lost or suspected).
+
+        Latched once ``tripped``; also true transiently on any below-floor frame
+        after arming, so inward creep stops immediately, before the trip latches.
+        """
+        return self.tripped or (self.armed and self._below_floor)
+
+
+class PalmForceController:
+    """Force-domain palm controller for the Jacobian (Road-1) press mode.
+
+    Output is a commanded press-force MAGNITUDE ``F_cmd`` (Newtons), NOT a press
+    depth ``s`` (meters). The magnitude is turned into an inward inter-palm wrench
+    by ``trajectory.targets.compute_press_wrenches`` and injected as joint torque
+    feedforward via ``G1HandIK.ee_jacobians`` (``tau = J^T W``) -- so the grip
+    force comes from a commanded torque, not from a position error against a
+    stiff servo (that is ``PalmPressController``, the ``mode: position`` fallback).
+
+    Structure: **feedforward + trim** (the doc's Road 1):
+
+        F_des_k = force_target * clip((t - t0)/ramp_time, 0, 1)    # ramp from 0
+        trim   += kappa_f * (F_des_k - F_meas)                     # integral trim
+        F_cmd   = clip( (F_des_k if feedforward else 0) + trim, 0, force_max )
+
+    The feedforward term ``F_des`` makes the press respond at the 250 Hz servo
+    rate (its real benefit over the slow ~6-10 Hz position loop); the ``trim``
+    integral cancels the object-dependent contact attenuation
+    ``F_delivered = F_cmd * k_e/(k_e + k_cart)`` so the steady state is
+    ``F_meas = F_des`` regardless of pad/object compliance. Ramping ``F_des`` from
+    zero is a soft-start (never step a torque onto contact). ``trim`` and the
+    output are both clamped, so even a stuck ``F_meas=0`` (contact lost) can only
+    drive ``F_cmd`` to ``force_max`` -- and the caller zeros ``F_cmd`` on a
+    ``PalmContactWatchdog`` trip well before that.
+
+    Units: forces in Newtons; ``kappa_f`` in N per step per N error; times in s.
+    """
+
+    def __init__(
+        self,
+        *,
+        kappa_f: float,
+        force_target: float,
+        force_max: float,
+        f_des_ramp_time: float = 0.0,
+        feedforward: bool = True,
+    ) -> None:
+        if force_target < 0.0:
+            raise ValueError(f"force_target ({force_target}) must be >= 0")
+        if force_max < 0.0:
+            raise ValueError(f"force_max ({force_max}) must be >= 0")
+        self.kappa_f = float(kappa_f)
+        self.force_target = float(force_target)
+        self.force_max = float(force_max)
+        self.f_des_ramp_time = float(f_des_ramp_time)
+        self.feedforward = bool(feedforward)
+        self._trim = 0.0
+        self.F_cmd = 0.0
+        self._t0 = None
+
+    def reset(self) -> None:
+        """Zero the commanded force, the trim integrator, and the ramp clock."""
+        self._trim = 0.0
+        self.F_cmd = 0.0
+        self._t0 = None
+
+    def f_des(self, now: float) -> float:
+        """Ramped force setpoint at wall-clock time ``now`` (seeds t0 on first call)."""
+        if self._t0 is None:
+            self._t0 = now
+        if self.f_des_ramp_time <= 0.0:
+            return self.force_target
+        frac = (now - self._t0) / self.f_des_ramp_time
+        return self.force_target * min(max(frac, 0.0), 1.0)
+
+    def step(self, F_meas: float, now: float | None = None) -> float:
+        """Advance one tick and return the commanded press force ``F_cmd`` (N).
+
+        Args:
+            F_meas: combined measured palm force (N) -- the target signal
+                    (e.g. min of the two palms from ``PalmForceReader``).
+            now:    wall-clock seconds for the ramp; defaults to time.monotonic().
+                    Injected explicitly in tests for determinism.
+        """
+        now = time.monotonic() if now is None else float(now)
+        F_des = self.f_des(now)
+        self._trim = float(np.clip(
+            self._trim + self.kappa_f * (F_des - float(F_meas)),
+            -self.force_max, self.force_max,
+        ))
+        base = F_des if self.feedforward else 0.0
+        self.F_cmd = float(np.clip(base + self._trim, 0.0, self.force_max))
+        return self.F_cmd

@@ -44,10 +44,16 @@ except ImportError:
     _HAS_RERUN = False
 
 from g1_spine_stabilization.controllers.grip_force import GraspController
-from g1_spine_stabilization.controllers.palm_force import PalmForceReader, PalmPressController
+from g1_spine_stabilization.controllers.palm_force import (
+    PalmForceReader,
+    PalmPressController,
+    PalmContactWatchdog,
+    PalmForceController,
+)
 from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep
 from g1_spine_stabilization.trajectory.targets import (
     compute_hand_targets,
+    compute_press_wrenches,
     R_L_BASE,
     R_R_BASE,
     L_EE_DEFAULT,
@@ -219,8 +225,12 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     grip_cfg     = cfg.get("grip_force", {})
     grip_enabled = grip_cfg.get("enabled", True)
 
-    palm_press_cfg     = cfg.get("palm_press", {})
-    palm_press_enabled = palm_press_cfg.get("enabled", False)
+    palm_press_cfg      = cfg.get("palm_press", {})
+    palm_press_enabled  = palm_press_cfg.get("enabled", False)
+    palm_press_mode     = palm_press_cfg.get("mode", "position")
+    palm_press_jacobian = palm_press_enabled and palm_press_mode == "jacobian"
+    seat_squeeze        = float(palm_press_cfg.get("seat_squeeze", 0.0))
+    tau_press_max       = float(palm_press_cfg.get("tau_press_max", 8.0))
 
     # Hands are engaged (fingers close to grasp pose) if EITHER the finger-force
     # grip or the palm-press loop is on. The finger force-feedback loop runs only
@@ -237,6 +247,8 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     # a pure DDS consumer (dry_run -> 0 N, so this whole path no-ops headlessly).
     reader = None
     press_ctrl = None
+    watchdog = None
+    force_ctrl = None
     if palm_press_enabled:
         reader = PalmForceReader(
             ["left", "right"],
@@ -246,6 +258,8 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
             noise_threshold=palm_press_cfg.get("noise_threshold", 0.0),
             signal=palm_press_cfg.get("signal", "min"),
         )
+        # Position-mode press loop (the default / fallback). Always constructed so
+        # the position path works and its force_target is available for logging.
         press_ctrl = PalmPressController(
             kappa=palm_press_cfg.get("kappa", 0.0),
             s_max=palm_press_cfg.get("squeeze_max", 0.0),
@@ -253,6 +267,29 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
             force_target=palm_press_cfg.get("force_target", 0.0),
             force_max=palm_press_cfg.get("force_max", 0.0),
         )
+        # Jacobian-mode force controller (Road 1): output is a press-force
+        # magnitude F_cmd turned into torque feedforward tau = J^T W. Only built
+        # in jacobian mode; kp is untouched. See docs/palm_force_jacobian.md.
+        if palm_press_jacobian:
+            force_ctrl = PalmForceController(
+                kappa_f=palm_press_cfg.get("kappa_f", 0.0),
+                force_target=palm_press_cfg.get("force_target", 0.0),
+                force_max=palm_press_cfg.get("force_max", 0.0),
+                f_des_ramp_time=palm_press_cfg.get("f_des_ramp_time", 0.0),
+                feedforward=palm_press_cfg.get("force_feedforward", True),
+            )
+        # Contact-loss safety guard: freeze the press (never keep squeezing a
+        # dropped/slipped head) once the grip is real and force then falls away.
+        # No-op in dry-run (reader = 0 N never arms it). Shared by both modes.
+        # See palm_force.py.
+        watchdog = PalmContactWatchdog(
+            touch_threshold=palm_press_cfg.get("touch_threshold", 0.5),
+            loss_floor=palm_press_cfg.get("loss_floor", 0.2),
+            loss_frames=palm_press_cfg.get("loss_frames", 3),
+        )
+        print(f"[SDKController] Palm-press grip: mode={palm_press_mode}"
+              + (f", seat={seat_squeeze * 1000:.1f}mm, F_des={press_ctrl.force_target:.2f}N, "
+                 f"tau_press_max={tau_press_max:.1f}Nm" if palm_press_jacobian else ""))
 
     # ---------------------------------------------------------------
     # Source startup — detect object marker or initialise sine timer
@@ -380,6 +417,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         t_start = time.monotonic()
         _last_log_t = t_start - 1.0   # fire on first step
         _obj_lost_warned = False
+        _contact_lost_warned = False
         try:
             while True:
                 elapsed = time.monotonic() - t_start
@@ -391,22 +429,58 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                     print("[SDKController] WARNING: object marker lost — box may have fallen! (SDK-6: stop here)")
                     _obj_lost_warned = True
 
-                # Palm-force press loop: read palm force, advance the press-depth
-                # integrator, and shrink the hand-target separation by `squeeze`.
-                # In dry-run the reader returns 0 N, so squeeze stays 0 and the
+                # Palm-force grip: pick a press DEPTH (position mode) or a press
+                # WRENCH (jacobian mode). Both share the S0 contact-loss guard. In
+                # dry-run the reader returns 0 N, so nothing arms/presses and the
                 # arm behaves exactly as the pre-palm-press tracking loop.
-                squeeze = 0.0
+                squeeze = seat_squeeze if palm_press_jacobian else 0.0
+                F_cmd = 0.0
                 if palm_press_enabled:
                     F_palm  = reader.target_force()
                     F_guard = reader.guard_force()
-                    squeeze = press_ctrl.step(F_palm, F_guard)
+                    # Contact-loss safety guard (see palm_force.py). Update first;
+                    # a trip FREEZES the press (position: hold last depth; jacobian:
+                    # zero the wrench) and holds pose stiffly via kp -- it does NOT
+                    # retreat or end the run.
+                    watchdog.update(F_palm)
+                    frozen = watchdog.press_frozen
+                    if frozen and watchdog.tripped and not _contact_lost_warned:
+                        print("[SDKController] [SAFETY] palm contact lost — press "
+                              "frozen, holding pose stiffly (head may have dropped/slipped).")
+                        _contact_lost_warned = True
+                    if palm_press_jacobian:
+                        # Hold the fixed seat separation; the grip force comes from
+                        # the torque feedforward below, not from a position error.
+                        F_cmd = 0.0 if frozen else force_ctrl.step(F_palm)
+                    elif frozen:
+                        squeeze = press_ctrl.s        # position mode: hold last depth
+                    else:
+                        squeeze = press_ctrl.step(F_palm, F_guard)
+
                 L_target, R_target = compute_hand_targets(
                     box_center, box_half_width, theta, squeeze=squeeze,
                 )
 
                 current_dq = np.zeros(14)
                 sol_q, sol_tauff = ik.solve_ik(L_target, R_target, current_q, current_dq)
-                robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
+
+                # Torque feedforward: gravity comp, plus (jacobian mode) the press
+                # wrench mapped to joint torque tau = J_L^T W_L + J_R^T W_R at the
+                # just-solved config. The SDK does NOT clamp tau_ff in software, so
+                # tau_press is saturated here. tau_press is added AFTER solve_ik's
+                # tauff EMA (which only smooths gravity), so the press responds
+                # promptly.
+                tau_ff = sol_tauff.copy() if gravity_comp_enabled else np.zeros(14)
+                tau_press_peak = 0.0
+                if palm_press_jacobian:
+                    W_L, W_R = compute_press_wrenches(theta, F_cmd)
+                    J_L, J_R = ik.ee_jacobians(sol_q)
+                    tau_press = J_L.T @ W_L + J_R.T @ W_R
+                    tau_press = np.clip(tau_press, -tau_press_max, tau_press_max)
+                    tau_press_peak = float(np.max(np.abs(tau_press)))
+                    tau_ff = tau_ff + tau_press
+                send_tauff = tau_ff if (gravity_comp_enabled or palm_press_jacobian) else None
+                robot.arm.set_joint_targets(sol_q, send_tauff)
                 current_q = sol_q
 
                 if finger_force:
@@ -429,13 +503,31 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                     _log_marker_info(source, theta, elapsed, preview,
                                       L_target=L_target, R_target=R_target)
                     if palm_press_enabled:
-                        print(f"  Palm press: s={squeeze * 1000:.1f}mm  "
-                              f"F_target={F_palm:.2f}N  F_guard={F_guard:.2f}N  "
-                              f"(setpoint={press_ctrl.force_target:.2f}N)")
+                        _wd = ""
+                        if watchdog.tripped:
+                            _wd = "  [CONTACT LOST — FROZEN]"
+                        elif watchdog.press_frozen:
+                            _wd = "  [contact dip — press held]"
+                        elif not watchdog.armed:
+                            _wd = "  [pre-contact]"
+                        if palm_press_jacobian:
+                            print(f"  Palm force[jacobian]: F_cmd={F_cmd:.2f}N  "
+                                  f"F_meas={F_palm:.2f}N  (setpoint={force_ctrl.force_target:.2f}N)  "
+                                  f"|tau_press|max={tau_press_peak:.2f}Nm  "
+                                  f"seat={squeeze * 1000:.1f}mm{_wd}")
+                        else:
+                            print(f"  Palm press: s={squeeze * 1000:.1f}mm  "
+                                  f"F_target={F_palm:.2f}N  F_guard={F_guard:.2f}N  "
+                                  f"(setpoint={press_ctrl.force_target:.2f}N){_wd}")
                         if _HAS_RERUN and preview is not None:
-                            rr.log("palm_press/squeeze_mm", rr.Scalars(float(squeeze * 1000)))
-                            rr.log("palm_press/force_target_N", rr.Scalars(float(F_palm)))
-                            rr.log("palm_press/force_guard_N", rr.Scalars(float(F_guard)))
+                            if palm_press_jacobian:
+                                rr.log("palm_press/F_cmd_N", rr.Scalars(float(F_cmd)))
+                                rr.log("palm_press/F_meas_N", rr.Scalars(float(F_palm)))
+                                rr.log("palm_press/tau_press_peak_Nm", rr.Scalars(float(tau_press_peak)))
+                            else:
+                                rr.log("palm_press/squeeze_mm", rr.Scalars(float(squeeze * 1000)))
+                                rr.log("palm_press/force_target_N", rr.Scalars(float(F_palm)))
+                                rr.log("palm_press/force_guard_N", rr.Scalars(float(F_guard)))
                     if _HAS_RERUN and gravity_comp_enabled:
                         _TAUFF_JOINT_NAMES = [
                             "L_shoulder_pitch", "L_shoulder_roll", "L_shoulder_yaw", "L_elbow",
@@ -461,6 +553,8 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                     ctrl_r.reset()
                 if palm_press_enabled:
                     press_ctrl.reset()
+                    if force_ctrl is not None:
+                        force_ctrl.reset()
                 _lerp_hand_pose(robot, control_dt, ctrl_l.close_pose, ctrl_l.open_pose, _HAND_RELEASE_TIME)
                 print("[SDKController] Hands released.")
             except KeyboardInterrupt:

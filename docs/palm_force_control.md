@@ -4,6 +4,15 @@ Status: **implemented** (hardware-free parts verified; live bringup is human-run
 This document is the reference for the palm-force grip architecture and the
 paper-ready mathematical formulation of the press controller.
 
+> New to this and want the intuition first? Read
+> [`palm_force_control_explained.md`](palm_force_control_explained.md) — a
+> from-first-principles walkthrough (spring analogy, a worked one-tick example with
+> numbers, and the position-vs-Jacobian difficulty tiers). This doc is the terse spec.
+>
+> This doc describes the **position/stiffness** controller (`palm_press.mode: position`, the
+> default). The alternative **Jacobian force** controller (`mode: jacobian`, "Road 1") is
+> documented in [`palm_force_jacobian.md`](palm_force_jacobian.md).
+
 Code: `controllers/palm_force.py` (`PalmForceReader`, `PalmPressController`),
 `trajectory/targets.py` (`compute_hand_targets` `squeeze` param),
 `controllers/sdk_pose_tracking.py` (Phase 1.5/2 wiring), `configs/default.yaml`
@@ -77,17 +86,26 @@ F = ( Σ_i clip(p_i − b_i, 0) ) / counts_per_newton        [Newtons]
 
 - `p_i` = 112 taxel counts, `b_i` = per-cell baseline (no-contact mean, from a
   startup capture / `--baseline`).
-- `counts_per_newton` = calibration scale. Obtain it with:
+- `counts_per_newton` = calibration scale. Obtain it **one hand at a time** with:
   ```
-  python scripts/read_palm_force.py --no-dry-run --baseline --calibrate <N>
+  python scripts/read_palm_force.py --no-dry-run --side left  --calibrate-kg 0.5
+  python scripts/read_palm_force.py --no-dry-run --side right --calibrate-kg 0.5
   ```
-  press the palm with a known static load of `<N>` newtons (e.g. hang 0.5 kg on a
-  level palm → 4.9 N); the tool prints `counts_per_newton = mean_total / N`.
+  (`--calibrate <N>` takes the load in Newtons directly; `--calibrate-kg <m>`
+  takes a mass and converts via g). Keep the palm untouched for the auto-captured
+  baseline, then at the prompt **rest the known load flat on the central palm pad**
+  (face-up, spread like the real object). The tool prints
+  `counts_per_newton = mean_total / N` per side.
 
-The summed-counts→force model assumes the taxel sum is ~proportional to total
-normal load; `counts_per_newton` absorbs the proportionality. It is approximate
-(FSR taxels are nonlinear/hysteretic) — good for a setpoint/threshold, not for
-precision force measurement.
+**Force, not pressure.** Each of the 112 cells reads local pressure, but the
+**sum** `Σ p_i` aggregates to total normal **force** (no area division) — that is
+what is calibrated against the known weight. The summed-counts→force
+proportionality is clean only in the linear, unsaturated regime, so calibrate with
+the load **spread across the pad like the grasped object** and **near the operating
+force**; a concentrated point load can saturate cells and bias the scale. It is
+approximate (FSR taxels are nonlinear/hysteretic) — good for a setpoint/threshold,
+not precision force measurement. (Left/right gains differ; `counts_per_newton` in
+config is a single scalar, so average or pick per your setup.)
 
 **Two-hand combination:** `target_force() = min(F_L, F_R)` (default) so **both**
 palms must reach the setpoint before the loop settles; `guard_force() =
