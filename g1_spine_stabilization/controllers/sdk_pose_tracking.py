@@ -199,7 +199,7 @@ def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=No
 
 
 def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
-                          preview=None, cam_for_preview=None):
+                          preview=None, cam_for_preview=None, recorder=None):
     """Run the three-phase pose-tracking controller via the SDK transport.
 
     Args:
@@ -215,6 +215,13 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         cam_for_preview: RealSenseCamera(dry_run=True) pre-attached to preview; capture()
                          is called every step to push synthetic frames to the Rerun camera pane.
                          Pass None for marker mode (frames arrive via the tracker).
+        recorder:        optional RunRecorder (data_recording.recorder). If provided,
+                         recorder.start() runs at the top of Phase 2, recorder.record(...)
+                         runs once per Phase-2 iteration, and recorder.save() is
+                         guaranteed to run when Phase 2 ends -- normal duration timeout,
+                         KeyboardInterrupt, or any other exception -- before falling
+                         through to hand-release/Phase 3. Pass None (default) to disable
+                         recording entirely.
     """
     control_dt         = cfg["control"]["dt"]
     interpolation_time = cfg["control"]["interpolation_time"]
@@ -418,6 +425,8 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         _last_log_t = t_start - 1.0   # fire on first step
         _obj_lost_warned = False
         _contact_lost_warned = False
+        if recorder is not None:
+            recorder.start()
         try:
             while True:
                 elapsed = time.monotonic() - t_start
@@ -428,6 +437,14 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                 if getattr(source, 'object_lost', False) and not _obj_lost_warned:
                     print("[SDKController] WARNING: object marker lost — box may have fallen! (SDK-6: stop here)")
                     _obj_lost_warned = True
+
+                if recorder is not None:
+                    recorder.record(
+                        t=elapsed,
+                        object_obs=getattr(source, 'last_obj_obs', None),
+                        target_obs=getattr(source, 'last_tgt_obs', None),
+                        theta=theta,
+                    )
 
                 # Palm-force grip: pick a press DEPTH (position mode) or a press
                 # WRENCH (jacobian mode). Both share the S0 contact-loss guard. In
@@ -540,6 +557,18 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
 
         except KeyboardInterrupt:
             print("\n[SDKController] KeyboardInterrupt — exiting Phase 2.")
+        finally:
+            # Guaranteed regardless of how Phase 2 exited (normal duration
+            # timeout, the KeyboardInterrupt above, or any other exception
+            # propagating through) -- save() is a pure pickle write with no
+            # hardware calls, so it can't itself raise or need a further
+            # guard. Simpler than grasp_sequence.py's pending_exc-reraise
+            # pattern, which exists there to guarantee MULTIPLE sequential
+            # hardware side effects (release, then return, then settle),
+            # each resilient to a further interrupt; here there's exactly
+            # one guaranteed side effect.
+            if recorder is not None:
+                recorder.save()
 
         # ---------------------------------------------------------------
         # Guaranteed hand release -- runs whenever grip was engaged,

@@ -14,3 +14,6 @@ env/
 *.log
 Miniforge3-Linux-x86_64.sh
 *.egg-info/
+
+# Recorded robot/human pose-tracking run data (see g1_spine_stabilization/data_recording/)
+data/runs/

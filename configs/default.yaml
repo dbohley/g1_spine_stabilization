@@ -105,6 +105,40 @@ shutdown:
   # tau=0). Used by grasp_demo.py (Phase R) and sdk_pose_tracking.py (Phase 3).
   settle_time: 0.4
 
+data_recording:
+  # Schema, filename convention, and (especially) the angle_diff_rpy
+  # reference-frame convention (target = reference/torso, object = moving/
+  # head -- NOT a symmetric difference) are documented in full at
+  # docs/data_recording_conventions.md. Read that before analyzing recorded
+  # data or adding a schema field.
+  #
+  # Governs BOTH scripts/run_pose_tracking_preview.py's --record flag and
+  # scripts/record_human_trial.py's --record flag: a single global on/off
+  # switch (e.g. to disable on a shared machine without editing every
+  # invocation). enabled=true does NOT start recording by itself -- --record
+  # is still opt-in per run on top of this; enabled=false makes --record a
+  # no-op with a printed warning, regardless of what's passed on the CLI.
+  enabled: true
+  # Default directory for auto-generated filenames (used when --record is
+  # passed with no PATH). Relative to the project root; auto-created on
+  # first save() if missing. Gitignored -- see .gitignore.
+  output_dir: "data/runs"
+  # Per-sample rate is NOT fixed here -- it's whatever rate the caller's own
+  # loop calls RunRecorder.record() at:
+  #   - robot run (sdk_pose_tracking.py Phase 2): ~6-10Hz actual (IK solve
+  #     cost dominates -- see control.dt's comment above), NOT the configured
+  #     50Hz.
+  #   - scripts/record_human_trial.py (perception-only, no IK): close to
+  #     camera FPS (no compute-heavy step between frames).
+  # Every sample carries its own t/wall_time plus each marker's own
+  # MarkerObservation.timestamp specifically so a downstream comparison
+  # resamples/interpolates rather than assuming a fixed rate.
+  # .pkl appended by the recorder. "{origin}" is "robot" or "human" (e.g.
+  # robot_run_..., human_run_...) so the two are distinguishable at a glance
+  # in data/runs/ without opening a file; the "_{tracking_mode}" segment is
+  # omitted when tracking_mode is None, e.g. --source sine.
+  filename_template: "{origin}_run_{timestamp}_{source}_{tracking_mode}"
+
 grip_force:
   enabled: true             # apply grip during grasp_demo.py AND pose tracking (sdk_pose_tracking.py)
   tau_baseline: 0.2        # target grip force per finger (N); light hold
@@ -159,7 +193,7 @@ palm_press:
   # of the hands at increasing force. force_max = crush guard (back off above it);
   # force_min = hold floor. PLACEHOLDERS — force_target: 0.0 => NO press until set,
   # so this is safe to leave enabled before calibration/tuning.
-  force_min: 0.0
+  force_min: 0.7
   force_target: 5.0
   force_max: 8.0
 

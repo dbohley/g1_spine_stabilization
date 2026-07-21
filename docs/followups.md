@@ -1413,3 +1413,279 @@ default).
   L_EE_DEFAULT[2]]`), never derived from a marker reading, so there's no
   marker-on-top offset to correct there.
 
+## Data recording (robot + human trial comparison)
+
+### What was built
+
+Goal: record trial data from the robot's live tracking runs, and from a
+human performing the same physical task, into pickle files sharing one
+schema, so the two can later be compared.
+
+**Files changed:**
+- `g1_spine_stabilization/data_recording/recorder.py` (new module, with
+  empty `__init__.py`) — the shared schema/logic imported identically by
+  both the robot controller and the human-trial script:
+  - `angle_diff_rpy(R_object, R_target)` — per-axis [roll, pitch, yaw]
+    angle difference, computed by decomposing the single relative rotation
+    `R_object.T @ R_target` via `scipy.spatial.transform.Rotation.
+    as_euler('xyz')` (not independent per-marker Euler angles subtracted).
+  - `angular_velocity_rotvec(R_prev, t_prev, R_cur, t_cur)` — finite-
+    difference angular velocity via `rotvec(R_cur @ R_prev.T) / dt`;
+    returns `None` (not a divide-by-zero) when `dt <= 0`.
+  - `MarkerSample` dataclass — one recorded instant: `t`, `wall_time`,
+    both markers' `*_pose`/`*_obs_timestamp`/`*_reprojection_error`,
+    `angle_diff_rpy`, both `*_angular_velocity`, `theta` (robot-only), and
+    a `load_cell_wrench` field reserved for the future neck-mounted load
+    cell (always `None` today — no sensor exists yet, this just keeps the
+    schema forward-compatible).
+  - `RunRecorder` — accumulates `MarkerSample`s via `start()`/`record()`,
+    pickles them via `save()`. `save()` is idempotent (a second call is a
+    no-op returning the same path) so it's safe to call unconditionally
+    from a `finally` block.
+  - `default_run_path()` — builds `data/runs/run_<timestamp>_<source>
+    [_<tracking_mode>].pkl`, cleanly omitting the tracking-mode segment
+    when it's `None` (e.g. `--source sine`).
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` —
+  `run_pose_tracking_sdk` gained an optional `recorder=None` parameter.
+  `recorder.start()` runs at the top of Phase 2; `recorder.record(...)`
+  runs once per Phase-2 iteration, fed `getattr(source, 'last_obj_obs',
+  None)`/`getattr(source, 'last_tgt_obs', None)` (works uniformly across
+  `SineSource`, which has no such attributes, and `MarkerSource`/its
+  `RateLimitedSource`/`NoiseFilteredSource` wrappers, which proxy them via
+  `__getattr__`). `recorder.save()` runs in a `finally` attached to Phase
+  2's existing `try/except KeyboardInterrupt` — the inner try/except is
+  untouched (same print, same swallow-and-fall-through), so this is a
+  strictly additive change. A comment at the `finally:` explains why a
+  plain `try/finally` is used here instead of `grasp_sequence.py`'s
+  `pending_exc`-reraise pattern (that pattern guarantees *multiple*
+  sequential hardware side effects each resilient to a further interrupt;
+  here there's exactly one guaranteed side effect, and `save()` is a pure
+  pickle write that can't itself raise).
+- `scripts/run_pose_tracking_preview.py` — new `--record [PATH]` flag
+  (`nargs="?", const="__AUTO__"`: absent → disabled, bare `--record` →
+  auto-generated path, `--record path.pkl` → explicit path). Constructs a
+  `RunRecorder` after the source/rate-limit/noise-filter wrapping chain is
+  finalized, gated by `data_recording.enabled` in config. `--source sine`
+  stays recordable (useful for exercising the pipeline with zero hardware)
+  but prints a warning that only `t`/`wall_time`/`theta` will be populated,
+  since `SineSource` has no real markers.
+- `scripts/record_human_trial.py` (new) — perception-only script: no
+  robot, no IK, no `compute_hand_targets`. Reuses the same building blocks
+  as `visualize_markers.py`'s `run_realsense()` (`RealSenseSource`,
+  `AprilTagDetector`, `MarkerTracker`, `d435_to_pelvis_from_pinocchio()`
+  with no `ik` arg — pure Pinocchio FK, no robot connection) and the same
+  `configs/default.yaml` `perception:` section, so both scripts track
+  identical markers. Imports `RunRecorder` from the same module as the
+  robot script, making schema identity structural rather than
+  conventional. `--source {realsense,mock}`, `--dry-run`, `--tracking`
+  (label only, no math), `--record [PATH]`, `--duration`. No Rerun
+  dependency (kept simple, matching `visualize_markers.py`'s style) — this
+  also means, unlike `run_pose_tracking_preview.py`, it can be smoke-tested
+  directly through the Bash tool without hitting the Rerun-spawn sandbox
+  limitation noted below.
+- `configs/default.yaml` — new `data_recording:` section (`enabled`,
+  `output_dir: "data/runs"`, `filename_template`), inserted after
+  `shutdown:`.
+- `.gitignore` — added `data/runs/` (in addition to the existing generic
+  `*.pkl` entry, to also cover the directory itself and any future
+  non-`.pkl` artifact placed there).
+- `tests/test_recorder.py` (new, 15 tests) — `angle_diff_rpy`/
+  `angular_velocity_rotvec` correctness and guard conditions, `RunRecorder`
+  first/second-sample velocity behavior, `None`-observation handling
+  (the `--source sine` case), pickle round-trip, `save()` idempotency,
+  nested-directory auto-creation, `default_run_path()` filename format
+  (including the no-tracking-mode case), constructor validation.
+- `tests/test_sdk_transport.py` — one new test,
+  `test_pose_tracking_sdk_saves_recording_after_interrupt_during_tracking`,
+  modeled directly on the existing
+  `test_pose_tracking_sdk_releases_hands_after_interrupt_during_tracking`:
+  injects a `KeyboardInterrupt` via `monkeypatch` on `ik.solve_ik`'s first
+  Phase-2 call, runs `run_pose_tracking_sdk(..., recorder=recorder)`,
+  confirms the pickle file exists afterward.
+
+### Test results
+
+184 tests pass (`pytest tests/ -v`), up from the count previously cited in
+CLAUDE.md's Current Status — that number was already stale before this
+session (a discrepancy the Plan agent flagged during design, consistent
+with a similar stale-count note from SDK-5). CLAUDE.md has been updated to
+cite 184 directly rather than propagate another soon-to-be-stale number.
+
+### Human-run smoke checks (not executed by Claude Code)
+
+- `scripts/record_human_trial.py --source mock --record --duration 3` WAS
+  run directly (no Rerun dependency, so no sandbox issue) — produced a
+  well-formed pickle; inspected manually: `angle_diff_rpy`/
+  `object_angular_velocity`/`target_angular_velocity` all matched the mock
+  tracker's known rotation-about-X motion.
+- `scripts/run_pose_tracking_preview.py --source sine --record` /
+  `--source mock --tracking 6dof --record` were **not** run directly, per
+  the existing sandbox limitation (see `[[sdk6-jerk-fix-decisions]]` /
+  memory): `RerunPreview(spawn=True)` spawns a detached GUI/server process
+  that doesn't exit when the script finishes, causing pipe hangs. The
+  `--record` code path this would exercise is validated instead by (1) the
+  new `test_pose_tracking_sdk_saves_recording_after_interrupt_during_tracking`
+  test, which runs the exact same `run_pose_tracking_sdk(..., recorder=...)`
+  call the script makes, without spawning Rerun, and (2) `RunRecorder`
+  itself being fully unit-tested. Still recommended before calling this
+  session done: `python scripts/run_pose_tracking_preview.py --source sine
+  --record` and `--source mock --tracking 6dof --record`, run by hand,
+  confirming a `.pkl` lands under `data/runs/`.
+- Real-hardware recording (`--source marker --no-dry-run --record` on the
+  robot; `record_human_trial.py --source realsense` with a real camera) is
+  human-run only, per CLAUDE.md's Hard Rules for the robot script and
+  simply not yet exercised against real hardware for the human script.
+
+### Rough edges for next session
+
+- No comparison-analysis script yet (loading a robot pickle and a human
+  pickle side-by-side and plotting/diffing them) — explicitly out of scope
+  for this feature per the request; natural next step once real trial data
+  exists.
+- `load_cell_wrench` is a schema placeholder only; wiring it up is blocked
+  on the neck-mounted load cell not existing yet.
+- No noise/rate-limiting is applied to the *recorded* marker data — the
+  recorder reads whatever `source.last_obj_obs`/`last_tgt_obs` are on the
+  wrapped source, which for `--source marker` already passes through
+  `NoiseFilteredSource`/`RateLimitedSource` before `compute_hand_targets`
+  sees it, but the raw (pre-filter) marker reading is not separately
+  available to the recorder without further plumbing. Worth deciding,
+  once real marker data exists, whether the comparison analysis wants
+  filtered or raw marker poses.
+
+### Things not modified
+
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights — unchanged.
+- `~/g1_inspire_sdk` — not modified.
+- Phase 1/1.5/3 and their existing `KeyboardInterrupt` handling in
+  `sdk_pose_tracking.py` — untouched; only Phase 2 gained recorder calls
+  and a `finally`.
+- `trajectory/sources.py` — unchanged; the recorder reads its existing
+  `last_obj_obs`/`last_tgt_obs`/`object_lost` properties, no new ones
+  needed.
+
+### Addendum: robot_run_/human_run_ filename prefix
+
+Follow-up requested right after the session above: origin (robot vs. human)
+was only visible in an auto-generated filename via `source_label`
+(`sine`/`mock`/`marker` vs. the then-hardcoded `"human"`), or by opening the
+pickle and checking `origin`. Added an explicit prefix so it's visible at a
+glance in `data/runs/`.
+
+- `data_recording/recorder.py` — `DEFAULT_FILENAME_TEMPLATE` gained a
+  leading `{origin}_run_` (was just `run_`); `default_run_path()` gained an
+  `origin: Optional[str] = None` parameter. When `origin` is `None` the
+  existing underscore-collapse regex strips the now-empty leading segment,
+  so any caller that doesn't pass `origin` still gets the old unprefixed
+  `run_...` filename — backward compatible by construction, not by a
+  special case. `RunRecorder.__init__` passes `origin=self.origin`
+  (already validated to `"robot"`/`"human"`) automatically, so neither
+  `run_pose_tracking_preview.py` nor `record_human_trial.py` needed a
+  call-site change for the prefix itself.
+- `scripts/record_human_trial.py` — **`source_label` semantics changed**:
+  was hardcoded `"human"` (which would have made the new prefix redundant,
+  `human_run_..._human_...`); now `args.source` (`"realsense"` or
+  `"mock"`), so filenames read e.g. `human_run_20260720_..._realsense_
+  orient-only.pkl` — no redundancy, and it additionally tells you at a
+  glance whether a given human-trial file came from a real camera trial or
+  a hardware-free mock smoke test.
+- `configs/default.yaml` — `data_recording.filename_template` default
+  updated to match; inline comment explains the `{origin}` placeholder.
+- `tests/test_recorder.py` — 3 new tests (prefixed-by-origin for human,
+  the origin=None backward-compat fallback, `RunRecorder`'s
+  auto-generated path carrying the right prefix for both origins); the
+  two pre-existing `default_run_path` filename tests updated to pass
+  `origin="robot"` and assert the new pattern. 187 tests pass total.
+
+Things not modified: the pickle's internal `origin` field (already existed,
+unchanged — the filename prefix is a convenience on top of it, not a
+replacement); `MarkerSample` schema; the `--record` CLI flag itself on
+either script.
+
+### Addendum: angle_diff_rpy reference-frame convention (biomechanics alignment)
+
+Follow-up discussion right after the session above surfaced a real
+ambiguity: `angle_diff_rpy` decomposes a SINGLE relative rotation, so it's
+anchored to whichever marker is passed as the first argument — this was
+`object` in the original implementation, meaning the recorded roll/pitch/
+yaw were expressed in the moving segment's own frame, not the reference
+segment's, for anyone reusing this for the human neck trial (head =
+`object_marker_id`, torso = `target_marker_id`, per the user's stated
+convention: "the reference target is the torso while the head is the
+object, since the object is what we are moving"). The user wants recorded
+errors to match the standard biomechanics convention — distal/moving
+segment (head) described relative to the proximal/stable reference segment
+(torso), in the torso's own axes — so this maps cleanly to clinical
+flexion/extension/rotation/lateral-bending terminology later, and asked
+that the convention be very well documented since it's easy to get backward
+(this conversation did, once, before the correction).
+
+**Files changed:**
+- `data_recording/recorder.py` — `angle_diff_rpy(R_object, R_target)`
+  renamed to `angle_diff_rpy(R_reference, R_moving)` (same math,
+  `R_reference.T @ R_moving`, intrinsic-xyz decomposition) — the rename
+  itself is part of the fix: "object"/"target" role names don't by
+  themselves indicate which one anchors the decomposition, which is
+  exactly the confusion that prompted this addendum. `RunRecorder.record()`
+  now calls `angle_diff_rpy(target_pose[...], object_pose[...])` —
+  **target is always the reference, object is always moving** — correct
+  for both the robot case (target = external tracking reference) and the
+  human case (target_marker_id = torso) without any anatomy-specific
+  special-casing, because `target` already plays the "stable reference"
+  role by definition in both conventions this module serves. Module
+  docstring rewritten with a prominent "Reference-frame convention" section
+  covering: the math, the biomechanics rationale, the worked head/torso
+  example, an explicit contrast with `MarkerSource._theta_from_target_
+  rotation` (`trajectory/sources.py` — a different, single-axis,
+  relative-to-target's-own-starting-pose computation used only to drive
+  the IK, not to be confused with this field), and a caveat that
+  `object_angular_velocity`/`target_angular_velocity` remain in the
+  ambient pelvis frame (space-fixed), not body-relative like
+  `angle_diff_rpy` — a known, deliberate asymmetry, not silently changed
+  since the user's request was specifically about the angle metric.
+- `docs/data_recording_conventions.md` (new) — consolidates everything
+  worked out across the data-recording conversation into one authoritative
+  reference: schema recap, filename convention, the angle_diff_rpy
+  reference-frame convention in full (main content), the pelvis-frame
+  invariance proof (angle_diff_rpy and angular-velocity *magnitude* are
+  exactly invariant to camera placement/calibration error — proven
+  algebraically via the shared-transform-cancels argument; absolute
+  poses and angular-velocity *axis* direction are not), and the marker
+  local-axis convention from `detector.py`'s `_object_points` (+X =
+  rightward along the tag's canonical-upright top edge, +Y = upward, +Z =
+  out of the printed face), with a pointer to verify it physically via
+  `scripts/visualize_markers.py --source realsense`'s `drawFrameAxes`
+  overlay on the **target** (reference) marker specifically.
+- `configs/default.yaml` — one-line pointer comment on `data_recording:`
+  to the new doc, matching the existing `palm_press` → `docs/
+  palm_force_control.md` pattern.
+- `tests/test_recorder.py` — 3 new tests: `test_angle_diff_rpy_argument_
+  order_is_not_a_sign_flip` (proves swapping reference/moving is not just
+  a sign flip for non-trivial rotations — a direct regression guard against
+  silently reverting to the old, ambiguous convention), `test_recorder_
+  angle_diff_anchored_to_target_not_object` (proves `RunRecorder.record()`
+  itself, not just the pure function, anchors to target). The two
+  pre-existing `angle_diff_rpy` tests renamed their local variables to
+  `R_reference`/`R_moving` for consistency; `test_recorder_pickle_round_
+  trip`'s expected value updated to the new `angle_diff_rpy(target, object)`
+  call order. 2 new tests (189 total).
+
+**Key finding worth restating:** swapping which matrix is the reference is
+NOT a sign flip except to first order for small angles — `R.T`'s Euler
+decomposition differs from `-euler(R)` elementwise for non-trivial
+rotations, because the intrinsic-XYZ sequence is order-dependent (roll
+first, then pitch about the already-rolled Y, then yaw about the
+twice-rotated Z). This is why the old object-anchored data would NOT have
+simply needed a sign flip to reinterpret as torso-anchored after the fact
+— the fix had to happen at the source, and any data recorded before this
+change should be treated as head-frame-anchored, not silently
+reinterpreted.
+
+Things not modified: `angular_velocity_rotvec`'s math or its
+pelvis-frame (not body-relative) convention — flagged as a documented
+caveat/open question per the user's decision to scope this fix to the
+angle metric only; `MarkerSample`'s field list (no new fields, only the
+`angle_diff_rpy` field's *meaning* changed); `theta`/`MarkerSource._theta_
+from_target_rotation` (a deliberately separate, unrelated computation).
+

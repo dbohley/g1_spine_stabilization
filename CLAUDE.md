@@ -37,6 +37,8 @@ The repo is a proper Python package (configs, tests, entry-point scripts). **Per
 
 **SDK-6 marker-tracking fix — COMPLETE.** A live test with real AprilTag markers using `--tracking 6dof` showed the hands positioning themselves around the target marker instead of the object marker. Root cause (confirmed via direct code read, not a marker-ID mixup): `MarkerSource`'s 6dof mode set `box_center` to the target marker's raw absolute position every step, instead of the object's own starting position shifted by however far the target had moved from *its own* starting position. Wrong whenever object and target are physically in different locations (the realistic setup — object in the robot's hands, target held separately). Fixed: both tracking modes now track the target's *displacement* from its own start (position delta for 6dof, rotation delta for both modes), composed onto the object's actual starting position — see `trajectory/sources.py`'s `MarkerSource`. Also added a Rerun diagnostic (`targets/L_hand`/`targets/R_hand`) showing the actual computed IK hand-target, distinct from the raw marker and the robot's rendered mesh, and diagnostic prints of the marker pose at intermediate transform stages to help investigate a separately-reported ~10cm marker-height discrepancy (still unresolved, needs physical measurement against real hardware). Along the way, ruled out a wrist-vs-palm IK targeting bug (confirmed `solve_ik()`'s cost function targets `L_ee_link`/`R_ee_link`, not the wrist) and corrected several stale doc claims (see Open Design Questions and File Structure). 3 tests rewritten in `tests/test_marker_source.py` to cover the delta semantics.
 
+**Data recording — COMPLETE.** Added the ability to record trial data from both the robot's live tracking runs and a human performing the same physical task, into pickle files sharing one schema so the two can be compared. New `g1_spine_stabilization/data_recording/recorder.py`: `RunRecorder` accumulates per-sample `MarkerSample`s (both markers' poses, a per-axis angle-diff, finite-difference angular velocities, time, plus a `load_cell_wrench` field reserved for the future neck-mounted load cell — always `None` until that sensor exists) and pickles them via an idempotent `save()`. `run_pose_tracking_sdk`'s Phase 2 (`sdk_pose_tracking.py`) gained an optional `recorder` parameter: `record()` runs once per iteration, and `save()` runs in a `finally` guaranteed regardless of how Phase 2 exits (normal timeout or `KeyboardInterrupt`) — additive only, Phase 2's existing try/except is untouched. `run_pose_tracking_preview.py` gained a `--record [PATH]` flag (works with any `--source`; `--source sine` records time/theta only, no real markers). New standalone `scripts/record_human_trial.py` — perception-only (no robot/IK), reuses the same camera/marker stack and `RunRecorder` import as the robot path, so its output is directly comparable. New `data_recording:` config section; `data/runs/` gitignored. Auto-generated filenames carry an explicit `robot_run_...`/`human_run_...` prefix so origin is visible at a glance; the human script's `source_label` is the camera source (`realsense`/`mock`), not a fixed `"human"`, to avoid a redundant name. **`angle_diff_rpy(R_reference, R_moving)` decomposes `R_reference.T @ R_moving` — `RunRecorder.record()` always passes `target` as the reference and `object` as moving** (biomechanics convention: for the neck-trial mapping `target_marker_id`=torso, `object_marker_id`=head, so recorded roll/pitch/yaw describe head rotation in the torso's own axes, matching standard neck-kinematics reporting — this is NOT a symmetric difference and swapping the arguments is not just a sign flip for non-trivial rotations). Full convention reference, including the pelvis-frame-invariance proof for this metric and the AprilTag local-axis convention: `docs/data_recording_conventions.md`. 21 new hardware-free tests. **189 tests pass total.**
+
 **Env (manual install — complete):** the unified env is named **`g1_inspire_sdk`** and was built by hand following the SDK's README. Our repo is installed into it. SDK examples **01 (preview), 06 (live pick-and-place), and 07 (live camera)** all run successfully — the live-hardware tier (CycloneDDS + `unitree_sdk2py` + `inspire_sdkpy` + `pyrealsense2`) is proven end-to-end. Two items remain from SDK-1: run our own 29 tests in this env (regression check), and write the per-machine setup record (`docs/sdk_setup.md`). Both are handled as preflight in SDK-2; no dedicated env session is required.
 
 ## Session Roadmap
@@ -58,6 +60,7 @@ The repo is a proper Python package (configs, tests, entry-point scripts). **Per
 - **SDK-6 jerk/smoothness fixes — COMPLETE.** First live test surfaced a startup-jerk bug (Phase 1 in `sdk_pose_tracking.py` fixed to start from `ik.fk(current_q)`, matching Phase 3/`grasp_sequence.py`'s existing pattern) and jerky tracking (root-caused to `ik.solve_ik()` costing ~100ms/call — real loop rate ~6-10Hz vs. assumed 50Hz; mitigated with a new `RateLimitedSource` slew-rate limiter on the trajectory target, config in `trajectory.rate_limit`). Sine default frequency lowered to `0.1` Hz. 10 new tests (72 total).
 - **SDK-6 pre-bringup hardening — COMPLETE.** Deeper jerk/jitter analysis + mock-to-real-marker gap analysis. Reverted an accidentally-left `INSPIRE_HAND_MASS=1.6` back to `1.0`; fixed `WeightedMovingFilter`'s reversed recency-weighting bug (doubled lag); documented (not fixed) GIL contention stalling the SDK's own publisher thread during every IK solve; added `ipopt_exhaustion_count` diagnostics; added `ExponentialMovingAverageFilter` smoothing `sol_tauff` before handoff; added `NoiseFilteredSource` (median+EMA, marker-only) since `RateLimitedSource` structurally cannot catch real AprilTag sensor noise. 24 new tests (96 total).
 - **SDK-6 marker-tracking fix — COMPLETE.** Found and fixed a real bug from live-marker testing: `MarkerSource`'s 6dof mode was teleporting `box_center` to the target marker's raw absolute position instead of tracking its displacement from its own starting pose, applied on top of the object's actual position. Both modes now track target displacement (position delta for 6dof, rotation delta for both). Added Rerun hand-target visualization and transform-chain diagnostics; corrected stale doc claims (calibration value, "runtime arguments" line, missing file references).
+- **Data recording — COMPLETE.** New `g1_spine_stabilization/data_recording/recorder.py` (`RunRecorder`, `MarkerSample`, `angle_diff_rpy`, `angular_velocity_rotvec`) shared by both a `--record` flag on `run_pose_tracking_preview.py` (hooked into `sdk_pose_tracking.py`'s Phase 2, guaranteed-save via `finally`) and the new standalone `scripts/record_human_trial.py` (perception-only, no robot). Produces pickle files in one schema so robot and human trials are directly comparable, auto-named with an explicit `robot_run_...`/`human_run_...` prefix. `load_cell_wrench` reserved in the schema for the not-yet-built neck load cell. `angle_diff_rpy` anchors its roll/pitch/yaw decomposition to the `target` marker's frame (biomechanics convention — see `docs/data_recording_conventions.md`), not the `object` marker's frame. 21 new tests (189 total).
 - **SDK-6 = original Session 5.** Live-robot bringup: run `scripts/grasp_demo.py --no-dry-run` to validate both hands; complete the full pre-flight sequence in `run_pose_tracking_preview.py` (sine → mock → marker); then run `run_pose_tracking_preview.py --no-dry-run --source marker`. **Human-run only** — robot mounted, E-stop in reach.
 
 ## File Structure
@@ -74,7 +77,7 @@ g1_spine_stabilization/
 ├── CLAUDE.md
 │
 ├── configs/
-│   └── default.yaml                 # tunable params; perception section added in Session 2
+│   └── default.yaml                 # tunable params; perception section added in Session 2; data_recording section added in Data recording session
 │
 ├── assets/
 │   ├── g1_with_hands.urdf
@@ -106,6 +109,9 @@ g1_spine_stabilization/
 │   │   ├── detector.py              # AprilTagDetector (cv2.aruco + solvePnP)
 │   │   ├── tracker.py               # MarkerTracker, MockMarkerTracker
 │   │   └── frames.py                # camera optical → d435_link → pelvis composition
+│   ├── data_recording/              # added Data recording session
+│   │   ├── __init__.py
+│   │   └── recorder.py              # RunRecorder, MarkerSample, angle_diff_rpy, angular_velocity_rotvec, default_run_path; shared by sdk_pose_tracking.py Phase 2 and scripts/record_human_trial.py
 │   ├── sim/
 │   │   ├── __init__.py
 │   │   ├── coppelia_utils.py        # joint handles, read/write state, box helpers
@@ -117,11 +123,12 @@ g1_spine_stabilization/
 │
 ├── scripts/
 │   ├── run_pose_tracking_sim.py     # main entry point (CoppeliaSim)
-│   ├── run_pose_tracking_preview.py # added SDK-3/4; --source sine|marker|mock, --tracking orient-only|6dof; added SDK-6-safety: --dry-run/--no-dry-run/--net
+│   ├── run_pose_tracking_preview.py # added SDK-3/4; --source sine|marker|mock, --tracking orient-only|6dof; added SDK-6-safety: --dry-run/--no-dry-run/--net; added Data recording session: --record [PATH]
 │   ├── grasp_demo.py                # added SDK-5; bimanual hand open/close validation (--dry-run default); thin wrapper around grasp_sequence.run_grasp_phases (SDK-6-safety)
 │   ├── setup_scene.py               # one-time URDF import
 │   ├── verify_ik.py                 # FK + IK self-test (no sim needed)
-│   └── visualize_markers.py         # added in Session 2; --source realsense|mock, --dry-run flag
+│   ├── visualize_markers.py         # added in Session 2; --source realsense|mock, --dry-run flag
+│   └── record_human_trial.py        # added Data recording session; perception-only human-trial recorder, --source realsense|mock, --record [PATH]
 │
 ├── tests/
 │   ├── __init__.py
@@ -140,13 +147,15 @@ g1_spine_stabilization/
 │   ├── test_weighted_moving_filter.py # added pre-bringup hardening; 5 tests, recency-weighting regression
 │   ├── test_ipopt_diagnostics.py    # added pre-bringup hardening; 4 tests, exhaustion counter
 │   ├── test_tauff_filter.py         # added pre-bringup hardening; 7 tests, EMA + solve_ik wiring
-│   └── test_noise_filtered_source.py # added pre-bringup hardening; 8 tests, median+EMA marker noise filter
+│   ├── test_noise_filtered_source.py # added pre-bringup hardening; 8 tests, median+EMA marker noise filter
+│   └── test_recorder.py             # added Data recording session; 15 hardware-free tests for RunRecorder/angle_diff_rpy/angular_velocity_rotvec/default_run_path
 │
 └── docs/
     ├── sdk_analysis.md              # SDK discovery notes (Session 0)
     ├── sdk_setup.md                 # per-machine env ledger (written in SDK-2 preflight)
     ├── ik_weight_analysis.md        # IK weight/payload brainstorm doc (SDK-5; paste into Claude chat)
     ├── gravity_comp_reference.md    # gravity-comp pipeline reference (SDK-5.5)
+    ├── data_recording_conventions.md # added Data recording session; pickle schema, angle_diff_rpy reference-frame convention, camera-invariance proof, marker axis convention
     └── followups.md                 # living notes from each session
 ```
 
@@ -431,7 +440,7 @@ These are unresolved and will be decided in their respective sessions:
 Run from the repo root:
 
 1. **Pinocchio FK / IK self-test:** `python scripts/verify_ik.py` — verify EE positions and IK round-trip
-2. **Unit tests:** `pytest tests/ -v` — 51 tests pass
+2. **Unit tests:** `pytest tests/ -v` — 189 tests pass
 3. **CoppeliaSim scene setup:** `python scripts/setup_scene.py` — import URDF, visual check
 4. **Full controller:** `python scripts/run_pose_tracking_sim.py`
 5. **(Session 2+, with hardware) Marker visualizer:** `python scripts/visualize_markers.py`
@@ -447,6 +456,13 @@ Run from the repo root:
    `python scripts/run_pose_tracking_preview.py --source marker --tracking orient-only`
    Run with two AprilTag markers (IDs matching `configs/default.yaml`) in the D435's field of view. Arms must respond smoothly to target marker motion. Ctrl+C to exit.
 9. **(SDK-6, human-run only, after SDK-5.5 gravity comp and SDK-6-safety are complete)** Run `python scripts/grasp_demo.py --no-dry-run` first; confirm hands actuate safely and both the hand-release and arm-return-to-default phases complete even after a mid-hold Ctrl-C. Then run `python scripts/run_pose_tracking_preview.py --no-dry-run --source marker --tracking orient-only` live. Robot mounted, E-stop in reach.
+10. **Recording pipeline (no hardware needed):**
+    ```
+    python scripts/run_pose_tracking_preview.py --source sine --record
+    python scripts/run_pose_tracking_preview.py --source mock --tracking 6dof --record
+    python scripts/record_human_trial.py --source mock --record
+    ```
+    Each must complete and leave a `.pkl` file under `data/runs/` that unpickles with the expected schema keys (`schema_version`, `origin`, `source_label`, `tracking_mode`, `object_marker_id`, `target_marker_id`, `metadata`, `samples`).
 
 ## When in Doubt
 

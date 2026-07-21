@@ -48,6 +48,7 @@ from g1_spine_stabilization.trajectory.sources import (
     SineSource, MarkerSource, RateLimitedSource, NoiseFilteredSource,
 )
 from g1_spine_stabilization.controllers.sdk_pose_tracking import run_pose_tracking_sdk
+from g1_spine_stabilization.data_recording.recorder import RunRecorder
 from g1_spine_stabilization.utils.config import load_config
 
 
@@ -173,6 +174,17 @@ def main():
     parser.add_argument(
         "--no-dry-run", dest="dry_run", action="store_false",
         help="Connect to live hardware (HUMAN-RUN ONLY; E-stop required)",
+    )
+    parser.add_argument(
+        "--record", nargs="?", const="__AUTO__", default=None, metavar="PATH",
+        help="Record Phase-2 marker/pose data (object+target pose, per-axis angle "
+             "diff, angular velocities, time) to a pickle file for later comparison "
+             "against human-trial recordings (scripts/record_human_trial.py). Pass "
+             "with no PATH to auto-generate a timestamped filename under data/runs/. "
+             "Works with any --source; --source sine has no real AprilTag markers, "
+             "so only time/theta are recorded (pose/angle-diff/velocity fields are "
+             "None) -- still useful for exercising the recording pipeline without "
+             "hardware. Disabled by default.",
     )
     args = parser.parse_args()
 
@@ -328,6 +340,37 @@ def main():
         print(f"[preview] Rate limiter enabled: {max_theta_rate_deg_s:.1f} deg/s, "
               f"{max_pos_rate_m_s:.2f} m/s")
 
+    # -------------------------------------------------------------------
+    # Optional data recording (--record). See g1_spine_stabilization/
+    # data_recording/recorder.py and scripts/record_human_trial.py -- both
+    # import RunRecorder from the same module, so the resulting pickle
+    # schemas are identical and directly comparable.
+    # -------------------------------------------------------------------
+    recorder = None
+    if args.record is not None:
+        data_recording_cfg = cfg.get("data_recording", {})
+        if not data_recording_cfg.get("enabled", True):
+            print("[preview] --record was passed but data_recording.enabled=false in "
+                  "config -- recording is disabled globally; ignoring --record.")
+        else:
+            output_path = None if args.record == "__AUTO__" else args.record
+            recorder = RunRecorder(
+                origin="robot",
+                source_label=args.source,
+                tracking_mode=args.tracking if args.source in ("mock", "marker") else None,
+                output_path=output_path,
+                output_dir=data_recording_cfg.get("output_dir"),
+                filename_template=data_recording_cfg.get("filename_template"),
+                object_marker_id=obj_id,
+                target_marker_id=tgt_id,
+                metadata={"perception": dict(perception)},
+            )
+            if args.source == "sine":
+                print("[preview] WARNING: --record with --source sine has no real "
+                      "AprilTag markers -- only time/theta will be recorded; pose/"
+                      "angle-diff/angular-velocity fields will be None.")
+            print(f"[preview] Recording enabled -> {recorder.output_path}")
+
     print(f"[preview] Connecting robot (dry_run={args.dry_run})…")
     robot.connect()
     robot.initialize()
@@ -336,7 +379,8 @@ def main():
 
     try:
         run_pose_tracking_sdk(robot, ik, cfg, source, duration=duration,
-                              preview=preview, cam_for_preview=cam_for_preview)
+                              preview=preview, cam_for_preview=cam_for_preview,
+                              recorder=recorder)
     finally:
         robot.shutdown()
         if cam_for_preview is not None:

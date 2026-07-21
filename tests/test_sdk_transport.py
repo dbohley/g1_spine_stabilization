@@ -3,10 +3,14 @@
 These tests validate the G1InspireRobot lifecycle and the joint-target
 hand-off without a physical robot or DDS network.
 """
+import os
+import pickle
+
 import numpy as np
 import pytest
 
 from g1_spine_stabilization.controllers.sdk_pose_tracking import run_pose_tracking_sdk
+from g1_spine_stabilization.data_recording.recorder import RunRecorder
 from g1_spine_stabilization.kinematics.ik_solver import G1HandIK
 from g1_spine_stabilization.trajectory.sources import SineSource
 from g1_spine_stabilization.utils.config import load_config
@@ -286,3 +290,43 @@ def test_pose_tracking_sdk_releases_hands_after_interrupt_during_tracking(
 
     assert len(recorded) > 0
     np.testing.assert_allclose(recorded[-1], HAND_OPEN_POSE, atol=1e-3)
+
+
+def test_pose_tracking_sdk_saves_recording_after_interrupt_during_tracking(
+    dry_robot, ik, cfg_fast, monkeypatch, tmp_path
+):
+    """A KeyboardInterrupt landing inside Phase 2 must still save the
+    recorder's accumulated samples -- recorder.save() runs in a `finally`
+    wrapping Phase 2's existing try/except, so it runs regardless of how
+    Phase 2 ended."""
+    source = SineSource(
+        box_center=np.array([0.35, 0.0, 0.1]),
+        amplitude=cfg_fast["trajectory"]["sine"]["amplitude"],
+        freq=cfg_fast["trajectory"]["sine"]["frequency"],
+    )
+    recorder = RunRecorder(
+        origin="robot", source_label="sine",
+        output_path=str(tmp_path / "run.pkl"),
+    )
+
+    call_count = {"n": 0}
+    original_solve_ik = ik.solve_ik
+
+    dt = cfg_fast["control"]["dt"]
+    phase1_calls = (int(cfg_fast["control"]["interpolation_time"] / dt)
+                    + max(1, int(cfg_fast["grasp_approach"]["close_time"] / dt)))
+
+    def fault_solve_ik(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == phase1_calls + 1:   # first call inside Phase 2
+            raise KeyboardInterrupt()
+        return original_solve_ik(*args, **kwargs)
+
+    monkeypatch.setattr(ik, "solve_ik", fault_solve_ik)
+
+    run_pose_tracking_sdk(dry_robot, ik, cfg_fast, source, duration=0.05, recorder=recorder)
+
+    assert os.path.exists(recorder.output_path)
+    with open(recorder.output_path, "rb") as f:
+        payload = pickle.load(f)
+    assert payload["origin"] == "robot"
