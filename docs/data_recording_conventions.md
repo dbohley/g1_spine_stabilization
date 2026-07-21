@@ -44,19 +44,28 @@ This is the standard biomechanics convention for describing a distal/moving segm
 
 **This is a different computation from `MarkerSource._theta_from_target_rotation`** (`trajectory/sources.py`), which is used only to drive `compute_hand_targets`/the live IK during Phase 2. That function computes a single-axis rotation of the target relative to *its own starting pose at the beginning of the run* (`R_delta = target_start_rot.T @ R_current`, then `atan2` of one matrix entry — a roll-about-X angle only). `angle_diff_rpy` is a full 3-axis instantaneous comparison of *object vs. target right now*, with no notion of a "starting pose." Don't read one as validating or contradicting the other — they answer different questions and are recorded as different fields (`theta` vs. `angle_diff_rpy`).
 
-## 4. What's invariant to camera placement/calibration, and what isn't
+## 4. Two different frames, on purpose: `angle_diff_rpy` vs. angular velocity
 
-The full transform chain is `pose_in_pelvis = T_d435_to_pelvis @ T_optical_to_d435 @ pose_in_optical`. For the robot, `T_d435_to_pelvis` is a real, physically accurate constant (the camera genuinely is mounted at the URDF's `d435_link`, head/waist genuinely are locked at zero). For `scripts/record_human_trial.py`, this same constant is reused regardless of where the human-trial camera is actually placed — it does **not** reflect the human rig's true camera pose.
+The full transform chain is `pose_in_pelvis = T_d435_to_pelvis @ T_optical_to_d435 @ pose_in_optical`. For the robot, `T_d435_to_pelvis` is a real, physically accurate constant (the camera genuinely is mounted at the URDF's `d435_link`, head/waist genuinely are locked at zero). For `scripts/record_human_trial.py`, this same constant is reused regardless of where the human-trial camera is actually placed — it does **not** reflect the human rig's true camera pose; it's FK for a G1 that isn't there. Even `T_optical_to_d435` was calibrated against this specific robot's physical camera bracket, not a generic device-intrinsic constant.
 
-This matters less than it sounds, because of how the two per-marker rotations combine. Let `C = T_d435_to_pelvis @ T_optical_to_d435` (the full fixed rotation applied to every marker reading in a given frame). Then:
+**`angle_diff_rpy` needs this composition, and is exactly invariant to it.** Let `C = T_d435_to_pelvis @ T_optical_to_d435` (the fixed rotation applied to every marker reading in a frame). Then:
 
 ```
 R_object_pelvis.T @ R_target_pelvis = (C·R_obj_opt).T @ (C·R_tgt_opt) = R_obj_opt.T @ R_tgt_opt      (C cancels, C.T@C = I)
 ```
 
-So **`angle_diff_rpy` is exactly invariant to `C`** — camera position, mounting, and calibration error in `T_d435_to_pelvis`/`T_optical_to_d435` don't affect it at all, as long as both markers are read from the same camera frame (always true here). By the same conjugation argument, **angular-velocity *magnitude* (rad/s) is also invariant** — rotation vectors preserve norm under conjugation by a rotation matrix.
+So `angle_diff_rpy`'s value doesn't depend on `C` at all — camera position, mounting, and calibration error in `T_d435_to_pelvis`/`T_optical_to_d435` don't affect it, as long as both markers are read from the same camera frame (always true here). This is what makes it safe for the biomechanics/clinical mapping use in §3 despite `T_d435_to_pelvis` being fictional for a human trial.
 
-What is **not** invariant: absolute `object_pose`/`target_pose` positions, and which XYZ **axis** an angular velocity is attributed to (`object_angular_velocity`/`target_angular_velocity` are expressed in the ambient pelvis frame — ω_pelvis = C · ω_optical — a rotation of the true direction by whatever `C` actually is). If you need absolute positions or axis-labeled angular velocity to be physically meaningful for the human rig, the camera needs to be physically mounted where the robot's head camera would be, or the pipeline needs a real measured calibration for wherever it ends up — neither is currently implemented.
+**`object_angular_velocity`/`target_angular_velocity` don't need `C` at all, so they don't carry it.** Their purpose is different from `angle_diff_rpy`: cross-trial *normalization* — how fast was the torso/head actually moving in this trial, to compare against a trial where it moved more or less. That's a magnitude-only need, and magnitude is exactly invariant to *any* fixed rotation (rotations preserve vector norm) — `|ω_pelvis| = |C · ω_optical| = |ω_optical|`, always, regardless of what `C` is. Since carrying `C` through would only ever change *axis attribution* (never the magnitude these fields exist for), and `C` is partly fictional for a human trial anyway, these two fields are computed directly from each marker's own **camera optical-frame** readings (`MarkerObservation.pose_in_optical`) — no `T_optical_to_d435`/`T_d435_to_pelvis` composition, not even the pelvis frame `object_pose`/`target_pose` use.
+
+**Consequence: the two rotation-derived quantities in this schema live in genuinely different frames, deliberately:**
+
+| Field | Frame | Purpose |
+|---|---|---|
+| `angle_diff_rpy` | Target's own local frame (torso, in a neck trial) | Axis-level clinical/biomechanics interpretation (§3) |
+| `object_angular_velocity` / `target_angular_velocity` | Camera optical frame (OpenCV: X right, Y down, Z forward) | Magnitude-only cross-trial normalization |
+
+Don't cross-reference their x/y/z components against each other or assume either is anatomically meaningful axis-by-axis for the angular-velocity fields — use `np.linalg.norm(object_angular_velocity)` / `np.linalg.norm(target_angular_velocity)` for normalization, not the raw vector components. `MarkerObservation.pose_in_optical` is `None` for synthetic observations that don't provide it (rare — real detections via `MarkerTracker.step()` always populate it, and the `--source mock` trackers in both scripts populate a synthetic stand-in specifically so `--record` exercises this path in hardware-free smoke tests); when `None`, the corresponding angular-velocity field is `None` for that sample rather than silently falling back to a different frame.
 
 ## 5. Marker local-axis convention (how to read "roll/pitch/yaw" physically)
 

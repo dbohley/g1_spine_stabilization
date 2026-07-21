@@ -84,6 +84,10 @@ class _AnimatedMockTracker:
             pose_in_pelvis=obj_pose,
             timestamp=t,
             reprojection_error=0.0,
+            # No real camera -- reuse the synthetic pose as a stand-in
+            # "optical frame" reading so --record exercises the recorder's
+            # camera-frame angular-velocity path in this hardware-free mode.
+            pose_in_optical=obj_pose,
         )
 
         theta = self._amplitude * math.sin(2 * math.pi * self._freq * t)
@@ -96,6 +100,7 @@ class _AnimatedMockTracker:
             pose_in_pelvis=tgt_pose,
             timestamp=t,
             reprojection_error=0.0,
+            pose_in_optical=tgt_pose,
         )
 
         self._latest[self._obj_id] = obs_obj

@@ -20,14 +20,19 @@ from g1_spine_stabilization.data_recording.recorder import (
 from g1_spine_stabilization.perception.types import MarkerObservation
 
 
-def _obs(marker_id, R=None, pos=(0.0, 0.0, 0.0), timestamp=0.0):
+def _obs(marker_id, R=None, pos=(0.0, 0.0, 0.0), timestamp=0.0, R_optical=None):
     pose = np.eye(4)
     if R is not None:
         pose[:3, :3] = R
     pose[:3, 3] = pos
+    pose_optical = None
+    if R_optical is not None:
+        pose_optical = np.eye(4)
+        pose_optical[:3, :3] = R_optical
     return MarkerObservation(
         marker_id=marker_id, pose_in_pelvis=pose,
         timestamp=timestamp, reprojection_error=0.5,
+        pose_in_optical=pose_optical,
     )
 
 
@@ -112,14 +117,21 @@ def test_recorder_first_sample_has_no_velocity():
     assert sample.target_angular_velocity is None
 
 
-def test_recorder_second_sample_computes_velocity():
+def test_recorder_second_sample_computes_velocity_from_optical_not_pelvis():
+    """Angular velocity must be computed from pose_in_optical, NOT
+    pose_in_pelvis -- pose_in_pelvis is held FIXED (identical) across both
+    samples while pose_in_optical actually rotates, so a correct
+    implementation reports the optical-frame rate and an implementation
+    that accidentally read pelvis-frame data would report zero."""
     rec = RunRecorder(origin="robot", source_label="mock", output_path="unused.pkl")
     omega = 1.0
     dt = 0.05
-    R0 = np.eye(3)
-    R1 = Rotation.from_rotvec([0, 0, omega * dt]).as_matrix()
-    obs0 = _obs(0, R=R0, timestamp=0.0)
-    obs1 = _obs(0, R=R1, timestamp=dt)
+    R_opt0 = np.eye(3)
+    R_opt1 = Rotation.from_rotvec([0, 0, omega * dt]).as_matrix()
+    R_pelvis_fixed = Rotation.from_euler('xyz', [0.5, 0.5, 0.5]).as_matrix()
+
+    obs0 = _obs(0, R=R_pelvis_fixed, timestamp=0.0, R_optical=R_opt0)
+    obs1 = _obs(0, R=R_pelvis_fixed, timestamp=dt, R_optical=R_opt1)
 
     rec.record(t=0.0, object_obs=obs0, target_obs=None)
     sample = rec.record(t=dt, object_obs=obs1, target_obs=None)
@@ -127,6 +139,20 @@ def test_recorder_second_sample_computes_velocity():
     assert sample.object_angular_velocity is not None
     np.testing.assert_allclose(sample.object_angular_velocity, [0.0, 0.0, omega], atol=1e-6)
     assert sample.target_angular_velocity is None
+
+
+def test_recorder_angular_velocity_none_when_pose_in_optical_unavailable():
+    """object_obs/target_obs present but pose_in_optical=None (e.g. a
+    synthetic observation that didn't provide it) -> angular velocity is
+    None, not a silent fallback to pelvis-frame data."""
+    rec = RunRecorder(origin="robot", source_label="mock", output_path="unused.pkl")
+    obs0 = _obs(0, R=np.eye(3), timestamp=0.0)   # no R_optical -> pose_in_optical=None
+    obs1 = _obs(0, R=np.eye(3), timestamp=0.05)  # no R_optical -> pose_in_optical=None
+
+    rec.record(t=0.0, object_obs=obs0, target_obs=None)
+    sample = rec.record(t=0.05, object_obs=obs1, target_obs=None)
+
+    assert sample.object_angular_velocity is None
 
 
 def test_recorder_handles_none_observations():

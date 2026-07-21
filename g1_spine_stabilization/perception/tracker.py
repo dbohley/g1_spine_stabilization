@@ -52,6 +52,7 @@ class MarkerTracker:
                 pose_in_pelvis=pose_pelvis,
                 timestamp=timestamp,
                 reprojection_error=det.reprojection_error,
+                pose_in_optical=det.pose_in_optical,
             )
             observations.append(obs)
             self._latest[det.marker_id] = obs

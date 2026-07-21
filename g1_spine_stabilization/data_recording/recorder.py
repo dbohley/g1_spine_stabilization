@@ -40,11 +40,23 @@ single-axis rotation of the target relative to ITS OWN STARTING POSE
 a multi-axis instantaneous object-vs-target comparison. Don't conflate the
 two just because both involve "target" and "rotation."
 
-Caveat: object_angular_velocity/target_angular_velocity (below) remain
-expressed in the AMBIENT PELVIS FRAME (space-fixed), NOT body-relative
-like angle_diff_rpy -- a known asymmetry, not an oversight. Their
-MAGNITUDE is invariant to camera placement/calibration; which axis a
-rotation is attributed to is not (see docs/data_recording_conventions.md).
+object_angular_velocity/target_angular_velocity (below) are DELIBERATELY
+in a DIFFERENT frame from angle_diff_rpy: they're computed directly from
+each marker's own consecutive CAMERA OPTICAL-FRAME readings (OpenCV/
+REP-103: X right, Y down, Z forward) -- no T_optical_to_d435/
+T_d435_to_pelvis composition at all, not even the pelvis frame object_pose/
+target_pose are expressed in. This is intentional, not an oversight: their
+purpose is cross-trial NORMALIZATION (how fast was the torso/head actually
+moving in this trial, to compare against a different trial where it moved
+more or less) -- a MAGNITUDE-only use. Magnitude is exactly invariant to
+any fixed rotation composition (rotations preserve vector norm), so
+carrying the pelvis-frame composition through added a dependency on a
+transform that's partly fictional for a human trial (T_d435_to_pelvis is
+FK for a G1 that isn't there) for zero benefit. Do NOT read these fields'
+x/y/z components as anatomically meaningful, and do NOT assume they share
+axes with angle_diff_rpy -- they don't; use the magnitude
+(np.linalg.norm(...)) for normalization, and see
+docs/data_recording_conventions.md for the full reasoning.
 """
 import os
 import pickle
@@ -97,8 +109,11 @@ def angular_velocity_rotvec(
 ) -> Optional[np.ndarray]:
     """Finite-difference angular velocity (rad/s) between two orientations.
 
-    Returns rotvec(R_cur @ R_prev.T) / dt in the pelvis frame. Returns None
-    (not NaN, not a divide-by-zero) when dt <= 0 -- covers both the
+    Returns rotvec(R_cur @ R_prev.T) / dt, in whatever frame R_prev/R_cur
+    are expressed in (this function is frame-agnostic; RunRecorder.record()
+    is what decides which frame to pass in -- currently each marker's own
+    camera optical-frame readings, see this module's docstring). Returns
+    None (not NaN, not a divide-by-zero) when dt <= 0 -- covers both the
     first-sample case at the call site and a duplicate/held marker
     timestamp: the control loop calling this (Phase 2 in
     sdk_pose_tracking.py) runs at ~6-10Hz per the documented IK-solve
@@ -132,7 +147,15 @@ class MarkerSample:
     # tracking reference otherwise), NOT the object marker's frame -- see
     # angle_diff_rpy()'s docstring and docs/data_recording_conventions.md.
     angle_diff_rpy: Optional[np.ndarray] = None
-    object_angular_velocity: Optional[np.ndarray] = None  # (3,) rad/s; None on first sample or dt<=0
+    # (3,) rad/s; None on first sample, dt<=0, or when pose_in_optical isn't
+    # available. Computed from consecutive CAMERA OPTICAL-FRAME readings
+    # (not pelvis frame, and not target-anchored like angle_diff_rpy) -- no
+    # T_optical_to_d435/T_d435_to_pelvis composition at all. Intended for
+    # magnitude-only cross-trial normalization (np.linalg.norm(...)); the
+    # x/y/z components are in the camera's own OpenCV convention, not
+    # anatomical, and don't share axes with angle_diff_rpy. See this
+    # module's docstring and docs/data_recording_conventions.md.
+    object_angular_velocity: Optional[np.ndarray] = None
     target_angular_velocity: Optional[np.ndarray] = None
     theta: Optional[float] = None                      # robot-side only: theta fed to compute_hand_targets this step
     # RESERVED for the future neck-mounted load cell: (6,) [Fx,Fy,Fz,Mx,My,Mz]
@@ -206,8 +229,8 @@ class RunRecorder:
             output_dir=output_dir, filename_template=filename_template,
         )
         self._samples: list = []
-        self._prev_obj = None   # (R_3x3, obs_timestamp) of the last non-None object observation
-        self._prev_tgt = None   # (R_3x3, obs_timestamp) of the last non-None target observation
+        self._prev_obj = None   # (R_optical_3x3, obs_timestamp) of the last object obs with pose_in_optical
+        self._prev_tgt = None   # (R_optical_3x3, obs_timestamp) of the last target obs with pose_in_optical
         self._t0 = None
         self._saved = False
 
@@ -248,23 +271,32 @@ class RunRecorder:
             # decomposition regardless of which use case is calling.
             angle_diff = angle_diff_rpy(target_pose[:3, :3], object_pose[:3, :3])
 
+        # Angular velocities are computed from each marker's own camera
+        # OPTICAL-frame readings, not pelvis frame -- no T_optical_to_d435/
+        # T_d435_to_pelvis composition. If pose_in_optical isn't available
+        # (e.g. a synthetic observation that didn't provide it), the field
+        # is None for that sample -- NOT a silent fallback to pelvis-derived
+        # rotation, which would reintroduce exactly the composition being
+        # avoided. See this module's docstring for why.
         object_angular_velocity = None
-        if object_obs is not None:
+        if object_obs is not None and object_obs.pose_in_optical is not None:
+            R_obj_opt = object_obs.pose_in_optical[:3, :3]
             if self._prev_obj is not None:
                 R_prev, t_prev = self._prev_obj
                 object_angular_velocity = angular_velocity_rotvec(
-                    R_prev, t_prev, object_pose[:3, :3], object_obs.timestamp
+                    R_prev, t_prev, R_obj_opt, object_obs.timestamp
                 )
-            self._prev_obj = (object_pose[:3, :3].copy(), object_obs.timestamp)
+            self._prev_obj = (R_obj_opt.copy(), object_obs.timestamp)
 
         target_angular_velocity = None
-        if target_obs is not None:
+        if target_obs is not None and target_obs.pose_in_optical is not None:
+            R_tgt_opt = target_obs.pose_in_optical[:3, :3]
             if self._prev_tgt is not None:
                 R_prev, t_prev = self._prev_tgt
                 target_angular_velocity = angular_velocity_rotvec(
-                    R_prev, t_prev, target_pose[:3, :3], target_obs.timestamp
+                    R_prev, t_prev, R_tgt_opt, target_obs.timestamp
                 )
-            self._prev_tgt = (target_pose[:3, :3].copy(), target_obs.timestamp)
+            self._prev_tgt = (R_tgt_opt.copy(), target_obs.timestamp)
 
         sample = MarkerSample(
             t=t,

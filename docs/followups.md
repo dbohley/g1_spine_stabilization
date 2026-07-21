@@ -1689,3 +1689,87 @@ angle metric only; `MarkerSample`'s field list (no new fields, only the
 `angle_diff_rpy` field's *meaning* changed); `theta`/`MarkerSource._theta_
 from_target_rotation` (a deliberately separate, unrelated computation).
 
+### Addendum: angular velocity moved to the camera optical frame (no pelvis composition)
+
+Immediate follow-up to the addendum above. Once `angle_diff_rpy` was fixed
+to be target/torso-anchored, the user asked what frame
+`object_angular_velocity`/`target_angular_velocity` should use, since
+"pelvis frame" isn't a real frame for the human trial (no G1, no pelvis —
+`T_d435_to_pelvis` there is FK for a robot that isn't present). Discussion
+landed on the actual intended use of these two fields: cross-trial
+**normalization** — how much was the torso/head actually moving in a given
+trial, since it won't be identical trial-to-trial, not axis-level
+biomechanical interpretation (that's what the now-fixed `angle_diff_rpy` is
+for). That's a magnitude-only need, and magnitude is exactly invariant to
+any fixed rotation composition (proof: rotations preserve vector norm) —
+so carrying `T_d435_to_pelvis`/`T_optical_to_d435` through this computation
+added a dependency on transforms that are partly fictional (human trial) or
+robot-specific-calibrated (`T_optical_to_d435`) for zero benefit. Decision:
+remove the composition entirely — compute both fields directly from each
+marker's own consecutive camera **optical-frame** readings.
+
+**Files changed:**
+- `perception/types.py` — `MarkerObservation` gained `pose_in_optical:
+  Optional[np.ndarray] = None` (4x4 SE3, OpenCV/REP-103 convention: X
+  right, Y down, Z forward). Optional with a `None` default specifically so
+  every existing construction site (tests, mock trackers,
+  `visualize_markers.py`'s `run_mock()`) keeps working unmodified — only
+  sites that want the new angular-velocity behavior need to populate it.
+- `perception/tracker.py` — `MarkerTracker.step()` now passes
+  `pose_in_optical=det.pose_in_optical` into the `MarkerObservation` it
+  constructs (one line; the data was already in scope, just never
+  forwarded). This is the real/production path, so every live detection
+  (robot and human, `--source marker`/`realsense`) gets it automatically.
+- `data_recording/recorder.py` — `RunRecorder.record()`'s angular-velocity
+  computation switched from `object_pose[:3,:3]`/`target_pose[:3,:3]`
+  (pelvis-frame) to `object_obs.pose_in_optical[:3,:3]`/`target_obs.
+  pose_in_optical[:3,:3]`. When `pose_in_optical` is `None`, the field is
+  `None` for that sample — no fallback to pelvis-derived rotation, which
+  would silently reintroduce the exact composition being removed.
+  `_prev_obj`/`_prev_tgt` now track optical-frame rotations.
+  `angular_velocity_rotvec` itself is unchanged (already frame-agnostic —
+  only which rotation `RunRecorder` feeds it changed). Module docstring's
+  caveat paragraph and the `MarkerSample` field comments rewritten to state
+  the new convention and explicitly warn against cross-referencing these
+  fields' axes with `angle_diff_rpy`'s (different frames, different
+  purposes — magnitude-only normalization vs. axis-level clinical mapping).
+- `scripts/run_pose_tracking_preview.py`'s `_AnimatedMockTracker` and
+  `scripts/record_human_trial.py`'s `_AnimatedHumanMockTracker` — both now
+  populate `pose_in_optical` (reusing the already-computed synthetic pose;
+  there's no real camera to be accurate about, it just needs to be *some*
+  consistent rotation) so `--source mock --record` smoke tests exercise
+  the full schema instead of silently getting `None` for these two fields.
+- `docs/data_recording_conventions.md` — §4 rewritten from "what's
+  invariant to camera calibration" into "two different frames, on purpose":
+  states plainly that `angle_diff_rpy` (target-anchored) and the angular
+  velocities (camera optical-frame) now live in genuinely different frames
+  for different reasons, with a table and the reasoning for each.
+- `tests/test_recorder.py` — `_obs()` helper gained an optional
+  `R_optical` parameter. `test_recorder_second_sample_computes_velocity`
+  renamed to `..._from_optical_not_pelvis` and strengthened: `pose_in_
+  pelvis` is now held IDENTICAL across both samples while `pose_in_optical`
+  actually rotates, so the test would fail if the implementation
+  accidentally read pelvis data (it would report zero velocity instead of
+  the expected nonzero rate) — a direct proof, not just an assertion. New
+  `test_recorder_angular_velocity_none_when_pose_in_optical_unavailable`
+  (graceful degradation).
+- `tests/test_tracker.py` (new) — no existing test file covered the real
+  `MarkerTracker` (as opposed to `MockMarkerTracker`, covered by
+  `test_mock_tracker.py`) at all, so two tests added with a stub frame
+  source/detector (no real camera or cv2 detection): confirms `step()`/
+  `get_latest()` populate `pose_in_optical` matching the raw detection
+  exactly.
+
+**Why this doesn't conflict with the target-frame decision for
+`angle_diff_rpy`:** they're solving different problems. `angle_diff_rpy`
+needs the pelvis-frame composition (or rather, needs to be invariant to
+it, which target-anchoring provides) because its output is read
+axis-by-axis for clinical mapping. The angular-velocity fields never
+needed axis-level meaning — only a trial-comparable scalar — and magnitude
+never depended on the composition in the first place, so removing it here
+loses nothing and drops a dependency on two calibration transforms (one
+partly fictional, one robot-specific) that weren't earning their keep for
+this particular pair of fields.
+
+Test count: 3 new tests (192 total, confirmed via `pytest tests/ -v`).
+
