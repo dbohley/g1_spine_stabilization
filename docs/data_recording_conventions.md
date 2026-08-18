@@ -12,7 +12,7 @@ Both scripts import the same `RunRecorder`/`MarkerSample` from `g1_spine_stabili
 
 ```python
 {
-    "schema_version": 1,
+    "schema_version": 2,
     "origin": "robot" | "human",
     "source_label": "sine" | "mock" | "marker" | "realsense",   # robot: trajectory source; human: camera source
     "tracking_mode": "orient-only" | "6dof" | None,
@@ -23,7 +23,9 @@ Both scripts import the same `RunRecorder`/`MarkerSample` from `g1_spine_stabili
 }
 ```
 
-**Per-sample fields (`MarkerSample`):** `t` (elapsed seconds since recording started), `wall_time` (absolute `time.time()` epoch — use this, not `t`, to correlate two different recordings against the real clock), `object_pose`/`target_pose` (4x4 SE3, pelvis frame, raw per-frame marker detections — `None` if that marker wasn't seen this sample), `object_obs_timestamp`/`target_obs_timestamp`, `object_reprojection_error`/`target_reprojection_error`, `angle_diff_rpy` (see §3), `object_angular_velocity`/`target_angular_velocity` (see §4), `theta` (robot-only, always `None` from the human script), `load_cell_wrench` (reserved for the not-yet-built neck load cell, always `None` today).
+**Per-sample fields (`MarkerSample`):** `t` (elapsed seconds since recording started), `wall_time` (absolute `time.time()` epoch — use this, not `t`, to correlate two different recordings against the real clock), `object_pose`/`target_pose` (4x4 SE3, pelvis frame, raw per-frame marker detections — `None` if that marker wasn't seen this sample), `object_obs_timestamp`/`target_obs_timestamp`, `object_reprojection_error`/`target_reprojection_error`, `angle_diff_rpy` (see §3), `object_angular_velocity`/`target_angular_velocity` (see §4), `theta` (robot-only, always `None` from the human script), `load_cell_wrench_raw`/`load_cell_wrench_grav_comp` (ATI F/T sensor wrench — see §6).
+
+**Schema versions:** v1 had a single reserved `load_cell_wrench` (always `None`). v2 (current) splits it into `load_cell_wrench_raw` + `load_cell_wrench_grav_comp` when the F/T sensor was wired up — see §6.
 
 ## 2. Filename convention
 
@@ -82,3 +84,17 @@ Don't cross-reference their x/y/z components against each other or assume either
 **+X = rightward along the tag's canonical-upright top edge, +Y = upward (bottom edge toward top edge), +Z = out of the printed face toward the viewer** — all relative to however that specific AprilTag ID's dictionary pattern reads as "upright" (not always obvious by eye, since the bit pattern doesn't visually indicate orientation the way a letter would).
 
 To physically confirm which real-world direction each axis points on your mounted markers: run `python scripts/visualize_markers.py --source realsense` — it overlays `cv2.drawFrameAxes` (red=X, green=Y, blue=Z) on every live detection. Since it draws from `pose_in_optical` (before any pelvis-frame composition), what you see is the marker's true local axes in the real world regardless of camera calibration. **Check the `target` marker specifically** (torso, in the neck-trial convention) — per §3, that's the frame `angle_diff_rpy`'s roll/pitch/yaw are expressed in, not the object/head marker's frame.
+
+## 6. Force/torque sensor fields (`load_cell_wrench_raw` / `_grav_comp`)
+
+The ATI Axia80-M20 6-axis F/T sensor (neck-mounted) is read every sample during a `--record` run (both scripts) via `g1_spine_stabilization/sensors/force_torque.py`. Two `(6,)` fields, `[Fx,Fy,Fz,Mx,My,Mz]` in N / N·m, **both in the SENSOR frame**:
+
+- **`load_cell_wrench_raw`** — the sensor's counts scaled by the config `cpf`/`cpt`. This is everything transmitted through the sensor: the weight of the payload mounted below it **plus** any external force (the neck device pulling). `None` when the sensor is disabled or unreachable (recording degrades gracefully — see `docs/force_sensor_setup.md`).
+- **`load_cell_wrench_grav_comp`** — gravity-cancelled, isolating the external interaction from the payload weight:
+  - **Force channels: orientation-aware.** At the start of the run a ~1 s at-rest baseline (`force_sensor.baseline_frames`) captures the gravity force `F0` in the sensor frame (have the neck device NOT pulling then — startup pose ≈ pure gravity). As the torso tilts, the gravity force is re-projected using the **target (torso) marker's** rotation: `F_grav = M·(R_cur.T R_ref)·M.T·F0`, where `M` is the fixed torso-marker→sensor rotation (`force_sensor.gravity_comp.marker_to_sensor_rpy`, default identity = marker mounted axis-aligned with the sensor). The relative rotation `R_cur.T R_ref` is frame-invariant, so it doesn't matter whether the marker rotation is taken in optical or pelvis frame.
+  - **Torque channels: tared** (`T_raw - T0`). Exact at the reference pose; fully orientation-aware torque would need the payload's center-of-mass offset `r` (not measured — a future upgrade).
+  - `None` until the startup reference is captured, and it falls back to a plain tare on all six channels for any sample where the target/torso marker isn't tracked.
+
+This is **not** the same as the `gravity_comp:` section elsewhere in the config — that's Pinocchio joint-torque feedforward for the arm motors, unrelated to F/T sensor gravity cancellation.
+
+To fill in the real `cpf`/`cpt` (placeholder `1000000`) and get the sensor reachable on this machine, see `docs/force_sensor_setup.md`.

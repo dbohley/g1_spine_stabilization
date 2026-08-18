@@ -139,6 +139,34 @@ data_recording:
   # omitted when tracking_mode is None, e.g. --source sine.
   filename_template: "{origin}_run_{timestamp}_{source}_{tracking_mode}"
 
+force_sensor:
+  # ATI Axia80-M20 6-axis F/T sensor (Ethernet, RDT-over-UDP). Read during
+  # --record runs by BOTH run_pose_tracking_preview.py and record_human_trial.py
+  # into the pickle's load_cell_wrench_raw / load_cell_wrench_grav_comp fields.
+  # Wiring: g1_spine_stabilization/sensors/force_torque.py. Networking setup for
+  # this machine + how to read cpf/cpt: docs/force_sensor_setup.md. Convention
+  # (frames, gravity comp): docs/data_recording_conventions.md.
+  enabled: true            # read the sensor when --record is active (--no-force-sensor overrides per run)
+  ip: "192.168.1.1"        # sensor IP (its static fallback on a direct point-to-point link)
+  port: 49152              # RDT UDP port
+  # Counts-per-force / counts-per-torque for THIS sensor (FT76858). PLACEHOLDER
+  # 1000000 -- read the real values from http://<ip>/config.htm (F/T
+  # Configurations page) or http://<ip>/netftcalapi.xml and set them here.
+  cpf: 1000000
+  cpt: 1000000
+  connect_timeout: 3.0     # s to wait for the first packet before warning + degrading to None
+  baseline_frames: 50      # at-rest frames averaged at startup for the gravity reference (~1s)
+  gravity_comp:
+    # Second wrench field. FORCE channels are cancelled orientation-aware (the
+    # startup gravity reading rotated by the target/torso marker as the torso
+    # tilts); TORQUE channels are tared (exact at the reference pose). Raw is
+    # always stored alongside regardless. See docs/data_recording_conventions.md.
+    enabled: true
+    # Fixed rotation from the target(torso)-marker frame to the sensor frame
+    # (rpy radians, fixed-axis). Default identity assumes the torso marker is
+    # mounted axis-aligned with the sensor -- calibrate if it isn't. PLACEHOLDER.
+    marker_to_sensor_rpy: [0.0, 0.0, 0.0]
+
 grip_force:
   enabled: true             # apply grip during grasp_demo.py AND pose tracking (sdk_pose_tracking.py)
   tau_baseline: 0.2        # target grip force per finger (N); light hold

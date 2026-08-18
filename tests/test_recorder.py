@@ -164,7 +164,23 @@ def test_recorder_handles_none_observations():
     assert sample.object_angular_velocity is None
     assert sample.target_angular_velocity is None
     assert sample.theta == 0.3
+    assert sample.load_cell_wrench_raw is None
+    assert sample.load_cell_wrench_grav_comp is None
     assert len(rec) == 1
+
+
+def test_recorder_stores_both_wrench_fields():
+    rec = RunRecorder(origin="human", source_label="mock", output_path="unused.pkl")
+    raw = np.array([1.0, 2.0, 3.0, 0.1, 0.2, 0.3])
+    comp = np.array([0.5, 0.5, 0.5, 0.05, 0.05, 0.05])
+    sample = rec.record(t=0.0, object_obs=None, target_obs=None,
+                        load_cell_wrench_raw=raw, load_cell_wrench_grav_comp=comp)
+    np.testing.assert_allclose(sample.load_cell_wrench_raw, raw)
+    np.testing.assert_allclose(sample.load_cell_wrench_grav_comp, comp)
+
+
+def test_recorder_schema_version_is_2():
+    assert RunRecorder.SCHEMA_VERSION == 2
 
 
 def test_recorder_angle_diff_only_when_both_markers_present():
@@ -208,8 +224,11 @@ def test_recorder_pickle_round_trip(tmp_path):
     obj_obs = _obs(0, R=np.eye(3), pos=(0.1, 0.2, 0.3), timestamp=0.0)
     tgt_obs = _obs(2, R=Rotation.from_euler('xyz', [0.1, 0, 0]).as_matrix(),
                    pos=(0.4, 0.0, 0.3), timestamp=0.0)
+    wrench_raw = np.array([1.0, -2.0, 3.0, 0.1, -0.2, 0.3])
+    wrench_comp = np.array([0.4, -0.5, 0.6, 0.01, -0.02, 0.03])
     rec.record(t=0.0, object_obs=None, target_obs=None)
-    rec.record(t=0.02, object_obs=obj_obs, target_obs=tgt_obs)
+    rec.record(t=0.02, object_obs=obj_obs, target_obs=tgt_obs,
+               load_cell_wrench_raw=wrench_raw, load_cell_wrench_grav_comp=wrench_comp)
     rec.save()
 
     with open(out_path, "rb") as f:
@@ -235,6 +254,9 @@ def test_recorder_pickle_round_trip(tmp_path):
         s1.angle_diff_rpy,
         angle_diff_rpy(tgt_obs.pose_in_pelvis[:3, :3], obj_obs.pose_in_pelvis[:3, :3]),
     )
+    assert s0.load_cell_wrench_raw is None
+    np.testing.assert_allclose(s1.load_cell_wrench_raw, wrench_raw)
+    np.testing.assert_allclose(s1.load_cell_wrench_grav_comp, wrench_comp)
 
 
 def test_recorder_save_is_idempotent(tmp_path):

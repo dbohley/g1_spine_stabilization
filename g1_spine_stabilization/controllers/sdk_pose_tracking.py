@@ -100,6 +100,19 @@ def _rpy_deg(R):
     return np.degrees(_Rot.from_matrix(R).as_euler('xyz'))
 
 
+def _obs_rotation(obs):
+    """3x3 rotation from a MarkerObservation (optical frame preferred, pelvis
+    fallback), or None. Used as the torso/target orientation for F/T gravity
+    compensation -- the relative rotation the compensator uses is frame-
+    invariant, so which of the two frames doesn't matter."""
+    if obs is None:
+        return None
+    pose_opt = getattr(obs, 'pose_in_optical', None)
+    if pose_opt is not None:
+        return pose_opt[:3, :3]
+    return obs.pose_in_pelvis[:3, :3]
+
+
 def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=None):
     """Print augmented per-step marker diagnostics and optionally push to Rerun.
 
@@ -199,7 +212,8 @@ def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=No
 
 
 def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
-                          preview=None, cam_for_preview=None, recorder=None):
+                          preview=None, cam_for_preview=None, recorder=None,
+                          wrench_source=None):
     """Run the three-phase pose-tracking controller via the SDK transport.
 
     Args:
@@ -222,6 +236,12 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                          KeyboardInterrupt, or any other exception -- before falling
                          through to hand-release/Phase 3. Pass None (default) to disable
                          recording entirely.
+        wrench_source:   optional ForceTorqueSource (sensors.force_torque). If provided
+                         (only meaningful alongside recorder), capture_reference() runs
+                         once at the top of Phase 2 and read() runs each iteration to
+                         supply the raw + gravity-cancelled F/T wrench to recorder.record().
+                         The caller owns its lifecycle (close() in a finally). None = no
+                         force data recorded.
     """
     control_dt         = cfg["control"]["dt"]
     interpolation_time = cfg["control"]["interpolation_time"]
@@ -425,6 +445,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         _last_log_t = t_start - 1.0   # fire on first step
         _obj_lost_warned = False
         _contact_lost_warned = False
+        _wrench_ref_captured = False
         if recorder is not None:
             recorder.start()
         try:
@@ -438,12 +459,28 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                     print("[SDKController] WARNING: object marker lost — box may have fallen! (SDK-6: stop here)")
                     _obj_lost_warned = True
 
+                obj_obs = getattr(source, 'last_obj_obs', None)
+                target_obs = getattr(source, 'last_tgt_obs', None)
+                R_torso = _obs_rotation(target_obs)
+
+                # F/T sensor: capture the gravity reference on the first step
+                # (now that a target/torso rotation is available), then read
+                # raw + gravity-cancelled wrench each step. No-op if disabled.
+                wrench_raw = wrench_comp = None
+                if wrench_source is not None:
+                    if not _wrench_ref_captured:
+                        wrench_source.capture_reference(R_torso)
+                        _wrench_ref_captured = True
+                    wrench_raw, wrench_comp = wrench_source.read(R_torso)
+
                 if recorder is not None:
                     recorder.record(
                         t=elapsed,
-                        object_obs=getattr(source, 'last_obj_obs', None),
-                        target_obs=getattr(source, 'last_tgt_obs', None),
+                        object_obs=obj_obs,
+                        target_obs=target_obs,
                         theta=theta,
+                        load_cell_wrench_raw=wrench_raw,
+                        load_cell_wrench_grav_comp=wrench_comp,
                     )
 
                 # Palm-force grip: pick a press DEPTH (position mode) or a press

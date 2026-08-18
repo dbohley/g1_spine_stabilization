@@ -158,10 +158,18 @@ class MarkerSample:
     object_angular_velocity: Optional[np.ndarray] = None
     target_angular_velocity: Optional[np.ndarray] = None
     theta: Optional[float] = None                      # robot-side only: theta fed to compute_hand_targets this step
-    # RESERVED for the future neck-mounted load cell: (6,) [Fx,Fy,Fz,Mx,My,Mz]
-    # in N / N*m. Always None until that sensor exists -- no sensor code
-    # written yet, this field just keeps the schema forward-compatible.
-    load_cell_wrench: Optional[np.ndarray] = None
+    # ATI Axia80 F/T sensor wrench, (6,) [Fx,Fy,Fz,Mx,My,Mz] in N / N*m,
+    # expressed in the SENSOR frame. Both None when the sensor is disabled or
+    # unreachable (recording degrades gracefully, never crashes).
+    #   _raw       -- scaled counts straight from the sensor.
+    #   _grav_comp -- gravity-cancelled: FORCE channels orientation-aware
+    #                 (startup gravity reading rotated by the target/torso
+    #                 marker), TORQUE channels tared. Additionally None until
+    #                 the startup gravity reference is captured. See
+    #                 g1_spine_stabilization/sensors/force_torque.py and
+    #                 docs/data_recording_conventions.md.
+    load_cell_wrench_raw: Optional[np.ndarray] = None
+    load_cell_wrench_grav_comp: Optional[np.ndarray] = None
 
 
 def default_run_path(
@@ -202,7 +210,7 @@ class RunRecorder:
     human-trial script (scripts/record_human_trial.py) -- so a downstream
     comparison analysis can load either file interchangeably.
     """
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2   # v2: load_cell_wrench split into _raw + _grav_comp (F/T sensor wired)
 
     def __init__(
         self,
@@ -247,11 +255,17 @@ class RunRecorder:
         theta: Optional[float] = None,
         t: Optional[float] = None,
         wall_time: Optional[float] = None,
+        load_cell_wrench_raw: Optional[np.ndarray] = None,
+        load_cell_wrench_grav_comp: Optional[np.ndarray] = None,
     ) -> MarkerSample:
         """Compute and append one MarkerSample. Never raises, including
         when object_obs/target_obs is None (stale/lost marker, or a
         non-marker-backed source like SineSource) -- the corresponding
         pose/angle-diff/velocity fields are simply None for that sample.
+
+        load_cell_wrench_raw/_grav_comp: optional (6,) F/T sensor wrenches
+        (see sensors/force_torque.py). Passed through verbatim; None when no
+        sensor is attached.
         """
         if t is None:
             if self._t0 is None:
@@ -311,6 +325,12 @@ class RunRecorder:
             object_angular_velocity=object_angular_velocity,
             target_angular_velocity=target_angular_velocity,
             theta=theta,
+            load_cell_wrench_raw=(
+                None if load_cell_wrench_raw is None else np.asarray(load_cell_wrench_raw, float).copy()
+            ),
+            load_cell_wrench_grav_comp=(
+                None if load_cell_wrench_grav_comp is None else np.asarray(load_cell_wrench_grav_comp, float).copy()
+            ),
         )
         self._samples.append(sample)
         return sample

@@ -1773,3 +1773,96 @@ this particular pair of fields.
 
 Test count: 3 new tests (192 total, confirmed via `pytest tests/ -v`).
 
+## ATI Axia80 F/T sensor integration
+
+### What was built
+
+The ATI Axia80-M20 6-axis force/torque sensor (Ethernet, RDT-over-UDP port
+49152) is now read into every `--record` run — robot and human — populating
+the previously-reserved load-cell field, in two forms (raw + gravity-
+cancelled) per the user's request. `scripts/sensor_test.py` (a standalone UDP
+print-loop with placeholder calibration) was the starting point.
+
+**Files changed / added:**
+- `g1_spine_stabilization/sensors/force_torque.py` (new `sensors/` subpackage)
+  — `ForceTorqueSensor` (background-daemon-thread RDT/UDP reader, lock-guarded
+  latest wrench, mirrors `PalmForceReader`'s pattern but owns its own recv
+  thread since RDT is a raw stream; degrades to `read_raw()->None` on
+  connect timeout with a printed diagnostic pointing at the setup doc);
+  `GravityCompensator` (pure-numpy: orientation-aware force cancellation +
+  tared torque); `ForceTorqueSource` (glue both scripts share:
+  `from_config`/`start`/`capture_reference`/`read`/`close`). Dependency-light
+  (socket/struct/threading/numpy/scipy) — no robot/IK/SDK import.
+- `data_recording/recorder.py` — `SCHEMA_VERSION` 1→2; single reserved
+  `load_cell_wrench` replaced by `load_cell_wrench_raw` +
+  `load_cell_wrench_grav_comp` (both `(6,)` `[Fx,Fy,Fz,Mx,My,Mz]` N/N·m,
+  sensor frame); `record()` gained the two matching keyword-only params.
+- `controllers/sdk_pose_tracking.py` — `run_pose_tracking_sdk` gained an
+  optional `wrench_source` param; Phase 2 captures the gravity reference on
+  the first step (when a torso rotation is available) and reads raw+comp each
+  iteration into `recorder.record(...)`. New `_obs_rotation` helper (optical-
+  preferred torso rotation).
+- `scripts/run_pose_tracking_preview.py` + `scripts/record_human_trial.py` —
+  both construct a `ForceTorqueSource` (config-gated, `--force-sensor`/
+  `--no-force-sensor` override), start it, capture the reference at the top of
+  the tracking loop, read each iteration, and `close()` it in the existing
+  `finally`. The human script stays perception-only (the reader has no robot
+  dependency).
+- `scripts/sensor_test.py` — refactored to use the shared `ForceTorqueSensor`
+  (single source of truth for the RDT protocol) + read ip/cpf/cpt from config.
+- `configs/default.yaml` — new `force_sensor:` section (ip, port, cpf/cpt
+  placeholders, connect_timeout, baseline_frames, gravity_comp with
+  `marker_to_sensor_rpy`).
+- `docs/force_sensor_setup.md` (new) — networking fix for this machine
+  (confirmed diagnosis: interface `enx00e04c6807dc` up but no IP, nmcli
+  `disconnected`, `ping 192.168.1.1` 0 replies), the sudo `ip addr add` quick
+  fix, the persistent `nmcli` profile, exactly what to hand an admin if sudo
+  is unavailable, direct-connect vs USB-hub note, and how to read cpf/cpt from
+  the web UI.
+- `tests/test_force_torque.py` (new, 13 tests) — GravityCompensator math
+  (cancels pure gravity at ref pose; orientation-aware force re-projection
+  cancels at a NEW orientation; `M` threads through; torque always tared;
+  plain-tare fallbacks; None cases) + ForceTorqueSensor over a localhost UDP
+  loopback with a fake-sensor thread (parse/scale, disabled-returns-None).
+  `tests/test_recorder.py` — new wrench-field + schema-v2 tests.
+
+### Gravity-comp math (the crux)
+
+`F_grav(t) = M · (R_cur.T @ R_ref) · M.T · F0`, subtract from raw force; tare
+the torque. `F0`/`T0`/`R_ref` captured at startup at-rest; `R_cur` = torso
+(target) marker rotation now; `M` = marker→sensor mounting (config, default I).
+No payload weighing needed — the startup reading supplies the weight vector.
+Relative rotation `R_cur.T @ R_ref` is frame-invariant (same reasoning as the
+angular-velocity fields), so optical vs. pelvis torso rotation is equivalent.
+
+### Deviations / limitations (documented, not silently assumed)
+
+- `M` defaults to identity — accurate only if the torso marker is mounted
+  axis-aligned with the sensor; otherwise one config rotation.
+- Torque gravity-cancellation is tare-only (exact at the reference pose); full
+  orientation-aware torque needs the payload COM offset `r` (future measurement).
+- `ForceTorqueSensor.read_raw()` returns the reading even on a nonzero ATI
+  status word (with a one-time warning) rather than nulling it — a status bit
+  is a warning, not a reason to discard data (minor deviation from the plan's
+  "None on status error").
+
+### Networking / not completed by Claude Code
+
+Making the sensor reachable on this machine needs a NIC IP assignment that
+requires sudo/admin (this account may lack it). The code + `docs/
+force_sensor_setup.md` are ready; the actual `ip addr`/`nmcli` change is the
+user's step. Verified read-only: interface `enx00e04c6807dc` has no IP and the
+sensor doesn't ping — matching the documented failure. Until fixed, both
+scripts run fine with `load_cell_wrench_*` = `None`.
+
+### Things not modified
+
+- The arm `gravity_comp` (Pinocchio joint-torque feedforward) — unrelated to
+  F/T gravity cancellation, untouched.
+- `angle_diff_rpy` / angular-velocity conventions — unchanged.
+- No new dependency added (socket/struct/threading are stdlib; numpy/scipy
+  already core).
+
+Test count: 15 new tests (13 in test_force_torque.py + 2 net in
+test_recorder.py). Full count confirmed via `pytest tests/ -v` at 207.
+

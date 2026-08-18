@@ -38,7 +38,19 @@ from g1_spine_stabilization.perception.frames import (
 from g1_spine_stabilization.perception.tracker import MarkerTracker
 from g1_spine_stabilization.perception.types import MarkerObservation
 from g1_spine_stabilization.data_recording.recorder import RunRecorder
+from g1_spine_stabilization.sensors.force_torque import ForceTorqueSource
 from g1_spine_stabilization.utils.config import load_config
+
+
+def _obs_rotation(obs):
+    """3x3 rotation from a MarkerObservation (optical frame preferred, pelvis
+    fallback), or None -- the torso/target orientation for F/T gravity comp."""
+    if obs is None:
+        return None
+    pose_opt = getattr(obs, "pose_in_optical", None)
+    if pose_opt is not None:
+        return pose_opt[:3, :3]
+    return obs.pose_in_pelvis[:3, :3]
 
 
 class _AnimatedHumanMockTracker:
@@ -118,6 +130,14 @@ def main():
         "--duration", type=float, default=None,
         help="Seconds to record. Default: run until Ctrl-C.",
     )
+    parser.add_argument(
+        "--force-sensor", dest="force_sensor", action="store_true", default=None,
+        help="Force-enable the ATI F/T sensor (overrides force_sensor.enabled in config).",
+    )
+    parser.add_argument(
+        "--no-force-sensor", dest="force_sensor", action="store_false",
+        help="Disable the F/T sensor for this run (e.g. sensor unplugged).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -168,6 +188,14 @@ def main():
         print("[record_human_trial] --record not passed -- running WITHOUT saving "
               "(use for camera-positioning rehearsal only).")
 
+    # ATI F/T sensor (only meaningful when recording). Degrades to None
+    # wrenches if unreachable, so this script always runs. Same camera/marker/
+    # sensor stack as the robot path -- see docs/force_sensor_setup.md.
+    wrench_source = None
+    if recorder is not None:
+        wrench_source = ForceTorqueSource.from_config(cfg, enabled_override=args.force_sensor)
+        wrench_source.start()
+
     print("[record_human_trial] Ready. Hold the object marker steady (or move it), "
           "move the target marker to perform the tracking task. Ctrl-C to stop and save.")
     if recorder is not None:
@@ -175,6 +203,7 @@ def main():
 
     t_start = time.monotonic()
     _last_print_t = t_start - 1.0
+    _wrench_ref_captured = False
     try:
         while True:
             elapsed = time.monotonic() - t_start
@@ -184,9 +213,19 @@ def main():
             tracker.step()
             obj_obs = tracker.get_latest(obj_id)
             tgt_obs = tracker.get_latest(tgt_id)
+            R_torso = _obs_rotation(tgt_obs)
+
+            wrench_raw = wrench_comp = None
+            if wrench_source is not None:
+                if not _wrench_ref_captured:
+                    wrench_source.capture_reference(R_torso)
+                    _wrench_ref_captured = True
+                wrench_raw, wrench_comp = wrench_source.read(R_torso)
 
             if recorder is not None:
-                recorder.record(t=elapsed, object_obs=obj_obs, target_obs=tgt_obs)
+                recorder.record(t=elapsed, object_obs=obj_obs, target_obs=tgt_obs,
+                                load_cell_wrench_raw=wrench_raw,
+                                load_cell_wrench_grav_comp=wrench_comp)
 
             if time.monotonic() - _last_print_t >= 1.0:
                 _last_print_t = time.monotonic()
@@ -202,6 +241,8 @@ def main():
     finally:
         if recorder is not None:
             recorder.save()
+        if wrench_source is not None:
+            wrench_source.close()
         if frame_source is not None:
             frame_source.close()
     print("[record_human_trial] Done.")

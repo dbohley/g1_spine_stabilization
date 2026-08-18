@@ -49,6 +49,7 @@ from g1_spine_stabilization.trajectory.sources import (
 )
 from g1_spine_stabilization.controllers.sdk_pose_tracking import run_pose_tracking_sdk
 from g1_spine_stabilization.data_recording.recorder import RunRecorder
+from g1_spine_stabilization.sensors.force_torque import ForceTorqueSource
 from g1_spine_stabilization.utils.config import load_config
 
 
@@ -190,6 +191,15 @@ def main():
              "so only time/theta are recorded (pose/angle-diff/velocity fields are "
              "None) -- still useful for exercising the recording pipeline without "
              "hardware. Disabled by default.",
+    )
+    parser.add_argument(
+        "--force-sensor", dest="force_sensor", action="store_true", default=None,
+        help="Force-enable the ATI F/T sensor during --record (overrides "
+             "force_sensor.enabled in config).",
+    )
+    parser.add_argument(
+        "--no-force-sensor", dest="force_sensor", action="store_false",
+        help="Disable the F/T sensor for this run (e.g. sensor unplugged).",
     )
     args = parser.parse_args()
 
@@ -376,6 +386,16 @@ def main():
                       "angle-diff/angular-velocity fields will be None.")
             print(f"[preview] Recording enabled -> {recorder.output_path}")
 
+    # -------------------------------------------------------------------
+    # Optional ATI F/T sensor (only meaningful when recording). Degrades
+    # gracefully to None wrenches if the sensor is unreachable. See
+    # g1_spine_stabilization/sensors/force_torque.py, docs/force_sensor_setup.md.
+    # -------------------------------------------------------------------
+    wrench_source = None
+    if recorder is not None:
+        wrench_source = ForceTorqueSource.from_config(cfg, enabled_override=args.force_sensor)
+        wrench_source.start()
+
     print(f"[preview] Connecting robot (dry_run={args.dry_run})…")
     robot.connect()
     robot.initialize()
@@ -385,9 +405,11 @@ def main():
     try:
         run_pose_tracking_sdk(robot, ik, cfg, source, duration=duration,
                               preview=preview, cam_for_preview=cam_for_preview,
-                              recorder=recorder)
+                              recorder=recorder, wrench_source=wrench_source)
     finally:
         robot.shutdown()
+        if wrench_source is not None:
+            wrench_source.close()
         if cam_for_preview is not None:
             cam_for_preview.shutdown()
         if args.source == "marker":
