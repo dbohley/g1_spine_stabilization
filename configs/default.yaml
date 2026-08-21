@@ -161,11 +161,44 @@ force_sensor:
     # startup gravity reading rotated by the target/torso marker as the torso
     # tilts); TORQUE channels are tared (exact at the reference pose). Raw is
     # always stored alongside regardless. See docs/data_recording_conventions.md.
+    #
+    # NOTE: `enabled` below controls ONLY the orientation-aware reprojection
+    # of the FORCE channels. The underlying startup tare (DC/electrical offset
+    # + reference-pose gravity) is captured and applied UNCONDITIONALLY,
+    # regardless of this flag -- ForceTorqueSource.capture_reference() always
+    # runs, and GravityCompensator.tare()/compensate()'s no-orientation
+    # fallback both degrade to that same plain tare when this is false or
+    # orientation data is unavailable. See sensors/force_torque.py.
     enabled: true
     # Fixed rotation from the target(torso)-marker frame to the sensor frame
     # (rpy radians, fixed-axis). Default identity assumes the torso marker is
     # mounted axis-aligned with the sensor -- calibrate if it isn't. PLACEHOLDER.
     marker_to_sensor_rpy: [0.0, 0.0, 0.0]
+  # Experimental alternative to gravity_comp's rotation-matrix reprojection
+  # above, used ONLY by scripts/gravity_comp_debug.py as a third comparison
+  # value -- NOT used by the real recording pipeline (record_human_trial.py /
+  # sdk_pose_tracking.py) and NOT part of GravityCompensator. Models the
+  # orientation-dependent residual visible in wrench_tared as
+  # reference_force_n * sin(theta_axis). reference_force_n was fit from a
+  # SINGLE observed data point (7.5N tared-force reading at a 90-degree torso
+  # rotation) -- sin(0)=0 matches tared force being ~0 at the reference pose;
+  # sin(pi/2)=1 recovers reference_force_n at 90 degrees. UNVALIDATED beyond
+  # that one point -- retune reference_force_n if more test rotations show
+  # it's inconsistent.
+  debug_sin_model:
+    reference_force_n: 7.5   # N -- tared force magnitude observed at a 90-degree torso rotation
+    # roll | pitch | yaw | magnitude -- which rotation quantity theta_axis is
+    # taken from. roll/pitch/yaw read one component of angle_diff_rpy's
+    # [roll,pitch,yaw] torso-orientation delta -- expressed in the AprilTag's
+    # own PRINTED local axes (an arbitrary direction fixed by how the
+    # physical tag happens to be mounted, NOT necessarily the real-world axis
+    # the torso is actually rotated about). A guessed axis can measure ~0
+    # rotation even while the torso is visibly rotating a lot (this bit a
+    # real test run with axis=pitch). magnitude (default, recommended) uses
+    # rotation_magnitude() (data_recording/recorder.py) instead -- the torso's
+    # TOTAL rotation angle since reference, correct regardless of which axis
+    # the physical rotation happens to align with.
+    axis: magnitude
 
 grip_force:
   enabled: true             # apply grip during grasp_demo.py AND pose tracking (sdk_pose_tracking.py)

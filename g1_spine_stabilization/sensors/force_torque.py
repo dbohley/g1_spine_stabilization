@@ -11,19 +11,27 @@ and the human-trial path (scripts/record_human_trial.py):
                          UDP stream, not DDS-callback driven). Degrades
                          gracefully (read_raw() -> None) if the sensor is
                          unreachable, so recording never crashes.
-  GravityCompensator  -- pure-numpy gravity cancellation: orientation-aware
-                         for the FORCE channels (rotate the startup gravity
-                         reading by the torso/target marker's rotation),
-                         tared for the TORQUE channels. See the class
+  GravityCompensator  -- pure-numpy gravity cancellation. tare() is a plain,
+                         orientation-blind subtraction of the startup
+                         reference (DC offset + reference-pose gravity),
+                         always available once a reference is captured.
+                         compensate() additionally re-projects the FORCE
+                         channels' startup gravity reading by the torso/
+                         target marker's rotation as it changes (TORQUE
+                         channels stay tared either way). See the class
                          docstring and docs/data_recording_conventions.md.
   ForceTorqueSource   -- thin glue wrapping the two, so both record loops
-                         share one read()/capture_reference() contract.
+                         share one read()/capture_reference() contract, plus
+                         read_all() for callers that want raw/tared/
+                         gravity-adjusted side by side (e.g.
+                         scripts/gravity_comp_debug.py).
 
 Dependency-light (socket/struct/threading/time/numpy/scipy) -- no robot, no
 IK, no g1_inspire_sdk. Calibration (cpf/cpt) and the sensor IP come from
 configs/default.yaml's force_sensor: section. Networking setup for this
 machine: docs/force_sensor_setup.md.
 """
+import math
 import socket
 import struct
 import threading
@@ -67,6 +75,20 @@ def rotation_from_rpy(rpy) -> np.ndarray:
     """3x3 rotation from fixed-axis rpy (radians): R = Rz(yaw)Ry(pitch)Rx(roll)."""
     r, p, y = (float(v) for v in rpy)
     return Rotation.from_euler("xyz", [r, p, y]).as_matrix()
+
+
+def sin_model_gravity_residual(theta_rad: float, reference_force_n: float) -> float:
+    """Experimental alternative to GravityCompensator's rotation-matrix
+    reprojection -- debug/comparison use only, see
+    scripts/gravity_comp_debug.py and configs/default.yaml's
+    force_sensor.debug_sin_model. Estimates the orientation-dependent gravity
+    residual left in an already-tared force reading as
+    reference_force_n * sin(theta_rad): fit from a single observed data point
+    (a torso rotation and its tared-force reading), where sin(0)=0 matches
+    tared force being ~0 at the reference pose and sin(pi/2)=1 recovers
+    reference_force_n at a 90-degree rotation. Not part of
+    GravityCompensator -- not used by the real recording pipeline."""
+    return reference_force_n * math.sin(theta_rad)
 
 
 class ForceTorqueSensor:
@@ -237,10 +259,38 @@ class GravityCompensator:
         T_comp = raw[3:] - self._T0
         return np.concatenate([F_comp, T_comp])
 
+    def tare(self, raw_wrench) -> Optional[np.ndarray]:
+        """Plain startup tare on all six channels: raw - [F0, T0]. No
+        orientation tracking at all -- cancels whatever was present in the
+        reference reading (DC/electrical offset + gravity at the reference
+        pose) and stays fixed at that value for the rest of the run,
+        regardless of how the torso later moves. Contrast with compensate(),
+        which additionally re-projects the reference gravity force as the
+        torso's orientation changes. Returns None before a reference is set
+        or when raw_wrench is None."""
+        if raw_wrench is None or self._F0 is None:
+            return None
+        raw = np.asarray(raw_wrench, float).reshape(6)
+        return raw - np.concatenate([self._F0, self._T0])
+
 
 class ForceTorqueSource:
     """Glue: a ForceTorqueSensor + GravityCompensator behind one contract, so
-    both record loops share the same read()/capture_reference() calls."""
+    both record loops share the same read()/capture_reference() calls.
+
+    Two independent things happen here, not one:
+      1. The startup tare -- ALWAYS captured (as long as the sensor produced
+         data), regardless of gravity_comp.enabled. This cancels whatever is
+         present in the raw reading at the reference instant: the sensor's
+         own DC/electrical offset AND the payload's weight at the reference
+         orientation (gravity). Neither is separable from a single static
+         reading, so taring necessarily cancels both together.
+      2. Orientation-aware reprojection -- an OPTIONAL upgrade, gated by
+         gravity_comp.enabled, that re-projects the reference gravity force
+         as the torso tilts (rather than assuming it stays at the reference
+         orientation forever). This only affects wrench_grav_comp/compensate();
+         it has no effect on the plain tare from (1).
+    """
 
     def __init__(self, sensor: ForceTorqueSensor,
                  compensator: Optional[GravityCompensator] = None,
@@ -248,7 +298,10 @@ class ForceTorqueSource:
         self._sensor = sensor
         self._comp = compensator
         self._baseline_frames = int(baseline_frames)
-        self._gravity_comp_enabled = bool(gravity_comp_enabled) and compensator is not None
+        # Gates ONLY orientation-aware reprojection in compensate() -- the
+        # startup tare itself (capture_reference/read_all below) always runs
+        # when a compensator is available. See class docstring.
+        self._orientation_tracking_enabled = bool(gravity_comp_enabled) and compensator is not None
 
     @classmethod
     def from_config(cls, cfg, *, enabled_override: Optional[bool] = None) -> "ForceTorqueSource":
@@ -274,11 +327,16 @@ class ForceTorqueSource:
         self._sensor.start()
 
     def capture_reference(self, R_torso, *, sleep=0.02) -> None:
-        """Average baseline_frames at-rest readings into the gravity reference,
-        paired with the torso rotation now. Call once, with the neck device NOT
-        pulling, at the start of the tracking phase. No-op if gravity comp is
-        off or the sensor gave no data."""
-        if not self._gravity_comp_enabled:
+        """Average baseline_frames at-rest readings into the tare/gravity
+        reference, paired with the torso rotation now (if available). Call
+        once, with the neck device NOT pulling, at the start of the tracking
+        phase. ALWAYS runs (regardless of gravity_comp.enabled) as long as a
+        compensator exists and the sensor produced data -- this is the
+        unconditional DC-offset + startup-gravity tare; whether it's later
+        upgraded to orientation-aware reprojection is decided in read()/
+        read_all() via gravity_comp.enabled. No-op if no compensator was
+        provided or the sensor gave no data."""
+        if self._comp is None:
             return
         frames = []
         for _ in range(self._baseline_frames):
@@ -287,19 +345,39 @@ class ForceTorqueSource:
                 frames.append(w)
             time.sleep(sleep)
         if not frames:
-            print("[ForceTorque] No sensor data for the gravity reference; "
-                  "gravity-cancelled wrench will be unavailable this run.")
+            print("[ForceTorque] No sensor data for the tare/gravity reference; "
+                  "adjusted wrench will be unavailable this run.")
             return
         self._comp.set_reference(np.mean(frames, axis=0), R_torso)
-        print(f"[ForceTorque] Gravity reference captured from {len(frames)} frames.")
+        print(f"[ForceTorque] Tare/gravity reference captured from {len(frames)} frames.")
 
     def read(self, R_torso) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Return (raw_wrench|None, gravity_cancelled_wrench|None) for this sample."""
+        """Return (raw_wrench|None, gravity_cancelled_wrench|None) for this
+        sample. gravity_cancelled_wrench is orientation-aware reprojection
+        when gravity_comp.enabled, else the plain tare from capture_reference
+        (see GravityCompensator.compensate()'s no-orientation fallback)."""
         raw = self._sensor.read_raw()
         comp = None
-        if self._gravity_comp_enabled and self._comp.has_reference:
-            comp = self._comp.compensate(raw, R_torso)
+        if self._comp is not None and self._comp.has_reference:
+            R_arg = R_torso if self._orientation_tracking_enabled else None
+            comp = self._comp.compensate(raw, R_arg)
         return raw, comp
+
+    def read_all(self, R_torso) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return (raw_wrench|None, tared_wrench|None, gravity_adjusted_wrench|None)
+        for this sample -- all three side by side, for by-hand comparison
+        (e.g. scripts/gravity_comp_debug.py). tared_wrench is the plain
+        startup tare (GravityCompensator.tare()), always populated once a
+        reference exists, independent of gravity_comp.enabled.
+        gravity_adjusted_wrench is the same orientation-aware value read()
+        returns as its second element."""
+        raw = self._sensor.read_raw()
+        tared = self._comp.tare(raw) if self._comp is not None else None
+        grav_comp = None
+        if self._comp is not None and self._comp.has_reference:
+            R_arg = R_torso if self._orientation_tracking_enabled else None
+            grav_comp = self._comp.compensate(raw, R_arg)
+        return raw, tared, grav_comp
 
     def close(self) -> None:
         self._sensor.close()

@@ -128,6 +128,24 @@ def angular_velocity_rotvec(
     return Rotation.from_matrix(R_delta).as_rotvec() / dt
 
 
+def rotation_magnitude(R_reference: np.ndarray, R_moving: np.ndarray) -> float:
+    """Total rotation angle (radians, >= 0) between two orientations:
+    Rotation.from_matrix(R_reference.T @ R_moving).magnitude().
+
+    Unlike angle_diff_rpy's per-axis Euler decomposition -- which is
+    expressed in R_reference's own local axes, an arbitrary direction fixed
+    by however that specific marker happens to be physically mounted -- this
+    is a single axis-agnostic number: how far the object has rotated overall,
+    correct regardless of which real-world axis the physical rotation
+    happens to align with. Used by scripts/gravity_comp_debug.py's
+    axis="magnitude" option, which exists precisely because a guessed Euler
+    axis (e.g. "pitch") can silently measure ~0 rotation even while the
+    tracked marker is visibly being rotated a lot, if the physical rotation
+    axis doesn't line up with that guess.
+    """
+    return float(Rotation.from_matrix(R_reference.T @ R_moving).magnitude())
+
+
 @dataclass
 class MarkerSample:
     """One recorded instant. Marker-derived fields are None when that

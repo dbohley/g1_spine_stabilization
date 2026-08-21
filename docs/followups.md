@@ -1866,3 +1866,315 @@ scripts run fine with `load_cell_wrench_*` = `None`.
 Test count: 15 new tests (13 in test_force_torque.py + 2 net in
 test_recorder.py). Full count confirmed via `pytest tests/ -v` at 207.
 
+## Debug tooling follow-ups (marker_tracking_debug.py + gravity_comp_debug.py)
+
+### What was built
+
+- `scripts/marker_tracking_debug.py` (new) — no-pickle intermediate between
+  `visualize_markers.py` (visual only) and `record_human_trial.py` (data
+  pipeline only, headless): annotated `cv2` window labeling detections
+  `OBJECT`/`TARGET` per config, plus a live terminal printout of
+  `angle_diff_rpy` and per-marker angular velocity — the same derived
+  quantities `RunRecorder` computes, without saving a run.
+- `scripts/gravity_comp_debug.py` (new) — isolates the F/T `GravityCompensator`
+  from `record_human_trial.py`'s full loop: tracks only the torso
+  (`target_marker_id`) marker, prints its position/orientation delta from its
+  first reading, and prints the F/T wrench.
+
+### Gap found and fixed: taring was gated behind orientation-tracking
+
+While building `gravity_comp_debug.py`, tracing through `ForceTorqueSource`
+surfaced a real bug: `capture_reference()` was a no-op whenever
+`force_sensor.gravity_comp.enabled=false`, so **no tare was ever captured** in
+that mode — `load_cell_wrench_grav_comp` stayed `None` for the entire run, not
+just un-reprojected. The fix, scoped to `g1_spine_stabilization/sensors/
+force_torque.py` (additive, no schema change):
+
+- `GravityCompensator.tare(raw_wrench)` (new) — plain orientation-blind
+  subtraction (`raw - [F0, T0]`), always available once a reference is set.
+  `compensate()` is untouched (still the orientation-aware path with its
+  existing no-orientation fallback).
+- `ForceTorqueSource.capture_reference()` — dropped the
+  `gravity_comp_enabled` early-out; now always captures the baseline whenever
+  a compensator exists. Internal flag renamed
+  `_gravity_comp_enabled` → `_orientation_tracking_enabled` to reflect its
+  narrower new meaning: it now gates ONLY whether `R_torso` is forwarded into
+  `compensate()` for reprojection (passing `None` when disabled correctly
+  triggers `compensate()`'s pre-existing plain-tare fallback branch — no
+  changes needed there).
+- `ForceTorqueSource.read_all(R_torso)` (new) — returns
+  `(raw, tared, grav_comp)` as a 3-tuple side by side, used only by
+  `gravity_comp_debug.py`. The existing `read(R_torso)` (2-tuple) is
+  UNCHANGED and still used by `record_human_trial.py`/`sdk_pose_tracking.py`
+  Phase 2 — this was a deliberate scope decision (confirmed with the user) to
+  avoid a pickle schema bump; recorded trials still only carry
+  `load_cell_wrench_raw`/`_grav_comp`, not a third tared field.
+- `configs/default.yaml` — clarified in a comment that `force_sensor.
+  gravity_comp.enabled` now controls only the orientation-aware reprojection;
+  the underlying tare is unconditional.
+- `tests/test_force_torque.py` — 6 new tests: `GravityCompensator.tare()`
+  (None-before-reference, None-when-raw-None, plain subtraction regardless of
+  orientation) + `ForceTorqueSource` (new direct test coverage — previously
+  untested as a class): capture_reference works with gravity_comp disabled
+  (the regression test for the bug), `read_all()` returns a plain tare when
+  disabled, `read_all()` still does full orientation reprojection when
+  enabled. 213 tests total.
+
+### Out of scope (deliberate, confirmed with user)
+
+- Adding the tared reading to the recorded pickle schema
+  (`MarkerSample.load_cell_wrench_tared`, `SCHEMA_VERSION` 2→3) — scoped out;
+  only the standalone debug script got the third reading.
+
+### Things not modified
+
+- `assets/g1_with_hands.urdf`, IK weights, EE frame defs, shoulder-roll
+  bounds — untouched.
+- `data_recording/recorder.py`, `RunRecorder`/`MarkerSample` schema,
+  `record_human_trial.py`, `controllers/sdk_pose_tracking.py` — untouched
+  (still call the existing 2-tuple `read()`).
+- `docs/data_recording_conventions.md` — untouched (describes the recorded
+  schema, which didn't change).
+
+## gravity_comp_debug.py follow-up: magnitude display + experimental sin(theta) model
+
+### What was done
+
+Two rounds of small changes to `scripts/gravity_comp_debug.py`, both scoped to
+the debug script only (no schema/pipeline changes):
+
+1. **Terser printout.** `wrench_raw` is no longer printed (dropped as noise
+   for by-hand comparison). `wrench_tared`/`wrench_grav_comp` now each print a
+   single total force (N) and total torque (Nm) magnitude
+   (`np.linalg.norm(...)`) instead of 3-axis `[Fx,Fy,Fz]`/`[Mx,My,Mz]`
+   components. `ForceTorqueSource.read_all()` itself is unchanged — this is
+   presentation-only.
+2. **Experimental sin(theta) force-residual model.** While comparing
+   `wrench_tared` against `wrench_grav_comp` by hand, the user noticed: at the
+   reference pose, `wrench_tared`'s total force is ~0 by construction; at a
+   90-degree torso rotation, it read **7.5N**. Since `sin(0)=0` and
+   `sin(90°)=1`, this fits `residual(theta) = reference_force_n * sin(theta)`.
+   Added as a new module-level function
+   `sin_model_gravity_residual(theta_rad, reference_force_n)` in
+   `g1_spine_stabilization/sensors/force_torque.py` (pure, no instance state
+   — not a `GravityCompensator` method), and wired into
+   `gravity_comp_debug.py` as a **third**, clearly-labeled `[EXPERIMENTAL]`
+   comparison line: `sin_model_force = wrench_tared's F_total -
+   reference_force_n * sin(theta_axis)`, where `theta_axis` is one configured
+   Euler axis (default `pitch`) of the same `angle_diff_rpy`-based
+   `orient_delta` already computed for display. New `configs/default.yaml`
+   block `force_sensor.debug_sin_model` (`reference_force_n: 7.5`,
+   `axis: pitch`) makes both the fitted coefficient and the rotation axis
+   tunable, since the coefficient was fit from a single observed data point
+   and may not generalize. 3 new hardware-free tests for the pure function
+   (sin(0)=0, sin(pi/2) recovers the exact 7.5N fit point, sin(pi/4) confirms
+   it's a real sine and not a stand-in constant). 216 tests total.
+
+### Key clarifications from the user (easy to get backwards)
+
+- It's **sin**, not cos — their first message said cos but the observed data
+  (0N at reference, 7.5N at 90°) only fits sin.
+- `Force` in the formula is the **tared** total, not raw — "because at
+  baseline we will have it at 0 anyways." This is a *second-stage* correction
+  of the orientation-dependent residual taring alone can't remove, not an
+  independent from-scratch computation off the raw signal.
+- `theta` is **one specific Euler axis** (configurable, default pitch) of the
+  existing roll/pitch/yaw `orient_delta`, not a combined rotation-angle
+  magnitude.
+- **Scope confirmed as debug-script-only** — this is explicitly unvalidated
+  (fit from one data point) and not adopted into `GravityCompensator`/the real
+  recording pipeline. Needs testing across a range of angles, not just 0° and
+  90°, before any wider adoption is even considered.
+
+### Out of scope / open
+
+- Whether the sin(theta) model actually holds up across more than the two
+  tested points (0° and 90°) — untested pending a human-run session rotating
+  the torso through a range of angles and comparing all three printed values.
+- If it does hold up, promoting it into the real `GravityCompensator`/
+  recording pipeline would be a separate, bigger decision (schema/production
+  code change) — not undertaken here.
+
+### Things not modified
+
+- `sensors/force_torque.py`'s `GravityCompensator`/`ForceTorqueSource` classes
+  — only a new standalone function was added alongside them.
+- `record_human_trial.py`, `controllers/sdk_pose_tracking.py`,
+  `data_recording/recorder.py` — untouched.
+- `docs/data_recording_conventions.md` — untouched.
+
+## gravity_comp_debug.py follow-up: visualization + wrong-axis fix + stale-tracking visibility
+
+### What was done
+
+A real human-run of `gravity_comp_debug.py` (axis=pitch, the previous
+default) surfaced two problems and prompted a third feature request, all
+addressed in `scripts/gravity_comp_debug.py`:
+
+1. **Added a live video window.** The camera loop no longer goes through
+   `MarkerTracker` at all — it now calls `RealSenseSource.read()` +
+   `AprilTagDetector.detect()` directly each frame (same pattern as
+   `marker_tracking_debug.py`'s `run_realsense()`), drawing axes + a `TORSO`
+   label on the tracked marker via `cv2.imshow`. This was necessary anyway
+   (see #3) since `MarkerObservation` doesn't carry pixel corners for
+   drawing, only the composed pose.
+
+2. **Root-caused and fixed the wrong-rotation-axis bug.** The user reported
+   that after a real run, `wrench_tared` and `sin_model_force` were
+   "essentially the same" — meaning the `sin(theta)` correction was
+   contributing ~nothing despite a visibly large torso rotation. Root cause:
+   `angle_diff_rpy`'s roll/pitch/yaw decomposition is expressed in the
+   AprilTag's own PRINTED local axes (an arbitrary direction fixed by how the
+   physical tag happens to be mounted — see `docs/data_recording_
+   conventions.md` §5), not necessarily the real-world axis the torso is
+   actually rotated about. `axis: pitch` was a guess, and it was wrong for
+   this rig — pitch read ~0 while the real rotation was happening on a
+   different axis. Fix: new `rotation_magnitude(R_reference, R_moving)` in
+   `g1_spine_stabilization/data_recording/recorder.py` (alongside
+   `angle_diff_rpy`/`angular_velocity_rotvec` — same kind of generic
+   rotation-comparison utility) computes the torso's TOTAL rotation angle
+   since reference via `Rotation.from_matrix(R_ref.T @ R_cur).magnitude()` —
+   correct regardless of which axis the physical rotation aligns with.
+   `force_sensor.debug_sin_model.axis` now accepts `roll|pitch|yaw|magnitude`
+   and defaults to `magnitude`. `tests/test_recorder.py` gained a test that
+   demonstrates the failure mode directly: a pure 90° roll rotation reads
+   `pitch ≈ 0` via `angle_diff_rpy` while `rotation_magnitude` correctly
+   reports the full 90°.
+
+3. **Fixed invisible marker dropout.** Tracing through why the user's third
+   question ("how might losing the marker mess up the calculation") mattered,
+   found: the OLD code called `tracker.step()` (discarding its return) then
+   separately called `MarkerTracker.get_latest(torso_id)` — but
+   `get_latest()` reads an internal cache (`perception/tracker.py:29,58,61-
+   62`) that's set once a marker is first seen and NEVER cleared. So
+   `torso_obs` could never be `None` again after the first sighting, even if
+   the marker left the frame entirely for the rest of the run — a mid-run
+   dropout was completely invisible, silently reusing a frozen pose forever
+   with no indication. Confirmed with the user: gravity comp should KEEP
+   running through a brief dropout using the last-known pose (don't stop
+   compensating), but it must be clearly visible when that's happening. Fixed
+   as part of the #1 rewrite: freshness is now a plain per-frame check
+   (`torso_id` present in *this frame's* raw detections or not), with a local
+   `last_pose_pelvis`/`last_R_optical`/`last_fresh_elapsed` state updated only
+   on actual detections. Every printed tick now shows `torso tracking: FRESH`
+   or `torso tracking: STALE (last seen N.Ns ago) -- using cached pose`.
+
+### Key finding worth flagging loudly
+
+**`record_human_trial.py` has the IDENTICAL latent staleness bug** — its main
+loop uses the exact same `tracker.step()` + `get_latest()` pattern for BOTH
+`object_obs` and `target_obs`. Once either marker is first seen, the script's
+"object=seen"/"target=seen" status line will show "seen" for the rest of the
+run even if that marker later drops entirely out of frame, and every
+downstream computation (`angle_diff_rpy`, angular velocity, F/T gravity comp)
+would silently keep using a stale pose. Confirmed with the user this is
+**deliberately NOT fixed this session** — scoped to `gravity_comp_debug.py`
+only, since fixing the real recording pipeline (and deciding how stale data
+should be represented in the pickle schema — a new field? drop the sample?)
+is a separate, bigger decision affecting real recorded data, not a quick
+port.
+
+### Out of scope / open
+
+- Porting the freshness fix to `record_human_trial.py` (and by extension
+  `controllers/sdk_pose_tracking.py` Phase 2, which has the same pattern for
+  the robot-side recording) — flagged above, not undertaken.
+- Whether `sin_model_force` under `axis=magnitude` now tracks visibly better
+  than `wrench_tared` across a range of angles — untested pending the next
+  human-run session (this was exactly the point of adding the video window +
+  the axis fix together).
+
+### Things not modified
+
+- `perception/tracker.py`'s `MarkerTracker`/`get_latest()` — untouched (the
+  fix is local to `gravity_comp_debug.py`, which stopped using it rather than
+  changing its caching behavior for every caller).
+- `record_human_trial.py`, `controllers/sdk_pose_tracking.py` — untouched
+  (same latent staleness bug, deliberately left for a future session).
+- `sensors/force_torque.py` — untouched this round (the axis fix lives in
+  `recorder.py`/the script, not the F/T module).
+
+## gravity_comp_debug.py follow-up: theta_used diagnostic (open anomaly, not yet resolved)
+
+### What was found
+
+A real run with the new `axis: magnitude` default (see previous entry) showed
+`sin_model_force` reading ≈-7 at "startup" (right after reference capture,
+torso presumed at rest) and ≈0 after rotating ~90° — the OPPOSITE of
+expectation (should be ≈0 at BOTH points; `wrench_tared` itself correctly
+goes from 0 → ~7, matching the original 90°-rotation data point the model was
+fit from). The user also directly confirmed via the new video overlay that
+the true physical rotation axis is X/roll (the red drawn axis), answering
+their own question about whether the earlier `pitch` default was really
+measuring the wrong (Y) axis — confirmed yes.
+
+Worked through why the -7 anomaly can't be a bug in the sin-model math itself:
+`wrench_tared` depends ONLY on the real F/T sensor's raw reading
+(`GravityCompensator.tare()` takes no rotation argument at all), so its
+correct 0→7 behavior means the SENSOR's own account of "did the orientation
+really change" is trustworthy. And `theta` (whichever axis) is mathematically
+guaranteed to equal exactly 0 at the reference instant
+(`rotation_magnitude(R_ref, R_ref) = 0` identically). So `sin_model_force`
+being -7 right at "startup" means the CAMERA-derived `theta` must have been
+wrong (non-zero) at the moment the user read that value — either real/
+apparent motion occurred between the "Reference captured" print and that
+reading, or `solvePnP`'s pose estimate for a small planar AprilTag viewed
+close to head-on is known to be less stable for the tilt/out-of-plane
+rotation components (a real, physically-motivated hypothesis, not confirmed).
+
+### What was done
+
+Added a new printed line to `scripts/gravity_comp_debug.py`'s per-tick output,
+purely diagnostic (no math changed):
+```
+theta_used(<axis>)=+68.4 deg   reproj_err=1.8px
+```
+Shows exactly what `theta_rad` value fed `sin_model_gravity_residual` this
+tick (whichever axis is configured), plus the torso detection's own
+`reprojection_error` (a leading indicator of an unstable/noisy pose
+estimate). New `last_reproj_err` state tracked alongside the existing
+`last_pose_pelvis`/`last_R_optical`/`last_fresh_elapsed`.
+
+### Out of scope / open
+
+- The -7 anomaly itself is NOT resolved — this session only added the
+  visibility needed to diagnose it on the next run. Two competing
+  hypotheses (timing/motion between reference capture and the "startup"
+  reading vs. `solvePnP` pose instability for a near-frontal marker) need to
+  be distinguished by reading the new `theta_used`/`reproj_err` line at the
+  moment the anomaly reproduces.
+- If pose instability turns out to be the real cause, a follow-up fix might
+  involve improving the viewing angle/marker placement, adding a
+  reprojection-error-based rejection threshold in `AprilTagDetector`, or
+  averaging/filtering the pose over multiple frames — none of these were
+  attempted, since the cause isn't confirmed yet.
+
+### Things not modified
+
+- `sensors/force_torque.py`, `data_recording/recorder.py`,
+  `AprilTagDetector`/`MarkerTracker` — untouched; this was a print-only
+  addition in `gravity_comp_debug.py`.
+
+## Handoff doc written: gravity_comp_recording_plan.md
+
+The user wants everything from this debugging arc (tare/gravity-comp
+decoupling, the experimental sin(theta) model, the wrong-axis root-cause +
+fix, the marker-dropout/staleness find, the still-open -7 anomaly) promoted
+from `gravity_comp_debug.py`-only into the real recording pipeline
+(`record_human_trial.py`, `sdk_pose_tracking.py` Phase 2) — but explicitly in
+a **separate future session**, not this one. Rather than re-deriving all of
+that from this diary (now 2000+ lines across many sessions), wrote a single
+consolidated, self-contained spec: **`docs/gravity_comp_recording_plan.md`**
+— findings with file:line evidence, the unresolved anomaly called out
+prominently as a decision point to resolve first, a concrete schema-v3 +
+pipeline-wiring implementation spec, and a summary checklist. Referenced from
+`CLAUDE.md`'s Open Design Questions and File Structure, mirroring how
+`docs/ik_weight_analysis.md` staged the SDK-5.5 gravity-comp work.
+
+No source code changed this session — documentation only, per the user's
+explicit request to defer implementation to a new session.
+
+### Things not modified
+
+- All source code — this was a docs-only session.
+

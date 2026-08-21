@@ -16,6 +16,7 @@ from g1_spine_stabilization.data_recording.recorder import (
     angle_diff_rpy,
     angular_velocity_rotvec,
     default_run_path,
+    rotation_magnitude,
 )
 from g1_spine_stabilization.perception.types import MarkerObservation
 
@@ -60,6 +61,31 @@ def test_angle_diff_rpy_is_relative_not_subtracted_eulers():
         - Rotation.from_matrix(R_reference).as_euler('xyz')
     )
     assert not np.allclose(result, naive_subtracted, atol=1e-3)
+
+
+def test_rotation_magnitude_zero_for_identity():
+    assert rotation_magnitude(np.eye(3), np.eye(3)) == pytest.approx(0.0)
+
+
+def test_rotation_magnitude_matches_known_single_axis_rotation():
+    R_reference = np.eye(3)
+    R_moving = Rotation.from_euler('xyz', [0.0, 0.0, 0.7]).as_matrix()
+    assert rotation_magnitude(R_reference, R_moving) == pytest.approx(0.7)
+
+
+def test_rotation_magnitude_is_axis_agnostic_unlike_angle_diff_rpy():
+    """A 90-degree rotation about an axis that doesn't line up with the
+    reference frame's own X/Y/Z can show up as ~0 in one particular
+    angle_diff_rpy component (e.g. pitch) while rotation_magnitude still
+    correctly reports the full 90 degrees -- this is exactly the gap that
+    caused scripts/gravity_comp_debug.py's sin_model_force to barely move
+    when axis=pitch was used against a real torso rotation about a
+    different physical axis."""
+    R_reference = np.eye(3)
+    R_moving = Rotation.from_euler('xyz', [np.pi / 2, 0.0, 0.0]).as_matrix()   # pure roll
+    roll, pitch, yaw = angle_diff_rpy(R_reference, R_moving)
+    assert pitch == pytest.approx(0.0, abs=1e-9)   # the "wrong axis" reads ~0
+    assert rotation_magnitude(R_reference, R_moving) == pytest.approx(np.pi / 2)
 
 
 def test_angle_diff_rpy_argument_order_is_not_a_sign_flip():
