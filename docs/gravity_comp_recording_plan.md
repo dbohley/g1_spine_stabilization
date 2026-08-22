@@ -1,5 +1,39 @@
 # Gravity-Comp Recording Plan
 
+> **STATUS: IMPLEMENTED.** §5's spec has been carried out in
+> `scripts/record_human_trial.py`, `controllers/sdk_pose_tracking.py`, and
+> `scripts/run_pose_tracking_preview.py` (schema v2→v3: `load_cell_wrench_
+> tared`, `sin_model_theta_rad`, `sin_model_force_corrected`). **§4's
+> anomaly was NOT independently re-diagnosed** — see the resolution note
+> appended to the end of §4 below before relying on this doc's "hypothesis
+> (a)/(b), not yet distinguished" framing as still open.
+>
+> **POLICY CHANGE (later session): the sin-model is now the PRIMARY method
+> behind `load_cell_wrench_grav_comp`, not an experimental side-note.** A
+> real-trial investigation (rolling the torso and back) found the
+> rotation-matrix `GravityCompensator.compensate()` method this doc
+> describes below measured *worse* than no correction at all (7.92N RMS
+> force error vs. 6.79N RMS for plain `tared`, on clean/non-glitch
+> samples) — most likely due to an uncalibrated `force_sensor.gravity_comp.
+> marker_to_sensor_rpy` (still the identity placeholder) and/or a rotation-
+> order question that a single-axis trial couldn't cleanly separate from
+> that calibration issue (multiple order/transpose variants, and multiple
+> very different fitted `marker_to_sensor_rpy` values, all achieved
+> statistically indistinguishable best-case residuals — this trial's motion
+> structurally cannot determine which). By contrast, the sin-model method
+> tracked visibly closer to zero. Per explicit project decision, `data_
+> recording/recorder.py`'s new `sin_model_wrench()` (tared's force
+> direction, rescaled to the sin-model-corrected magnitude; torque
+> unchanged from tared) now populates the recorded `load_cell_wrench_
+> grav_comp` field in both real recording scripts. The rotation-matrix
+> method itself is untouched and still computed (via `read_all()`'s 3rd
+> return value) but no longer recorded — it remains available for `scripts/
+> gravity_comp_debug.py`'s live comparison and any future recalibration
+> work. This does not resolve the open calibration question the rest of
+> this doc describes — it changes which value is *recorded*, not the
+> calibration state of the rotation-matrix method itself. See
+> `docs/data_recording_conventions.md` §6 for the current field semantics.
+
 **Purpose of this doc:** `scripts/gravity_comp_debug.py` was built as a
 hands-on diagnostic to validate F/T sensor gravity compensation before
 trusting real recorded trial data. That debugging arc produced a working
@@ -215,6 +249,26 @@ pickle's `metadata` and in `docs/data_recording_conventions.md` — not
 presented as equivalent in trustworthiness to the raw/tared/grav_comp
 wrenches.
 
+**Resolution actually applied (read this, not just the recommendation
+above):** this anomaly was **not independently re-diagnosed** — hypotheses
+(a) and (b) above were never distinguished by re-running `gravity_comp_
+debug.py` and reading `theta_used`/`reproj_err` as recommended. Instead,
+per explicit project direction, it's addressed by requiring the camera/
+marker reading to settle over a few consecutive fresh frames before locking
+the reference at all (`data_recording.reference_settle_frames`, default 5,
+in `configs/default.yaml` — gated behind `scripts/record_human_trial.py`'s
+new `'r'`-to-start video window; there was no interactive gating point to
+attach an equivalent settle to in `sdk_pose_tracking.py`, so the robot path's
+reference capture is still a single instant, unchanged in this respect).
+This is a plausible fix for hypothesis (a) (a transient reading right at
+the reference instant) but does **not** rule out hypothesis (b) (systematic
+`solvePnP` instability for near-head-on tilt rotations) — if the anomaly
+recurs even with the settle in place, revisit hypothesis (b) specifically.
+The sin-model fields are recorded flagged `"status": "experimental_
+unvalidated"` in the pickle's `metadata["sin_model_config"]`, per this
+section's fallback recommendation, since the anomaly was not confirmed
+resolved by direct evidence.
+
 ---
 
 ## 5. Implementation spec
@@ -297,17 +351,27 @@ to it.
 
 ## 6. Summary checklist for the new session
 
-- [ ] Re-run `gravity_comp_debug.py`, read `theta_used`/`reproj_err` at the
+- [x] ~~Re-run `gravity_comp_debug.py`, read `theta_used`/`reproj_err` at the
       "startup" anomaly point, and resolve/document what's actually
-      happening (§4) — do this first.
-- [ ] Bump `SCHEMA_VERSION` to 3; add `load_cell_wrench_tared`,
+      happening (§4) — do this first.~~ **Not done as recommended** — per
+      project direction, addressed instead via a multi-frame reference
+      settle (`data_recording.reference_settle_frames`) rather than
+      re-diagnosed. See the resolution note at the end of §4.
+- [x] Bump `SCHEMA_VERSION` to 3; add `load_cell_wrench_tared`,
       `sin_model_theta_rad`, `sin_model_force_corrected` to `MarkerSample`;
       matching `RunRecorder.record()` kwargs; `sin_model_config` in
       run-level `metadata` (§5.1).
-- [ ] Wire `read_all()` + the sin-model computation into
+- [x] Wire `read_all()` + the sin-model computation into
       `record_human_trial.py` and `sdk_pose_tracking.py` Phase 2 (§5.2).
-- [ ] Decide on and apply (or explicitly defer, with a note) the
-      marker-dropout companion fix (§5.3).
-- [ ] Decide on the `debug_sin_model` config naming (§5.4).
-- [ ] Update `docs/data_recording_conventions.md`, `tests/test_recorder.py`,
+      Also wired into `run_pose_tracking_preview.py`'s `RunRecorder`
+      construction (metadata only).
+- [x] Marker-dropout companion fix (§5.3) — applied in
+      `record_human_trial.py` via the new `_DirectMultiMarkerTracker`
+      (direct per-frame reads + `is_fresh()`/`seconds_since_fresh()`,
+      replacing `MarkerTracker`). **Deliberately left unfixed** in
+      `sdk_pose_tracking.py`/`trajectory/sources.py` — out of scope for this
+      task (no interactive UI there to build the fix around).
+- [x] `debug_sin_model` config naming (§5.4) — kept as-is (no rename), to
+      avoid pure churn now that 3 call sites read it.
+- [x] Updated `docs/data_recording_conventions.md`, `tests/test_recorder.py`,
       `CLAUDE.md` (§5.5).

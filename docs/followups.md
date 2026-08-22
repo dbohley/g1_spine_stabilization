@@ -2178,3 +2178,487 @@ explicit request to defer implementation to a new session.
 
 - All source code — this was a docs-only session.
 
+## Gravity-comp recording promotion follow-ups
+
+### What was done
+
+Implemented `docs/gravity_comp_recording_plan.md`'s spec (now marked
+IMPLEMENTED at the top of that doc): promoted `gravity_comp_debug.py`'s
+tared wrench + experimental sin-model force into the real `--record`
+pipeline, and added a `'r'`-to-start recording gate to
+`record_human_trial.py`.
+
+**Files changed:**
+- `g1_spine_stabilization/data_recording/recorder.py` — `SCHEMA_VERSION`
+  2→3; `MarkerSample` gained `load_cell_wrench_tared`,
+  `sin_model_theta_rad`, `sin_model_force_corrected` (the latter two
+  EXPERIMENTAL); new shared helper `sin_model_theta_rad(axis, R_reference,
+  R_current)` plus `RPY_AXIS_INDEX`/`VALID_SIN_MODEL_AXES` constants, so
+  both real recording call sites compute this identically instead of each
+  keeping their own copy (`gravity_comp_debug.py` keeps its pre-existing
+  copy, untouched).
+- `configs/default.yaml` — new `data_recording.reference_settle_frames: 5`;
+  `force_sensor.debug_sin_model`'s comment updated (no longer
+  debug-script-only).
+- `scripts/record_human_trial.py` — rewritten. When `--record` is passed,
+  opens a `cv2` window: waits for `'r'` before `recorder.start()` (nothing
+  saved if `'q'` is pressed first), then requires
+  `reference_settle_frames` consecutive fresh TARGET detections before
+  locking the pose/gravity reference (used for both
+  `wrench_source.capture_reference()` and the sin-model theta). New
+  script-local `_DirectMultiMarkerTracker` replaces `MarkerTracker` for
+  `--source realsense` — direct per-frame `AprilTagDetector` reads
+  tracking both `object_marker_id`/`target_marker_id`, with
+  `is_fresh()`/`seconds_since_fresh()` surfaced live as a `FRESH`/`STALE`
+  overlay (fixes `MarkerTracker.get_latest()`'s sticky-cache staleness bug
+  as a side effect, for this script only). `--source mock` gets a matching
+  interface via `_build_mock_display_frame()` (synthetic canvas) so the
+  same window/keypress flow works for both sources. When `--record` is
+  omitted, behavior is unchanged (no window, immediate loop).
+  `wrench_source.read()` → `read_all()`.
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` — Phase 2
+  switched `read()` → `read_all()`, computes the same sin-model
+  theta/force via the shared helper, and passes the 3 new fields to
+  `recorder.record()`. No UI change — reference capture is still a single
+  instant (no settle), since there's no interactive gating point on the
+  robot path to attach one to.
+- `scripts/run_pose_tracking_preview.py` — `RunRecorder` construction
+  gains `metadata["sin_model_config"]` (reads the same
+  `force_sensor.debug_sin_model` config), for parity with the human
+  script's metadata.
+- `tests/test_recorder.py` — 7 new tests (schema v3, `load_cell_wrench_tared`,
+  the two sin-model fields, `None` defaults, `sin_model_theta_rad()`
+  matching `rotation_magnitude`/`angle_diff_rpy` per axis). 226 tests total.
+- `docs/data_recording_conventions.md` — schema recap bumped to v3, new §6
+  subsection for the tared/sin-model fields (flagged experimental).
+- `docs/gravity_comp_recording_plan.md` — marked IMPLEMENTED; §4 (the
+  anomaly) got a resolution note (see Key findings below) and §6's
+  checklist items marked done/explained.
+- `CLAUDE.md` — new Current Status bullet, Session Roadmap entry, File
+  Structure comments, Open Design Questions moved to Resolved, test count
+  219→226.
+
+### Decisions made by the user (binding, don't relitigate)
+
+- Object-vs-target `angle_diff_rpy` (already in schema) was judged
+  sufficient for "the change between them" — no new position-delta field
+  was added.
+- The `'r'`-to-start UI is `record_human_trial.py` only;
+  `sdk_pose_tracking.py`'s robot recording still starts automatically at
+  the top of Phase 2.
+- Schema-field parity (the 3 new fields, no UI) WAS extended to
+  `sdk_pose_tracking.py`/`run_pose_tracking_preview.py` — user explicitly
+  wants robot and human pickles fully comparable.
+- The `docs/gravity_comp_recording_plan.md` §4 anomaly (sin-model force
+  reading backwards at "startup") was **NOT independently re-diagnosed**.
+  Per the user: it worked correctly before, attributed to the reference
+  needing a few frames to settle — addressed via
+  `reference_settle_frames` rather than re-running `gravity_comp_debug.py`
+  to distinguish the two hypotheses that doc had flagged. If the anomaly
+  recurs with the settle in place, revisit hypothesis (b) (`solvePnP`
+  instability for near-head-on tilt rotations) specifically — see that
+  doc's §4 resolution note.
+
+### Key findings
+
+- **Pre-existing, unrelated environment issue found while test-running
+  this session's changes — flagging for whoever next attempts robot-side
+  recording (`sdk_pose_tracking.py`/`run_pose_tracking_preview.py`):**
+  `pytest tests/test_sdk_transport.py` (and everything that shares its
+  `robot.connect()` fixture: `test_grasp_demo_safety.py`,
+  `test_pose_tracking_contact_loss.py`) fails on **this machine** with
+  ```
+  RuntimeError: input stream error
+  ```
+  raised from `g1_inspire_sdk/_ik/ik.py`'s `G1_29_ArmIK.load_cache()` (a
+  `pickle.load()` on `g1_inspire_sdk/_ik/g1_29_model_cache.pkl`). Confirmed
+  via `git stash` that this reproduces identically on the fully unmodified
+  codebase — **nothing in this session's changes caused or touches it**.
+  Root cause, evidenced not guessed: that cache file is a Pinocchio
+  `robot.model`/`reduced_robot.model` pair, and Pinocchio's pickling of
+  those routes through Boost's C++ serialization
+  (`boost::archive`), whose *binary* archives are not portable across
+  compilers/platforms — "input stream error" is literally
+  `boost::archive`'s own error string for a binary stream it can't parse,
+  not a generic "file corrupted" message. `git log` on the vendored SDK
+  clone (`~/g1_inspire_sdk`) shows this exact file was committed as part
+  of `019e942 Initial commit: g1_inspire_sdk` — i.e. it shipped as a
+  pre-built asset with the SDK, most plausibly built on a Linux machine
+  (the SDK's live-hardware tier — CycloneDDS, `unitree_sdk2py` — targets
+  Linux, and this is very likely the actual robot's own compute
+  environment), not generated on this Windows dev machine. This is
+  consistent with the failure mode.
+  - **Does NOT affect `record_human_trial.py`** (human trials) — that
+    script is perception-only and never imports/instantiates
+    `G1InspireRobot`/`G1Arm`/`G1_29_ArmIK` at all. Confirmed by reading its
+    full import list; there is no code path there that could hit this.
+  - **Would affect the robot recording path** — `robot.connect()`
+    (`G1InspireRobot`) calls `G1Arm.connect()`, which unconditionally
+    constructs `G1_29_ArmIK(...)` (even though our own code never calls
+    the SDK's IK solve — we use `G1HandIK` per the Hard Rules; the SDK
+    still builds that object as part of its own connect() plumbing). So
+    this would block `robot.connect()` for BOTH `run_pose_tracking_preview.py`
+    (dry-run) and any live SDK-6 bringup on this machine, before Phase 1
+    even starts — not something this session's recorder/schema work
+    touches, but worth fixing before attempting robot-side `--record`
+    runs.
+  - **Likely fix (not attempted — user asked to defer, human record path
+    works fine as-is right now):** delete
+    `~/g1_inspire_sdk/g1_inspire_sdk/_ik/g1_29_model_cache.pkl` on this
+    machine. `G1_29_ArmIK.__init__` only takes the `load_cache()` branch
+    `if os.path.exists(self.cache_path)`; otherwise it builds the model
+    fresh from the bundled URDF and calls `save_cache()` itself
+    (`_ik/ik.py:55-57,124-126`) — a fresh build should succeed since our
+    own separate `G1HandIK` already builds successfully from a similar
+    URDF on this same machine's Pinocchio install. This is outside our
+    repo (`~/g1_inspire_sdk`); per the External SDK policy we `git pull`
+    that clone rather than edit its source, but deleting a regenerable
+    cache artifact (not source code) is a different kind of action — still
+    worth confirming with the user before doing it, since it's a one-way
+    delete of a committed file in that clone.
+  - Not confirmed by a bare (non-pytest) `robot.connect()` repro on this
+    machine — only confirmed via `pytest`, both scoped to
+    `test_sdk_transport.py` alone and via `git stash` on the clean
+    codebase. Nothing pytest-specific about a plain file-open-and-unpickle
+    call, so a bare script repro is expected to fail identically, but
+    wasn't directly executed this session (user asked to stop
+    investigating and just document).
+- Confirmed (via `--source mock --record --no-force-sensor --duration 2`
+  under a `timeout` wrapper) that the new wait-for-`'r'` state actually
+  blocks as designed: the process printed setup messages, reached "Press
+  'r' to start recording," then hung until killed — and `data/runs/`
+  didn't even exist afterward, confirming `recorder.save()` correctly
+  never ran because recording never started.
+
+### Out of scope / open
+
+- The vendored-SDK IK-cache issue above — deferred to whenever robot-side
+  `--record` runs are next attempted. Human-trial recording is unaffected
+  and works today.
+- Full interactive walkthrough of `record_human_trial.py`'s new `'r'`/`'q'`
+  keypress flow with a real camera and real key presses — not done this
+  session (only argparse/import/mock-headless-path smoke tests were run;
+  see Key findings). Recommend a human-run smoke test with `--source
+  realsense` and two real AprilTag markers before trusting a real trial's
+  output.
+- `sdk_pose_tracking.py`'s reference capture has no multi-frame settle
+  (unlike `record_human_trial.py`'s new one) — deliberate, since there's no
+  interactive gating point on the robot path to attach one to. If the
+  sin-model anomaly shows up on a robot-side recording too, this is the
+  first place to look.
+
+### Things not modified
+
+- `~/g1_inspire_sdk` — SDK not modified (including the stale IK cache
+  file — flagged above, not deleted).
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights — unchanged.
+- `scripts/gravity_comp_debug.py` — untouched; kept its own historical
+  copy of the axis/theta logic rather than being refactored onto the new
+  shared helper.
+
+## Plotting tool follow-ups
+
+### What was done
+
+User asked to plot the pickle files being produced by the newly-completed
+recording pipeline (both real trials: `human_run_20260822_143538_...` and
+`human_run_20260822_144944_...`, both `--source realsense`). New
+`scripts/plot_recorded_run.py`: loads a `.pkl` (default: newest under
+`data/runs/` by mtime), saves 6 PNGs per figure group (`positions.png`,
+`angle_diff_rpy.png`, `angular_velocity.png`, `load_cell_wrench.png`,
+`sin_model.png`, `reprojection_error.png`), plus `theta.png` only when at
+least one sample has non-`None` theta (robot-only field — correctly
+skipped, with a printed note, for both human trials). A shared `_series()`
+helper extracts a None-safe `(N,)` array (NaN where a field was `None` that
+sample) so every plot degrades gracefully instead of crashing on a
+partially-`None` field. `--pickle PATH`, `--output-dir DIR`, `--show`.
+
+**Dependency note:** `matplotlib` was NOT actually installed in the
+`g1_inspire_sdk` env, despite a stale claim in this same followups file's
+SDK-1 entry that it was present as a transitive dependency (apparently no
+longer true, or was never quite accurate). Added `matplotlib` to
+`requirements.txt` and installed it directly into the env
+(`pip install matplotlib`, user confirmed first) — pulled in `contourpy`,
+`cycler`, `fonttools`, `kiwisolver`, `pyparsing`, `python-dateutil`, `six`
+as transitive deps.
+
+### Findings from the actual plotted data
+
+Both real trials showed the same pattern, which directly motivated the next
+session's fix (see below): brief, isolated spikes in `angle_diff_rpy`,
+`object_angular_velocity`/`target_angular_velocity` (up to 40-50 rad/s —
+physically implausible for a human), `load_cell_wrench_grav_comp`, and
+`sin_model_theta_rad`/`sin_model_force_corrected` — even during periods the
+torso wasn't being moved. `reprojection_error.png` stayed under ~1.1px
+throughout both trials, including during the spikes — so reprojection error
+does NOT reliably flag these bad reads. `load_cell_wrench.png` showed clean
+raw/tared/grav_comp separation otherwise (working as designed). `sin_model.png`
+showed the sin-model force visibly diverging from tared force (even going
+negative) at the exact same instants as the spikes — a concrete real-world
+instance of the still-unresolved anomaly `docs/gravity_comp_recording_plan.md`
+§4 flagged.
+
+### Out of scope / open
+
+- No fix was implemented this session — purely a visualization/diagnostic
+  tool. The spike pattern it surfaced was fixed in the very next session
+  (see "Marker-pose noise filtering follow-ups" below).
+- `record_human_trial.py`/`sdk_pose_tracking.py`/`recorder.py` — untouched.
+
+### Things not modified
+
+- All recording-pipeline code — this was a read-only analysis tool added
+  on top of already-recorded pickles.
+
+## Marker-pose noise filtering follow-ups
+
+### What was done
+
+Fixed the spike pattern found by the plotting tool above. Root cause
+(confirmed via code read): every consumer of the current marker
+rotation — `RunRecorder.record()`'s pose/angle_diff/angular-velocity
+fields, `GravityCompensator.compensate()`'s `R_torso_current`, and
+`sin_model_theta_rad()` — read straight from the tracker's per-frame
+output with zero filtering, so a single bad `solvePnP` frame propagated
+into all of them simultaneously.
+
+**Files changed:**
+- New `g1_spine_stabilization/perception/pose_filter.py` — `PoseNoiseFilter`:
+  median-of-N then EMA on the (3,) translation; median-of-N then EMA on a
+  quaternion for rotation, with hemisphere-continuity correction (flip sign
+  against the previous FILTERED quaternion before appending to history, so
+  `q`/`-q` — the same physical rotation — aren't treated as a spurious
+  jump), re-normalized before converting back to a matrix. Same
+  median-window/EMA recipe as `trajectory/sources.py`'s `NoiseFilteredSource`,
+  generalized from `(box_center, theta)` to a full SE3 pose.
+- `configs/default.yaml` — new `perception.pose_filter` block (`enabled`,
+  `median_window: 5`, `ema_alpha: 0.3` — same defaults as
+  `trajectory.noise_filter`, same problem class).
+- `scripts/record_human_trial.py` — `_DirectMultiMarkerTracker` gains a
+  `pose_filter_cfg` param; filters `det.pose_in_optical` (one
+  `PoseNoiseFilter` instance per marker id) before deriving `pose_pelvis`
+  via `compose_to_pelvis` and constructing the `MarkerObservation`.
+  `reprojection_error`/`timestamp` stay tied to the raw per-frame
+  detection. `--source mock` unaffected (synthetic, no filter applied).
+  **No changes needed** to the main recording loop, wrench/sin-model
+  computation, or the wait-for-`'r'`/reference-settle logic — they already
+  consume `tracker.get_latest(...)`, which transparently returns filtered
+  poses now.
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` — new
+  `_filtered_marker_obs()` helper (constructs a new `MarkerObservation`
+  with filtered `pose_in_optical`/`pose_in_pelvis`, or returns the input
+  unchanged if there's nothing to filter); two `PoseNoiseFilter` instances
+  created in Phase 2 (`_obj_pose_filter`/`_tgt_pose_filter`); `obj_obs`/
+  `target_obs` filtered immediately after being read from `source`, before
+  `R_torso`/`_sin_model_R_ref`/`recorder.record()` use them.
+  `optical_to_d435_from_config`/`d435_to_pelvis_from_pinocchio(ik=ik)`
+  computed once near the top of `run_pose_tracking_sdk` (reuses the
+  already-loaded `ik`, no Pinocchio re-instantiation cost).
+- `docs/data_recording_conventions.md` — new §7 explaining the filter, the
+  frame-invariance rationale for filtering only in optical frame, and that
+  `object_pose`/`target_pose` (and derived fields) are no longer strictly
+  raw per-frame detections; updated §1's field descriptions accordingly.
+- `tests/test_pose_filter.py` — 7 new hardware-free tests (median rejects
+  a position/rotation outlier, quaternion hemisphere continuity across a
+  sign flip, EMA reduces jitter variance, output is always a valid
+  rotation matrix, `median_window=1`/`ema_alpha=1.0` is identity
+  passthrough, constructor validation). 233 tests total.
+- `CLAUDE.md` — Current Status, Session Roadmap, File Structure, test
+  count updated; also backfilled a missing `CLAUDE.md` entry for the
+  previous (plotting tool) session, which had been skipped.
+
+**Key design point (verified against actual code, not assumed):**
+`GravityCompensator.compensate()`'s own docstring states the relative
+rotation `R_cur.T @ R_ref` is invariant to which fixed frame it's expressed
+in (optical vs. pelvis give the same answer) — but that invariance only
+holds because `compose_to_pelvis` is a single fixed linear
+left-multiplication. Median-of-N is a nonlinear, order-statistics
+operation and is NOT equivariant under an arbitrary rotation (only EMA
+is) — so filtering translation/rotation independently in both optical AND
+pelvis frame would silently give two different, inconsistent answers.
+Filtering `pose_in_optical` exactly once, then re-deriving `pose_in_pelvis`
+from the filtered value via the existing `compose_to_pelvis`, is what lets
+one change clean up every consumer (recorded pose fields, F/T gravity-comp,
+sin-model theta) consistently — no changes needed to `recorder.py` at all.
+
+**Confirmed NOT double-filtering the robot's live arm-control path:**
+`MarkerSource.step()`'s `last_obj_obs`/`last_tgt_obs` are set directly from
+the tracker's raw detections, NOT from the `(box_center, theta)` value that
+`NoiseFilteredSource`/`RateLimitedSource` wrap — so `obj_obs`/`target_obs`
+were already an independent, unfiltered signal path before this fix, and
+this fix only touches that path (used for recording), never `box_center`/
+`theta` (used for the actual IK/arm-motion target).
+
+### User's confirmed decisions (binding)
+
+1. Apply to both `record_human_trial.py` and `sdk_pose_tracking.py` (parity).
+2. Smooth the recorded pose/`angle_diff_rpy`/angular-velocity fields too,
+   not just the F/T/sin-model inputs — meaning `object_pose`/`target_pose`
+   are no longer strictly raw per-frame detections once this ships (no
+   dual raw+filtered fields were requested).
+3. Median-of-N then EMA (not a rate-of-change-rejection/hold approach).
+
+### Out of scope / open
+
+- Could not fully exercise the robot-path wiring end-to-end
+  (`run_pose_tracking_preview.py --source mock --record`) — it hit the
+  SAME pre-existing vendored-SDK IK-cache issue documented in the
+  "Gravity-comp recording promotion follow-ups" entry above
+  (`RuntimeError: input stream error` in `G1_29_ArmIK.load_cache()`,
+  before Phase 2 / this fix's code ever runs). Confirmed the code up to
+  that point (rate limiter, recorder construction, ForceTorque connect)
+  runs cleanly; `sdk_pose_tracking.py` imports without error and
+  `run_pose_tracking_sdk`'s `_filtered_marker_obs` helper is present.
+  Full verification of this path is blocked on the same cache fix noted
+  previously — still deferred, human's call on timing.
+- Did verify `record_human_trial.py --source realsense --dry-run --record`
+  reaches the wait-for-`'r'` state cleanly with the new
+  `_DirectMultiMarkerTracker(pose_filter_cfg=...)` construction (synthetic
+  frames, so the actual `.filter()` call inside `step()`'s marker-found
+  branch wasn't exercised live — covered directly by the `test_pose_filter.py`
+  unit tests instead).
+- Retuning `median_window`/`ema_alpha` against the two real trials' actual
+  noise characteristics was not attempted — kept the same starting
+  defaults as `trajectory.noise_filter`. A live re-recording (per the
+  Verification section in the approved plan) is needed to confirm the fix
+  actually eliminates the spikes in practice.
+
+### Things not modified
+
+- `data_recording/recorder.py`, `sensors/force_torque.py` — untouched (the
+  fix works entirely by cleaning the input before either ever sees it).
+- `trajectory/sources.py` (`NoiseFilteredSource`/`RateLimitedSource`) — untouched;
+  the robot's live arm-control filtering stack is unrelated to and
+  unaffected by this fix.
+- `~/g1_inspire_sdk` — SDK not modified (including the still-stale IK
+  cache file).
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights — unchanged.
+
+## Gravity-comp method swap follow-ups
+
+### What was investigated
+
+User noticed, plotting a real trial (torso rolled and brought back), that
+`load_cell_wrench_grav_comp` read a *higher* force magnitude than
+`load_cell_wrench_tared` during the roll — backwards from expectation,
+since the orientation-aware correction should track closer to zero than
+the orientation-blind tare, not further from it. Investigated
+quantitatively against the actual recorded pickle (not just re-reading
+code):
+
+- Confirmed the anomaly persists in "clean" (non-glitch, plausible
+  angular-velocity) samples, not just noise-contaminated ones:
+  `corr(theta, |grav_comp|-|tared|) ≈ 0.87` across a whole clean trial.
+- Re-derived `GravityCompensator.compensate()`'s formula from rigid-body
+  kinematics first principles, twice independently — both landed exactly
+  on the code's existing formula (`M @ (R_cur.T @ R_ref) @ M.T @ F0`),
+  suggesting the rotation order is likely correct under this codebase's
+  established SE3 conventions.
+- Directly tested all 4 possible rotation-order/transpose combinations
+  against real data, with `M` left at identity: RMS force error ranged
+  6.09N-10.09N depending on order, vs. 6.79N for plain `tared` and **7.92N
+  for the current code's exact combination — worse than doing nothing**.
+  Two of the four alternate orders beat plain `tared`; two (including the
+  current one) didn't.
+- Least-squares-fit the best possible `marker_to_sensor_rpy` (`M`) against
+  the same data for each of the 4 order variants: **every variant reaches
+  statistically indistinguishable best-case residual (~5.6-5.7N) at some
+  non-identity `M`**, and multiple random restarts per variant converge to
+  wildly different rotation vectors (93°-283° apart) with the same
+  residual. Conclusion: this trial's largely single-axis (roll) motion
+  cannot separate "the rotation order in the code is wrong" from "the
+  mounting offset (`M`) is uncalibrated" — both remain genuinely
+  confounded in this dataset; a multi-axis calibration trial would be
+  needed to actually distinguish them.
+- `sin_model_force_corrected` (the experimental magnitude-only curve fit)
+  visually tracked closer to zero on the same trial. Explained why this
+  isn't strong evidence the underlying 3D physics is right: it's a
+  single-parameter (`reference_force_n=7.5N`, fit from one 90°-rotation
+  data point) curve fit directly against `tared`'s own magnitude-vs-theta
+  trend, so subtracting it from that same trend is close to guaranteed to
+  look flat, regardless of whether the model generalizes to a different
+  axis/mounting/range. Also pointed out (from the user's own pasted graph)
+  that `sin_model_force_corrected` swings to a large negative excursion
+  (~-3N) during the exact same brief camera-glitch spike visible in
+  `theta` — a real compensator shouldn't react that violently to one bad
+  frame, which is itself evidence against "sin-model is working correctly
+  as intended," even though it happens to track the smooth part of the
+  trial's trend well.
+
+### User's decision (explicit, final, after this investigation)
+
+Use the sin-model correction as the primary method behind the recorded
+`load_cell_wrench_grav_comp` field, overriding the technical reservations
+raised above (magnitude-only, fit-to-symptom-not-cause, fragile to noise,
+loses torque/direction information). Implemented as directed.
+
+### What was done
+
+- `g1_spine_stabilization/data_recording/recorder.py` — new
+  `sin_model_wrench(tared_wrench, sin_model_force_corrected)`: builds a
+  `(6,)` wrench from `tared`'s own force *direction* rescaled to
+  `sin_model_force_corrected`'s magnitude (sign-preserving — a negative
+  correction flips direction rather than clamping), with torque copied
+  from `tared` unchanged (the sin-model has no torque information).
+- `scripts/record_human_trial.py` and
+  `controllers/sdk_pose_tracking.py` — both now build
+  `load_cell_wrench_grav_comp` via `sin_model_wrench()` instead of
+  forwarding `wrench_source.read_all()`'s 3rd return value (the rotation-
+  matrix result). `read_all()` itself, `GravityCompensator`, and
+  `scripts/gravity_comp_debug.py` are **unchanged** — the rotation-matrix
+  method is still computed (discarded at the two recording call sites,
+  still used by the debug tool and available for future recalibration).
+- `metadata["sin_model_config"]["status"]` changed from
+  `"experimental_unvalidated"` to `"primary_grav_comp_method"` in both
+  `record_human_trial.py` and `run_pose_tracking_preview.py`.
+- Docs updated for the new field semantics and to flag that
+  `norm(load_cell_wrench_grav_comp[:3])` now reports
+  `abs(sin_model_force_corrected)`, losing sign-flip information: `configs/
+  default.yaml` (`gravity_comp`/`debug_sin_model` comments),
+  `sensors/force_torque.py`'s `sin_model_gravity_residual()` docstring,
+  `docs/data_recording_conventions.md` §6, `docs/gravity_comp_recording_
+  plan.md` (new policy-change banner), `CLAUDE.md`.
+- `tests/test_recorder.py` — 5 new tests for `sin_model_wrench()`
+  (magnitude matches, direction preserved/flipped by sign, torque
+  passthrough, no divide-by-zero at near-zero tared force). 238 tests
+  total.
+- Verified against real data without a new hardware trial: the two
+  existing post-pose-filter pickles (`human_run_20260822_152723_...`,
+  `human_run_20260822_153047_...`) already contain `load_cell_wrench_
+  tared`/`sin_model_force_corrected` (recorded before this code change),
+  so reconstructing `sin_model_wrench(sample.load_cell_wrench_tared,
+  sample.sin_model_force_corrected)` per-sample and comparing against the
+  old stored `load_cell_wrench_grav_comp` confirmed the new method comes
+  out smaller (closer to zero) than both `tared` and the old rotation-
+  matrix method on both trials.
+
+### Out of scope / open
+
+- The underlying calibration question (order vs. `M` vs. both) from the
+  investigation is **not resolved** — this session changed which value is
+  *recorded*, not the rotation-matrix method's own correctness. A proper
+  fix would still need a multi-axis calibration trial if that method is
+  ever revisited.
+- Existing pickles recorded before this change (`143538`, `144944`,
+  `152723`, `153047`) still have the OLD rotation-matrix `load_cell_
+  wrench_grav_comp` baked in — not retroactively rewritten (their
+  `load_cell_wrench_tared`/`sin_model_force_corrected` fields are
+  unaffected and can be used to reconstruct what the new value would have
+  been, as done for verification above, if ever needed).
+- No new hardware trial was recorded this session to see the new field
+  live end-to-end (`plot_recorded_run.py` against a freshly-recorded
+  pickle) — verification was via reconstruction from already-recorded
+  fields on two existing trials instead.
+
+### Things not modified
+
+- `sensors/force_torque.py`'s `GravityCompensator` class itself (`compensate()`/
+  `tare()`/`set_reference()`) — untouched; still fully functional, just no
+  longer wired into the recorded schema field.
+- `scripts/gravity_comp_debug.py` — untouched; still shows all three
+  (tared/rotation-matrix grav_comp/sin_model_force) side by side live.
+- `~/g1_inspire_sdk`, `assets/g1_with_hands.urdf`, EE frame defs,
+  shoulder_roll bounds, IK cost weights — unchanged.
+

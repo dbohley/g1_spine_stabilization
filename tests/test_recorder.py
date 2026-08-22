@@ -17,6 +17,8 @@ from g1_spine_stabilization.data_recording.recorder import (
     angular_velocity_rotvec,
     default_run_path,
     rotation_magnitude,
+    sin_model_theta_rad,
+    sin_model_wrench,
 )
 from g1_spine_stabilization.perception.types import MarkerObservation
 
@@ -106,6 +108,62 @@ def test_angle_diff_rpy_argument_order_is_not_a_sign_flip():
     np.testing.assert_allclose(
         backward, Rotation.from_matrix(R_b.T @ R_a).as_euler('xyz'), atol=1e-9
     )
+
+
+# ---------------------------------------------------------------------
+# sin_model_theta_rad (EXPERIMENTAL -- see docs/gravity_comp_recording_plan.md)
+# ---------------------------------------------------------------------
+
+def test_sin_model_theta_rad_magnitude_axis_matches_rotation_magnitude():
+    R_reference = np.eye(3)
+    R_current = Rotation.from_euler('xyz', [0.2, 0.4, -0.3]).as_matrix()
+    assert sin_model_theta_rad("magnitude", R_reference, R_current) == pytest.approx(
+        rotation_magnitude(R_reference, R_current)
+    )
+
+
+@pytest.mark.parametrize("axis,index", [("roll", 0), ("pitch", 1), ("yaw", 2)])
+def test_sin_model_theta_rad_rpy_axis_matches_angle_diff_component(axis, index):
+    R_reference = Rotation.from_euler('xyz', [0.1, -0.2, 0.3]).as_matrix()
+    R_current = Rotation.from_euler('xyz', [0.5, 0.4, -0.6]).as_matrix()
+    expected = angle_diff_rpy(R_reference, R_current)[index]
+    assert sin_model_theta_rad(axis, R_reference, R_current) == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------
+# sin_model_wrench (promoted to the primary load_cell_wrench_grav_comp
+# method -- see docs/gravity_comp_recording_plan.md)
+# ---------------------------------------------------------------------
+
+def test_sin_model_wrench_magnitude_matches_corrected_force():
+    tared = np.array([3.0, 4.0, 0.0, 0.1, 0.2, 0.3])  # force magnitude 5.0
+    out = sin_model_wrench(tared, sin_model_force_corrected=2.5)
+    assert np.linalg.norm(out[:3]) == pytest.approx(2.5)
+
+
+def test_sin_model_wrench_keeps_tared_direction_for_positive_correction():
+    tared = np.array([3.0, 4.0, 0.0, 0.0, 0.0, 0.0])
+    out = sin_model_wrench(tared, sin_model_force_corrected=10.0)
+    np.testing.assert_allclose(out[:3] / np.linalg.norm(out[:3]), tared[:3] / np.linalg.norm(tared[:3]))
+
+
+def test_sin_model_wrench_flips_direction_for_negative_correction():
+    tared = np.array([3.0, 4.0, 0.0, 0.0, 0.0, 0.0])
+    out = sin_model_wrench(tared, sin_model_force_corrected=-2.0)
+    np.testing.assert_allclose(out[:3] / np.linalg.norm(out[:3]), -tared[:3] / np.linalg.norm(tared[:3]))
+    assert np.linalg.norm(out[:3]) == pytest.approx(2.0)
+
+
+def test_sin_model_wrench_torque_passes_through_from_tared_unchanged():
+    tared = np.array([3.0, 4.0, 0.0, 0.11, -0.22, 0.33])
+    out = sin_model_wrench(tared, sin_model_force_corrected=1.0)
+    np.testing.assert_allclose(out[3:], tared[3:])
+
+
+def test_sin_model_wrench_near_zero_tared_force_does_not_divide_by_zero():
+    tared = np.array([1e-12, -1e-12, 0.0, 0.05, 0.0, 0.0])
+    out = sin_model_wrench(tared, sin_model_force_corrected=3.0)
+    assert np.all(np.isfinite(out))
 
 
 # ---------------------------------------------------------------------
@@ -205,8 +263,31 @@ def test_recorder_stores_both_wrench_fields():
     np.testing.assert_allclose(sample.load_cell_wrench_grav_comp, comp)
 
 
-def test_recorder_schema_version_is_2():
-    assert RunRecorder.SCHEMA_VERSION == 2
+def test_recorder_schema_version_is_3():
+    assert RunRecorder.SCHEMA_VERSION == 3
+
+
+def test_recorder_stores_load_cell_wrench_tared():
+    rec = RunRecorder(origin="human", source_label="mock", output_path="unused.pkl")
+    tared = np.array([1.0, 2.0, 3.0, 0.1, 0.2, 0.3])
+    sample = rec.record(t=0.0, object_obs=None, target_obs=None, load_cell_wrench_tared=tared)
+    np.testing.assert_allclose(sample.load_cell_wrench_tared, tared)
+
+
+def test_recorder_stores_sin_model_fields():
+    rec = RunRecorder(origin="human", source_label="mock", output_path="unused.pkl")
+    sample = rec.record(t=0.0, object_obs=None, target_obs=None,
+                        sin_model_theta_rad=0.5, sin_model_force_corrected=-2.3)
+    assert sample.sin_model_theta_rad == pytest.approx(0.5)
+    assert sample.sin_model_force_corrected == pytest.approx(-2.3)
+
+
+def test_recorder_new_wrench_and_sin_model_fields_default_none():
+    rec = RunRecorder(origin="human", source_label="mock", output_path="unused.pkl")
+    sample = rec.record(t=0.0, object_obs=None, target_obs=None)
+    assert sample.load_cell_wrench_tared is None
+    assert sample.sin_model_theta_rad is None
+    assert sample.sin_model_force_corrected is None
 
 
 def test_recorder_angle_diff_only_when_both_markers_present():
@@ -252,9 +333,12 @@ def test_recorder_pickle_round_trip(tmp_path):
                    pos=(0.4, 0.0, 0.3), timestamp=0.0)
     wrench_raw = np.array([1.0, -2.0, 3.0, 0.1, -0.2, 0.3])
     wrench_comp = np.array([0.4, -0.5, 0.6, 0.01, -0.02, 0.03])
+    wrench_tared = np.array([0.6, -0.7, 0.8, 0.02, -0.03, 0.04])
     rec.record(t=0.0, object_obs=None, target_obs=None)
     rec.record(t=0.02, object_obs=obj_obs, target_obs=tgt_obs,
-               load_cell_wrench_raw=wrench_raw, load_cell_wrench_grav_comp=wrench_comp)
+               load_cell_wrench_raw=wrench_raw, load_cell_wrench_grav_comp=wrench_comp,
+               load_cell_wrench_tared=wrench_tared,
+               sin_model_theta_rad=0.42, sin_model_force_corrected=-1.5)
     rec.save()
 
     with open(out_path, "rb") as f:
@@ -283,6 +367,9 @@ def test_recorder_pickle_round_trip(tmp_path):
     assert s0.load_cell_wrench_raw is None
     np.testing.assert_allclose(s1.load_cell_wrench_raw, wrench_raw)
     np.testing.assert_allclose(s1.load_cell_wrench_grav_comp, wrench_comp)
+    np.testing.assert_allclose(s1.load_cell_wrench_tared, wrench_tared)
+    assert s1.sin_model_theta_rad == pytest.approx(0.42)
+    assert s1.sin_model_force_corrected == pytest.approx(-1.5)
 
 
 def test_recorder_save_is_idempotent(tmp_path):

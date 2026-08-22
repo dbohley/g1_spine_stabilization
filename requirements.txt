@@ -5,3 +5,4 @@ pytest
 coppeliasim-zmqremoteapi-client
 casadi
 opencv-contrib-python
+matplotlib

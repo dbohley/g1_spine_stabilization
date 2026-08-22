@@ -50,6 +50,15 @@ from g1_spine_stabilization.controllers.palm_force import (
     PalmContactWatchdog,
     PalmForceController,
 )
+from g1_spine_stabilization.data_recording.recorder import (
+    sin_model_theta_rad, sin_model_wrench, VALID_SIN_MODEL_AXES,
+)
+from g1_spine_stabilization.perception.frames import (
+    optical_to_d435_from_config, d435_to_pelvis_from_pinocchio, compose_to_pelvis,
+)
+from g1_spine_stabilization.perception.pose_filter import PoseNoiseFilter
+from g1_spine_stabilization.perception.types import MarkerObservation
+from g1_spine_stabilization.sensors.force_torque import sin_model_gravity_residual
 from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep
 from g1_spine_stabilization.trajectory.targets import (
     compute_hand_targets,
@@ -111,6 +120,25 @@ def _obs_rotation(obs):
     if pose_opt is not None:
         return pose_opt[:3, :3]
     return obs.pose_in_pelvis[:3, :3]
+
+
+def _filtered_marker_obs(pose_filter, obs, T_opt_to_d435, T_d435_to_pelvis):
+    """Return a new MarkerObservation with pose_in_optical/pose_in_pelvis
+    replaced by the PoseNoiseFilter-smoothed versions, or `obs` unchanged if
+    there's nothing to filter (obs is None, pose_filter is None, or
+    pose_in_optical isn't populated). Mirrors record_human_trial.py's
+    _DirectMultiMarkerTracker -- filters pose_in_optical (the primitive
+    reading) once, then re-derives pose_in_pelvis via compose_to_pelvis, per
+    perception/pose_filter.py's frame-invariance rationale."""
+    if pose_filter is None or obs is None or obs.pose_in_optical is None:
+        return obs
+    filtered_optical = pose_filter.filter(obs.pose_in_optical)
+    filtered_pelvis = compose_to_pelvis(filtered_optical, T_opt_to_d435, T_d435_to_pelvis)
+    return MarkerObservation(
+        marker_id=obs.marker_id, pose_in_pelvis=filtered_pelvis,
+        timestamp=obs.timestamp, reprojection_error=obs.reprojection_error,
+        pose_in_optical=filtered_optical,
+    )
 
 
 def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=None):
@@ -238,16 +266,49 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                          recording entirely.
         wrench_source:   optional ForceTorqueSource (sensors.force_torque). If provided
                          (only meaningful alongside recorder), capture_reference() runs
-                         once at the top of Phase 2 and read() runs each iteration to
-                         supply the raw + gravity-cancelled F/T wrench to recorder.record().
-                         The caller owns its lifecycle (close() in a finally). None = no
-                         force data recorded.
+                         once at the top of Phase 2 and read_all() runs each iteration to
+                         supply raw/tared to recorder.record(). load_cell_wrench_grav_comp
+                         is built via data_recording.recorder's sin_model_wrench() (tared's
+                         force direction, rescaled to the sin-model-corrected magnitude;
+                         torque unchanged from tared) -- promoted to the primary method
+                         after GravityCompensator.compensate()'s rotation-matrix reprojection
+                         measured worse than no correction at all on real trial data (see
+                         docs/gravity_comp_recording_plan.md); that method's 3-tuple return
+                         from read_all() is still computed but no longer recorded. Schema
+                         parity with scripts/record_human_trial.py. The caller owns its lifecycle
+                         (close() in a finally). None = no force data recorded.
     """
     control_dt         = cfg["control"]["dt"]
     interpolation_time = cfg["control"]["interpolation_time"]
     if duration is None:
         duration = cfg["control"]["rotation_duration"]
     gravity_comp_enabled = cfg.get("gravity_comp", {}).get("enabled", True)
+
+    # EXPERIMENTAL sin-model gravity-comp force correction, recorded alongside
+    # load_cell_wrench_tared for schema parity with record_human_trial.py --
+    # see docs/gravity_comp_recording_plan.md and configs/default.yaml's
+    # force_sensor.debug_sin_model. Not used by any control/tracking logic.
+    _sin_model_cfg = cfg.get("force_sensor", {}).get("debug_sin_model", {})
+    sin_model_ref_force_n = _sin_model_cfg.get("reference_force_n", 7.5)
+    sin_model_axis = _sin_model_cfg.get("axis", "magnitude")
+    if sin_model_axis not in VALID_SIN_MODEL_AXES:
+        raise ValueError(
+            f"force_sensor.debug_sin_model.axis={sin_model_axis!r} must be one "
+            f"of {sorted(VALID_SIN_MODEL_AXES)}"
+        )
+
+    # Marker-pose noise filtering (median-of-N then EMA, perception/
+    # pose_filter.py) -- schema parity with record_human_trial.py's
+    # _DirectMultiMarkerTracker. Cleans obj_obs/target_obs (used for
+    # recorder.record()/R_torso/sin-model theta) ONLY -- does NOT touch
+    # source.step()'s box_center/theta (the actual arm IK target), which is
+    # computed via a separate, already-filtered path (trajectory.rate_limit/
+    # noise_filter). See docs/data_recording_conventions.md.
+    _pose_filter_cfg = cfg.get("perception", {}).get("pose_filter", {})
+    pose_filter_enabled = _pose_filter_cfg.get("enabled", True)
+    if pose_filter_enabled:
+        _T_opt_to_d435 = optical_to_d435_from_config(cfg["perception"]["d435_link_to_optical"])
+        _T_d435_to_pelvis = d435_to_pelvis_from_pinocchio(ik=ik)
 
     grip_cfg     = cfg.get("grip_force", {})
     grip_enabled = grip_cfg.get("enabled", True)
@@ -446,6 +507,19 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         _obj_lost_warned = False
         _contact_lost_warned = False
         _wrench_ref_captured = False
+        _sin_model_R_ref = None
+        _obj_pose_filter = (
+            PoseNoiseFilter(
+                median_window=_pose_filter_cfg.get("median_window", 5),
+                ema_alpha=_pose_filter_cfg.get("ema_alpha", 0.3),
+            ) if pose_filter_enabled else None
+        )
+        _tgt_pose_filter = (
+            PoseNoiseFilter(
+                median_window=_pose_filter_cfg.get("median_window", 5),
+                ema_alpha=_pose_filter_cfg.get("ema_alpha", 0.3),
+            ) if pose_filter_enabled else None
+        )
         if recorder is not None:
             recorder.start()
         try:
@@ -461,17 +535,37 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
 
                 obj_obs = getattr(source, 'last_obj_obs', None)
                 target_obs = getattr(source, 'last_tgt_obs', None)
+                if pose_filter_enabled:
+                    obj_obs = _filtered_marker_obs(_obj_pose_filter, obj_obs, _T_opt_to_d435, _T_d435_to_pelvis)
+                    target_obs = _filtered_marker_obs(_tgt_pose_filter, target_obs, _T_opt_to_d435, _T_d435_to_pelvis)
                 R_torso = _obs_rotation(target_obs)
 
                 # F/T sensor: capture the gravity reference on the first step
                 # (now that a target/torso rotation is available), then read
                 # raw + gravity-cancelled wrench each step. No-op if disabled.
-                wrench_raw = wrench_comp = None
+                wrench_raw = wrench_tared = None
+                sin_model_theta = None
+                sin_model_force = None
+                wrench_grav_comp = None
                 if wrench_source is not None:
                     if not _wrench_ref_captured:
                         wrench_source.capture_reference(R_torso)
+                        _sin_model_R_ref = (
+                            target_obs.pose_in_pelvis[:3, :3].copy() if target_obs is not None else None
+                        )
                         _wrench_ref_captured = True
-                    wrench_raw, wrench_comp = wrench_source.read(R_torso)
+                    # 3rd return (rotation-matrix GravityCompensator.compensate())
+                    # is intentionally discarded -- promoted out of the recorded
+                    # schema in favor of sin_model_wrench() below, per project
+                    # decision (see docs/gravity_comp_recording_plan.md).
+                    wrench_raw, wrench_tared, _ = wrench_source.read_all(R_torso)
+                    if wrench_tared is not None and _sin_model_R_ref is not None and target_obs is not None:
+                        sin_model_theta = sin_model_theta_rad(
+                            sin_model_axis, _sin_model_R_ref, target_obs.pose_in_pelvis[:3, :3]
+                        )
+                        residual = sin_model_gravity_residual(sin_model_theta, sin_model_ref_force_n)
+                        sin_model_force = float(np.linalg.norm(wrench_tared[:3])) - residual
+                        wrench_grav_comp = sin_model_wrench(wrench_tared, sin_model_force)
 
                 if recorder is not None:
                     recorder.record(
@@ -480,7 +574,10 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                         target_obs=target_obs,
                         theta=theta,
                         load_cell_wrench_raw=wrench_raw,
-                        load_cell_wrench_grav_comp=wrench_comp,
+                        load_cell_wrench_grav_comp=wrench_grav_comp,
+                        load_cell_wrench_tared=wrench_tared,
+                        sin_model_theta_rad=sin_model_theta,
+                        sin_model_force_corrected=sin_model_force,
                     )
 
                 # Palm-force grip: pick a press DEPTH (position mode) or a press

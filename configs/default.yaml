@@ -77,6 +77,23 @@ perception:
   d435_link_to_optical:
     xyz: [-0.0860, -0.0002, -0.0384] #  xyz: [0.0, 0.0, 0.0] urdf non-calibrated
     rpy: [-1.4118, 0.0076, -1.5896]  #  rpy: [-1.5708, 0.0, -1.5708] urdf non-calibrated
+  # Median-of-N then EMA smoothing (perception/pose_filter.py's
+  # PoseNoiseFilter) applied to each marker's raw pose_in_optical before
+  # ANY consumer sees it -- the recorded object_pose/target_pose/
+  # angle_diff_rpy/angular-velocity fields, the F/T gravity-comp
+  # reprojection, and the sin-model theta all read the same filtered
+  # value. Rejects an occasional single-frame solvePnP misread (observed
+  # in real trials as brief isolated spikes -- up to 40-50 rad/s implied
+  # rotation rate -- even while the torso was held still); does NOT
+  # affect the robot's live arm-control target (compute_hand_targets/IK
+  # reads from a separate, already-filtered signal path). Same
+  # median_window/ema_alpha defaults as trajectory.noise_filter (same
+  # problem class) -- retune against real marker data if needed.
+  # --source mock is synthetic/noiseless and does not use this filter.
+  pose_filter:
+    enabled: true
+    median_window: 5
+    ema_alpha: 0.3
 
 gravity_comp:
   enabled: true  # Runtime Pinocchio inertia correction for 1.0 kg Inspire hands
@@ -138,6 +155,14 @@ data_recording:
   # in data/runs/ without opening a file; the "_{tracking_mode}" segment is
   # omitted when tracking_mode is None, e.g. --source sine.
   filename_template: "{origin}_run_{timestamp}_{source}_{tracking_mode}"
+  # Consecutive fresh TARGET-marker detections required, after 'r' is
+  # pressed in record_human_trial.py, before locking the pose/gravity
+  # reference (used for the sin-model theta AND the instant
+  # wrench_source.capture_reference() is called). A single-frame capture
+  # previously produced a spurious "startup" sin-model reading; per-user
+  # direction this is addressed by settling over a few frames rather than
+  # re-diagnosed -- see docs/gravity_comp_recording_plan.md.
+  reference_settle_frames: 5
 
 force_sensor:
   # ATI Axia80-M20 6-axis F/T sensor (Ethernet, RDT-over-UDP). Read during
@@ -157,9 +182,17 @@ force_sensor:
   connect_timeout: 3.0     # s to wait for the first packet before warning + degrading to None
   baseline_frames: 50      # at-rest frames averaged at startup for the gravity reference (~1s)
   gravity_comp:
-    # Second wrench field. FORCE channels are cancelled orientation-aware (the
-    # startup gravity reading rotated by the target/torso marker as the torso
-    # tilts); TORQUE channels are tared (exact at the reference pose). Raw is
+    # Controls GravityCompensator.compensate()'s rotation-matrix reprojection
+    # (FORCE channels cancelled orientation-aware -- the startup gravity
+    # reading rotated by the target/torso marker as the torso tilts; TORQUE
+    # channels tared, exact at the reference pose). NOTE: this method is
+    # still computed by read_all() but is NO LONGER what's recorded into the
+    # pickle's load_cell_wrench_grav_comp field -- that field is now built
+    # from the sin-model correction instead (recorder.py's sin_model_wrench()),
+    # promoted after this rotation-matrix method measured worse than no
+    # correction at all on real trial data. See
+    # docs/gravity_comp_recording_plan.md. This method remains available via
+    # gravity_comp_debug.py for comparison/future calibration work. Raw is
     # always stored alongside regardless. See docs/data_recording_conventions.md.
     #
     # NOTE: `enabled` below controls ONLY the orientation-aware reprojection
@@ -174,17 +207,22 @@ force_sensor:
     # (rpy radians, fixed-axis). Default identity assumes the torso marker is
     # mounted axis-aligned with the sensor -- calibrate if it isn't. PLACEHOLDER.
     marker_to_sensor_rpy: [0.0, 0.0, 0.0]
-  # Experimental alternative to gravity_comp's rotation-matrix reprojection
-  # above, used ONLY by scripts/gravity_comp_debug.py as a third comparison
-  # value -- NOT used by the real recording pipeline (record_human_trial.py /
-  # sdk_pose_tracking.py) and NOT part of GravityCompensator. Models the
-  # orientation-dependent residual visible in wrench_tared as
+  # Alternative to gravity_comp's rotation-matrix reprojection above --
+  # PROMOTED to the primary method behind the recorded load_cell_wrench_
+  # grav_comp field (recorder.py's sin_model_wrench()), after the rotation-
+  # matrix method measured worse than no correction at all against real
+  # trial data (uncalibrated marker_to_sensor_rpy and/or a rotation-order
+  # question a single-axis trial couldn't cleanly separate -- see
+  # docs/gravity_comp_recording_plan.md). Still used by
+  # scripts/gravity_comp_debug.py as a comparison value; sin_model_theta_rad/
+  # sin_model_force_corrected are also recorded as their own fields.
+  # Not part of GravityCompensator's own class. Models the orientation-
+  # dependent residual visible in wrench_tared as
   # reference_force_n * sin(theta_axis). reference_force_n was fit from a
   # SINGLE observed data point (7.5N tared-force reading at a 90-degree torso
   # rotation) -- sin(0)=0 matches tared force being ~0 at the reference pose;
-  # sin(pi/2)=1 recovers reference_force_n at 90 degrees. UNVALIDATED beyond
-  # that one point -- retune reference_force_n if more test rotations show
-  # it's inconsistent.
+  # sin(pi/2)=1 recovers reference_force_n at 90 degrees. Retune
+  # reference_force_n if more test rotations show it's inconsistent.
   debug_sin_model:
     reference_force_n: 7.5   # N -- tared force magnitude observed at a 90-degree torso rotation
     # roll | pitch | yaw | magnitude -- which rotation quantity theta_axis is

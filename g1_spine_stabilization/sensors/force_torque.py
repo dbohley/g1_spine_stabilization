@@ -78,16 +78,19 @@ def rotation_from_rpy(rpy) -> np.ndarray:
 
 
 def sin_model_gravity_residual(theta_rad: float, reference_force_n: float) -> float:
-    """Experimental alternative to GravityCompensator's rotation-matrix
-    reprojection -- debug/comparison use only, see
-    scripts/gravity_comp_debug.py and configs/default.yaml's
-    force_sensor.debug_sin_model. Estimates the orientation-dependent gravity
-    residual left in an already-tared force reading as
-    reference_force_n * sin(theta_rad): fit from a single observed data point
-    (a torso rotation and its tared-force reading), where sin(0)=0 matches
-    tared force being ~0 at the reference pose and sin(pi/2)=1 recovers
-    reference_force_n at a 90-degree rotation. Not part of
-    GravityCompensator -- not used by the real recording pipeline."""
+    """Alternative to GravityCompensator's rotation-matrix reprojection --
+    PROMOTED to the primary method behind the recorded load_cell_wrench_
+    grav_comp field (data_recording/recorder.py's sin_model_wrench()), after
+    the rotation-matrix method measured worse than no correction at all
+    against real trial data; see docs/gravity_comp_recording_plan.md. Also
+    still used by scripts/gravity_comp_debug.py as a comparison value, and
+    configs/default.yaml's force_sensor.debug_sin_model. Estimates the
+    orientation-dependent gravity residual left in an already-tared force
+    reading as reference_force_n * sin(theta_rad): fit from a single
+    observed data point (a torso rotation and its tared-force reading),
+    where sin(0)=0 matches tared force being ~0 at the reference pose and
+    sin(pi/2)=1 recovers reference_force_n at a 90-degree rotation. Not part
+    of GravityCompensator's own class."""
     return reference_force_n * math.sin(theta_rad)
 
 

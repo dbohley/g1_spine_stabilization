@@ -48,7 +48,7 @@ from g1_spine_stabilization.trajectory.sources import (
     SineSource, MarkerSource, RateLimitedSource, NoiseFilteredSource,
 )
 from g1_spine_stabilization.controllers.sdk_pose_tracking import run_pose_tracking_sdk
-from g1_spine_stabilization.data_recording.recorder import RunRecorder
+from g1_spine_stabilization.data_recording.recorder import RunRecorder, VALID_SIN_MODEL_AXES
 from g1_spine_stabilization.sensors.force_torque import ForceTorqueSource
 from g1_spine_stabilization.utils.config import load_config
 
@@ -368,6 +368,14 @@ def main():
             print("[preview] --record was passed but data_recording.enabled=false in "
                   "config -- recording is disabled globally; ignoring --record.")
         else:
+            sin_model_cfg = cfg.get("force_sensor", {}).get("debug_sin_model", {})
+            sin_model_ref_force_n = sin_model_cfg.get("reference_force_n", 7.5)
+            sin_model_axis = sin_model_cfg.get("axis", "magnitude")
+            if sin_model_axis not in VALID_SIN_MODEL_AXES:
+                raise ValueError(
+                    f"force_sensor.debug_sin_model.axis={sin_model_axis!r} must be one "
+                    f"of {sorted(VALID_SIN_MODEL_AXES)}"
+                )
             output_path = None if args.record == "__AUTO__" else args.record
             recorder = RunRecorder(
                 origin="robot",
@@ -378,7 +386,18 @@ def main():
                 filename_template=data_recording_cfg.get("filename_template"),
                 object_marker_id=obj_id,
                 target_marker_id=tgt_id,
-                metadata={"perception": dict(perception)},
+                metadata={
+                    "perception": dict(perception),
+                    # Primary load_cell_wrench_grav_comp method -- see
+                    # docs/gravity_comp_recording_plan.md. Actual per-sample
+                    # computation happens inside controllers/sdk_pose_tracking.py's
+                    # Phase 2.
+                    "sin_model_config": {
+                        "reference_force_n": sin_model_ref_force_n,
+                        "axis": sin_model_axis,
+                        "status": "primary_grav_comp_method",
+                    },
+                },
             )
             if args.source == "sine":
                 print("[preview] WARNING: --record with --source sine has no real "

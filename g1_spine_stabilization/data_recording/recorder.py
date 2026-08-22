@@ -146,6 +146,53 @@ def rotation_magnitude(R_reference: np.ndarray, R_moving: np.ndarray) -> float:
     return float(Rotation.from_matrix(R_reference.T @ R_moving).magnitude())
 
 
+RPY_AXIS_INDEX = {"roll": 0, "pitch": 1, "yaw": 2}
+VALID_SIN_MODEL_AXES = set(RPY_AXIS_INDEX) | {"magnitude"}
+
+
+def sin_model_theta_rad(axis: str, R_reference: np.ndarray, R_current: np.ndarray) -> float:
+    """theta to feed into sensors.force_torque.sin_model_gravity_residual,
+    per force_sensor.debug_sin_model.axis config (one of VALID_SIN_MODEL_AXES).
+
+    EXPERIMENTAL -- see docs/gravity_comp_recording_plan.md. Does not
+    validate `axis` itself (assumes the caller already validated it against
+    VALID_SIN_MODEL_AXES, e.g. at CLI/config-load time) -- an invalid axis
+    raises a plain KeyError here.
+
+    Shared by scripts/record_human_trial.py and
+    controllers/sdk_pose_tracking.py so both compute this identically;
+    scripts/gravity_comp_debug.py keeps its own historical copy of this
+    logic (unmodified) since it predates this helper.
+    """
+    if axis == "magnitude":
+        return rotation_magnitude(R_reference, R_current)
+    return float(angle_diff_rpy(R_reference, R_current)[RPY_AXIS_INDEX[axis]])
+
+
+def sin_model_wrench(tared_wrench: np.ndarray, sin_model_force_corrected: float) -> np.ndarray:
+    """Build a (6,) wrench from the sin-model force correction -- this is
+    what populates load_cell_wrench_grav_comp (promoted from the rotation-
+    matrix GravityCompensator.compensate() method per project decision; see
+    docs/data_recording_conventions.md and docs/gravity_comp_recording_plan.md).
+
+    Force channels: tared_wrench's own force DIRECTION, rescaled to
+    sin_model_force_corrected's magnitude -- sign-preserving, so a negative
+    sin_model_force_corrected flips the direction rather than being clamped.
+    Falls back to the (zero) tared force vector directly if its magnitude is
+    ~0 (nothing to normalize).
+
+    Torque channels: tared_wrench's torque, unchanged -- the sin-model
+    produces no torque information at all, same as the rotation-matrix
+    method's torque handling (always a plain tare, regardless of
+    orientation).
+    """
+    tared_wrench = np.asarray(tared_wrench, dtype=float)
+    force_mag = np.linalg.norm(tared_wrench[:3])
+    direction = tared_wrench[:3] / force_mag if force_mag > 1e-9 else tared_wrench[:3]
+    force = direction * sin_model_force_corrected
+    return np.concatenate([force, tared_wrench[3:]])
+
+
 @dataclass
 class MarkerSample:
     """One recorded instant. Marker-derived fields are None when that
@@ -188,6 +235,22 @@ class MarkerSample:
     #                 docs/data_recording_conventions.md.
     load_cell_wrench_raw: Optional[np.ndarray] = None
     load_cell_wrench_grav_comp: Optional[np.ndarray] = None
+    # Plain GravityCompensator.tare() output -- DC-offset + startup-gravity
+    # subtraction only, orientation-blind (unlike _grav_comp above). Always
+    # populated once a reference exists, independent of gravity_comp.enabled.
+    # See sensors/force_torque.py's ForceTorqueSource.read_all().
+    load_cell_wrench_tared: Optional[np.ndarray] = None
+    # --- EXPERIMENTAL, unvalidated -- see docs/gravity_comp_recording_plan.md ---
+    # theta actually fed into sin_model_gravity_residual() THIS sample (per
+    # force_sensor.debug_sin_model.axis), stored per-sample (not just once in
+    # metadata) since it varies every sample and is needed to audit/reproduce
+    # sin_model_force_corrected below. See this module's sin_model_theta_rad().
+    sin_model_theta_rad: Optional[float] = None
+    # tared force magnitude corrected by reference_force_n * sin(theta) --
+    # scalar only (not a (6,) wrench). Debug/comparison value only, NOT used
+    # by any downstream tracking/control logic. See sensors/force_torque.py's
+    # sin_model_gravity_residual() docstring.
+    sin_model_force_corrected: Optional[float] = None
 
 
 def default_run_path(
@@ -228,7 +291,8 @@ class RunRecorder:
     human-trial script (scripts/record_human_trial.py) -- so a downstream
     comparison analysis can load either file interchangeably.
     """
-    SCHEMA_VERSION = 2   # v2: load_cell_wrench split into _raw + _grav_comp (F/T sensor wired)
+    SCHEMA_VERSION = 3   # v3: added load_cell_wrench_tared + experimental sin-model
+                         # fields (sin_model_theta_rad, sin_model_force_corrected)
 
     def __init__(
         self,
@@ -275,15 +339,22 @@ class RunRecorder:
         wall_time: Optional[float] = None,
         load_cell_wrench_raw: Optional[np.ndarray] = None,
         load_cell_wrench_grav_comp: Optional[np.ndarray] = None,
+        load_cell_wrench_tared: Optional[np.ndarray] = None,
+        sin_model_theta_rad: Optional[float] = None,
+        sin_model_force_corrected: Optional[float] = None,
     ) -> MarkerSample:
         """Compute and append one MarkerSample. Never raises, including
         when object_obs/target_obs is None (stale/lost marker, or a
         non-marker-backed source like SineSource) -- the corresponding
         pose/angle-diff/velocity fields are simply None for that sample.
 
-        load_cell_wrench_raw/_grav_comp: optional (6,) F/T sensor wrenches
-        (see sensors/force_torque.py). Passed through verbatim; None when no
-        sensor is attached.
+        load_cell_wrench_raw/_grav_comp/_tared: optional (6,) F/T sensor
+        wrenches (see sensors/force_torque.py). Passed through verbatim;
+        None when no sensor is attached.
+
+        sin_model_theta_rad/sin_model_force_corrected: optional experimental
+        scalars (see this module's sin_model_theta_rad() and
+        docs/gravity_comp_recording_plan.md). Passed through verbatim.
         """
         if t is None:
             if self._t0 is None:
@@ -348,6 +419,13 @@ class RunRecorder:
             ),
             load_cell_wrench_grav_comp=(
                 None if load_cell_wrench_grav_comp is None else np.asarray(load_cell_wrench_grav_comp, float).copy()
+            ),
+            load_cell_wrench_tared=(
+                None if load_cell_wrench_tared is None else np.asarray(load_cell_wrench_tared, float).copy()
+            ),
+            sin_model_theta_rad=(None if sin_model_theta_rad is None else float(sin_model_theta_rad)),
+            sin_model_force_corrected=(
+                None if sin_model_force_corrected is None else float(sin_model_force_corrected)
             ),
         )
         self._samples.append(sample)
