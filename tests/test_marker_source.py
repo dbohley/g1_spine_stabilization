@@ -4,6 +4,7 @@ Uses MockMarkerTracker — no camera or hardware required.
 """
 import math
 import time
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -329,6 +330,33 @@ def test_startup_preseeds_nonzero_theta_delta_and_it_persists_when_stale():
     )
 
 
+def test_wait_for_keypress_blocks_on_input_and_refreshes_theta():
+    """wait_for_keypress=True blocks on input() and does one final refresh of
+    theta from the target marker's post-keypress reading before returning,
+    instead of the fixed-duration countdown -- lets a human freely reposition
+    the arm while waiting, then trigger Phase 1 on demand."""
+    start_theta = 0.0
+    post_keypress_theta = 0.5
+    frames = [
+        (BOX_CENTER, BOX_CENTER, 0.0),                  # Phase A
+        (BOX_CENTER, BOX_CENTER, start_theta),          # Phase B: start reference
+        (BOX_CENTER, BOX_CENTER, post_keypress_theta),  # Phase C: post-keypress refresh
+    ]
+    tracker = _SequenceTracker(frames, repeat_last=False)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only",
+                          countdown=0.0, wait_for_keypress=True)
+
+    with patch("builtins.input", return_value="") as mock_input:
+        source.startup()
+    mock_input.assert_called_once()
+
+    _, theta = source.step()  # tracker now silent -- holds the post-keypress value
+    expected_delta = post_keypress_theta - start_theta
+    assert abs(theta - expected_delta) < 1e-6, (
+        f"Expected theta delta {expected_delta} from the post-keypress refresh, got {theta}"
+    )
+
+
 def test_target_stale_seconds_increments():
     """target_stale_seconds increments by control_dt each step where target is absent."""
     dt = 0.02
@@ -384,3 +412,88 @@ def test_object_lost_after_threshold():
     for _ in range(101):
         source.step()
     assert source.object_lost, "object_lost should be True after 101 steps with no object marker"
+
+
+# ---------------------------------------------------------------------------
+# Grasp-without-tracking: object marker found, target marker never found
+# ---------------------------------------------------------------------------
+
+class _ObjectOnlyTracker:
+    """Always returns the object marker; never returns the target marker --
+    simulates a torso/target marker that's out of frame or never attached."""
+    def __init__(self, obj_pos):
+        self._obj_obs = _make_obs(OBJ_ID, obj_pos)
+        self._latest = {OBJ_ID: self._obj_obs}
+
+    def step(self):
+        return [self._obj_obs]
+
+    def get_latest(self, mid):
+        return self._latest.get(mid)
+
+
+def test_startup_proceeds_without_target_marker():
+    """startup() must not raise when the target marker is never found -- it
+    should return the object-derived box_center and leave target_found False,
+    so the caller can grasp normally and just skip the tracking phase."""
+    tracker = _ObjectOnlyTracker(BOX_CENTER)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0)
+
+    box_center = source.startup(timeout=0.15)
+
+    np.testing.assert_allclose(box_center, BOX_CENTER, atol=1e-9)
+    assert source.target_found is False
+
+
+def test_target_found_true_when_target_marker_is_detected():
+    """Sanity check on the flag's positive case, using the existing
+    always-both-markers tracker convention."""
+    tracker = _RepeatTracker(obj_pos=BOX_CENTER)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only")
+    source.startup()
+    assert source.target_found is True
+
+
+# ---------------------------------------------------------------------------
+# on_observations: fires the instant each tracker.step() call detects
+# something, independent of which phase is running or whether it later
+# succeeds -- regression test for the "markers never appeared in Rerun"
+# live bug, root-caused to logging that was coupled to Phase 1 succeeding
+# instead of to detection itself.
+# ---------------------------------------------------------------------------
+
+def test_on_observations_fires_during_phase_a_even_if_target_never_found():
+    """The callback must fire from Phase A alone -- using a tracker that
+    NEVER returns the target marker proves this isn't gated on Phase B (or
+    any later phase) ever completing, which is exactly the bug: the old
+    phase-coupled logging could be skipped entirely by unrelated downstream
+    failures (e.g. a Phase 1 collision-avoidance abort)."""
+    tracker = _ObjectOnlyTracker(BOX_CENTER)
+    calls = []
+    source = MarkerSource(
+        tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0,
+        on_observations=lambda obj_obs, tgt_obs: calls.append((obj_obs, tgt_obs)),
+    )
+    source.startup(timeout=0.15)
+
+    assert len(calls) >= 1, "on_observations should fire during Phase A's poll loop"
+    obj_obs, tgt_obs = calls[0]
+    assert obj_obs is not None and obj_obs.marker_id == OBJ_ID
+    assert tgt_obs is None, "target was never in frame -- callback must still report it as None, not skip the call"
+
+
+def test_on_observations_fires_on_every_step_call():
+    tracker = _RepeatTracker(obj_pos=BOX_CENTER, tgt_theta=0.3)
+    calls = []
+    source = MarkerSource(
+        tracker, OBJ_ID, TGT_ID, mode="orient-only",
+        on_observations=lambda obj_obs, tgt_obs: calls.append((obj_obs, tgt_obs)),
+    )
+    source.startup()
+    calls.clear()  # isolate step()'s own call from startup()'s
+
+    source.step()
+    assert len(calls) == 1, "on_observations should fire exactly once per step() call"
+    obj_obs, tgt_obs = calls[0]
+    assert obj_obs is not None and obj_obs.marker_id == OBJ_ID
+    assert tgt_obs is not None and tgt_obs.marker_id == TGT_ID

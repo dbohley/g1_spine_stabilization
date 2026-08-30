@@ -64,3 +64,59 @@ def test_marker_tracker_get_latest_includes_pose_in_optical():
     obs = tracker.get_latest(2)
     assert obs is not None
     np.testing.assert_allclose(obs.pose_in_optical, pose_optical)
+
+
+def test_set_t_d435_to_pelvis_updates_subsequent_steps():
+    """set_T_d435_to_pelvis() must take effect on the next step() -- used to
+    correct T_d435_to_pelvis once a robot's real, live waist angle is known
+    post-connect (the constructor-time value assumes zero-waist)."""
+    pose_optical = np.eye(4)
+    pose_optical[:3, 3] = [1.0, 0.0, 0.0]
+    detector = _StubDetector(pose_optical)
+    tracker = MarkerTracker(
+        _StubFrameSource(), detector, intrinsics=None,
+        T_optical_to_d435=np.eye(4), T_d435_to_pelvis=np.eye(4),
+    )
+
+    obs_before = tracker.step()[0]
+    np.testing.assert_allclose(obs_before.pose_in_pelvis[:3, 3], [1.0, 0.0, 0.0])
+
+    T_shifted = np.eye(4)
+    T_shifted[:3, 3] = [0.0, 0.0, 0.5]   # e.g. a corrected pelvis-to-mount offset
+    tracker.set_T_d435_to_pelvis(T_shifted)
+
+    obs_after = tracker.step()[0]
+    np.testing.assert_allclose(obs_after.pose_in_pelvis[:3, 3], [1.0, 0.0, 0.5])
+
+
+def test_pelvis_offset_hotfix_applied_after_full_composition():
+    """pelvis_offset is added directly in pelvis frame, after T_d435_to_pelvis
+    @ T_optical_to_d435 @ pose_in_optical -- an empirical, reversible probe
+    (configs/default.yaml perception.pelvis_offset_hotfix), distinct from the
+    real T_optical_to_d435 calibration."""
+    pose_optical = np.eye(4)
+    pose_optical[:3, 3] = [1.0, 2.0, 3.0]
+    detector = _StubDetector(pose_optical)
+    tracker = MarkerTracker(
+        _StubFrameSource(), detector, intrinsics=None,
+        T_optical_to_d435=np.eye(4), T_d435_to_pelvis=np.eye(4),
+        pelvis_offset=[0.0, 0.05, 0.0],
+    )
+
+    obs = tracker.step()[0]
+    np.testing.assert_allclose(obs.pose_in_pelvis[:3, 3], [1.0, 2.05, 3.0])
+
+
+def test_no_pelvis_offset_by_default():
+    """Omitting pelvis_offset must reproduce the exact prior behavior --
+    every existing caller relies on this."""
+    pose_optical = np.eye(4)
+    pose_optical[:3, 3] = [1.0, 2.0, 3.0]
+    detector = _StubDetector(pose_optical)
+    tracker = MarkerTracker(
+        _StubFrameSource(), detector, intrinsics=None,
+        T_optical_to_d435=np.eye(4), T_d435_to_pelvis=np.eye(4),
+    )
+
+    obs = tracker.step()[0]
+    np.testing.assert_allclose(obs.pose_in_pelvis[:3, 3], [1.0, 2.0, 3.0])

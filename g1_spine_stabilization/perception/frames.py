@@ -48,6 +48,28 @@ def d435_to_pelvis_from_pinocchio(locked_joint_config=None, ik=None) -> np.ndarr
     return T
 
 
+def waist_q_full(model, waist_yaw: float, waist_roll: float, waist_pitch: float) -> np.ndarray:
+    """Build a full-model Pinocchio q vector (zeros elsewhere) with the three
+    waist joint angles placed at their correct indices.
+
+    Pinocchio's q ordering is unrelated to the SDK's motor-index ordering, so
+    each joint must be located by name via getJointId()/idx_q rather than
+    written at a raw positional index. Intended for feeding a robot's actual,
+    live waist reading into d435_to_pelvis_from_pinocchio's locked_joint_config,
+    instead of that function's zero-waist default.
+    """
+    q = np.zeros(model.nq)
+    for name, value in (
+        ("waist_yaw_joint", waist_yaw),
+        ("waist_roll_joint", waist_roll),
+        ("waist_pitch_joint", waist_pitch),
+    ):
+        jid = model.getJointId(name)
+        idx_q = model.joints[jid].idx_q
+        q[idx_q] = value
+    return q
+
+
 def compose_to_pelvis(
     pose_in_optical: np.ndarray,
     T_optical_to_d435: np.ndarray,

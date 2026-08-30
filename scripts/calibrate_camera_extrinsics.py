@@ -7,11 +7,14 @@ run_pose_tracking_preview.py's --detect mode).
 
 Workflow:
   1. Physically place an AprilTag marker at a measured, known position in the
-     pelvis frame (x, y, z in meters), with its orientation as close to
-     identity (aligned with the pelvis frame's axes) as you can manage.
+     pelvis frame (x, y, z in meters). Pass --marker-rpy if you measured its
+     orientation (e.g. against a squared fixture or a level/protractor); it
+     defaults to identity, which is only correct if the marker is truly
+     axis-aligned with the pelvis frame -- an eyeballed placement is a
+     leading source of residual rotation error in the resulting calibration.
   2. Run this script pointed at that marker:
        python scripts/calibrate_camera_extrinsics.py \\
-           --marker-id 0 --marker-pos 0.40 0.0 0.0
+           --marker-id 0 --marker-pos 0.40 0.0 0.0 --marker-rpy 0.0 0.0 0.0
      It scans for a few seconds, averages the raw camera-frame reading, and
      prints the T_optical_to_d435 correction (xyz + rpy) that would make the
      perception pipeline agree with your measurement. This does NOT edit
@@ -92,8 +95,16 @@ def main():
                          help="AprilTag ID of the marker to read.")
     parser.add_argument("--marker-pos", type=float, nargs=3, required=True,
                          metavar=("X", "Y", "Z"),
-                         help="Known ground-truth marker position in the pelvis frame (m). "
-                              "Orientation is assumed identity.")
+                         help="Known ground-truth marker position in the pelvis frame (m).")
+    parser.add_argument("--marker-rpy", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+                         metavar=("R", "P", "Y"),
+                         help="Known ground-truth marker orientation in the pelvis frame "
+                              "(radians, fixed-axis rpy). Defaults to identity, which only "
+                              "gives a correct calibration if the physical marker is truly "
+                              "axis-aligned with the pelvis frame -- an eyeballed placement "
+                              "is a leading source of residual rotation error. Measure this "
+                              "(e.g. with a squared fixture or a level/protractor) rather "
+                              "than assuming identity if the resulting calibration looks off.")
     parser.add_argument("--duration", type=float, default=5.0,
                          help="Seconds to scan and average over (default: 5.0).")
     parser.add_argument("--verify", action="store_true",
@@ -105,7 +116,9 @@ def main():
     cfg = load_config(args.config)
     perception = cfg["perception"]
 
-    T_marker_true_pelvis = make_se3(np.array(args.marker_pos, dtype=float), np.eye(3))
+    rpy = np.array(args.marker_rpy, dtype=float)
+    R_marker_true = Rotation.from_euler("ZYX", [rpy[2], rpy[1], rpy[0]]).as_matrix()
+    T_marker_true_pelvis = make_se3(np.array(args.marker_pos, dtype=float), R_marker_true)
 
     print("[calibrate] Loading IK solver (for T_d435_to_pelvis via FK)...")
     ik = G1HandIK()

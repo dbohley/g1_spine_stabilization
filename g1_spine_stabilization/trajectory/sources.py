@@ -10,6 +10,7 @@ import math
 import time
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 
 def sine_trajectory(t, amplitude, freq):
@@ -81,7 +82,15 @@ class MarkerSource:
         mode:              "orient-only" or "6dof".
         countdown:         seconds to count down after both markers are detected
                            in startup() before returning. 0.0 skips the countdown
-                           (use for mock trackers and unit tests).
+                           (use for mock trackers and unit tests). Ignored when
+                           wait_for_keypress=True.
+        wait_for_keypress: if True, Phase C blocks on Enter instead of counting
+                           down a fixed duration -- lets a human freely
+                           reposition the arm (e.g. into an unusual test
+                           configuration) before triggering Phase 1's approach,
+                           since the caller reads the arm's live joint state
+                           immediately after startup() returns. Default False
+                           preserves the original timed-countdown behavior.
         control_dt:        control loop period in seconds; used for stale-time
                            calculations (does not introduce delays in step()).
         box_half_height:   the object marker is mounted on TOP of the held
@@ -96,11 +105,25 @@ class MarkerSource:
                            placed perfectly level. Default 0.0 preserves the
                            old behavior (marker position taken as box_center
                            directly).
+        on_observations:   optional callback(obj_obs, tgt_obs) invoked on
+                           EVERY self._tracker.step() call this class makes
+                           (Phase A/B/C's wait/countdown loops AND step()),
+                           immediately when each poll returns -- independent
+                           of whatever the caller does with box_center/theta
+                           afterward. Intended for a live-visualization hook
+                           (e.g. logging marker poses to Rerun the instant
+                           they're detected) that must not depend on later
+                           control-flow (a Phase 1 collision-avoidance abort,
+                           for example, must not prevent markers detected
+                           during Phase A/B/C from ever having been shown).
+                           Either argument may be None if that marker wasn't
+                           seen this poll. Default None disables the hook.
     """
 
     def __init__(self, tracker, object_marker_id, target_marker_id,
                  mode="orient-only", countdown=0.0, control_dt=0.02,
-                 box_half_height=0.0):
+                 box_half_height=0.0, wait_for_keypress=False,
+                 on_observations=None):
         if mode not in ("orient-only", "6dof"):
             raise ValueError(f"mode must be 'orient-only' or '6dof', got {mode!r}")
         self._tracker = tracker
@@ -108,12 +131,17 @@ class MarkerSource:
         self._tgt_id = target_marker_id
         self._mode = mode
         self._countdown = countdown
+        self._wait_for_keypress = wait_for_keypress
         self._control_dt = control_dt
         self._box_half_height = float(box_half_height)
+        self._on_observations = on_observations  # see _step_tracker()
         self._object_start_pos = None  # object's own position, set once by startup(), never changes
+        self._object_marker_pos = None  # RAW object marker pose (pre-box_half_height-offset),
+        self._object_marker_R = None    # set once by startup() Phase A -- see object_marker_pose
         self._target_start_pos = None  # target's position when tracking began (Phase B)
         self._target_start_rot = None  # target's rotation when tracking began (Phase B)
         self._box_center = None        # live returned value; == object_start_pos in orient-only mode
+        self._target_found = False     # set True by startup() Phase B; see target_found property
         self._last_theta = 0.0
         self._last_obj_obs = None
         self._last_tgt_obs = None
@@ -135,6 +163,20 @@ class MarkerSource:
         """Object's own start position, shifted by the target's displacement from its own start."""
         return self._object_start_pos + (pos_current - self._target_start_pos)
 
+    def _step_tracker(self):
+        """The ONE place self._tracker.step() is called from this class.
+        Fires self._on_observations(obj_obs, tgt_obs) immediately, before
+        returning -- every phase (A/B/C's wait/countdown loops and step())
+        routes through here, so the callback is guaranteed to see every
+        detection the instant it happens, regardless of what any later phase
+        does with it (see on_observations in the class docstring)."""
+        current = self._tracker.step()
+        obj_obs = next((o for o in current if o.marker_id == self._obj_id), None)
+        tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
+        if self._on_observations is not None:
+            self._on_observations(obj_obs, tgt_obs)
+        return obj_obs, tgt_obs, current
+
     def startup(self, timeout=10.0) -> np.ndarray:
         """Block until both markers are detected, then optionally count down.
 
@@ -144,23 +186,34 @@ class MarkerSource:
         Phase C: counts down self._countdown seconds while continuously
                  refreshing readings; skipped when countdown=0.0.
 
-        Returns the box_center (pelvis frame). Raises RuntimeError on timeout.
+        Returns the box_center (pelvis frame) as soon as the object marker
+        is found -- Phase 0/1/1.5 (the grasp) only ever need box_center, not
+        theta, so they can proceed even if the target marker is never found.
+        Raises RuntimeError only if the OBJECT marker times out (there's
+        nothing to grasp without it). If the TARGET marker times out, this
+        prints a warning, leaves target_found False, and still returns
+        box_center normally -- callers check target_found to decide whether
+        to run the tracking phase at all.
         """
         # Phase A: object marker
         print(f"[MarkerSource] Waiting for object marker (id={self._obj_id})…")
         deadline = time.monotonic() + timeout
         found_obj = False
         while time.monotonic() < deadline:
-            current = self._tracker.step()
-            obj_obs = next((o for o in current if o.marker_id == self._obj_id), None)
+            obj_obs, _tgt_obs, _current = self._step_tracker()
             if obj_obs is not None:
                 marker_pos = obj_obs.pose_in_pelvis[:3, 3]
                 marker_R   = obj_obs.pose_in_pelvis[:3, :3]
+                self._object_marker_pos = marker_pos.copy()
+                self._object_marker_R = marker_R.copy()
                 # Marker sits on top of the object -- shift down along its own
                 # measured "out of the surface" axis to recover the true center.
                 self._object_start_pos = marker_pos - self._box_half_height * marker_R[:, 2]
                 self._box_center = self._object_start_pos.copy()
+                marker_rpy_deg = np.degrees(Rotation.from_matrix(marker_R).as_euler('xyz'))
                 print(f"[MarkerSource] Object marker detected: box_center={np.round(self._box_center, 4)}")
+                print(f"[MarkerSource] Object marker orientation (rpy, deg): "
+                      f"[{marker_rpy_deg[0]:+.1f}, {marker_rpy_deg[1]:+.1f}, {marker_rpy_deg[2]:+.1f}]")
                 found_obj = True
                 break
             time.sleep(0.05)
@@ -174,23 +227,36 @@ class MarkerSource:
         deadline = time.monotonic() + timeout
         found_tgt = False
         while time.monotonic() < deadline:
-            current = self._tracker.step()
-            tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
+            _obj_obs, tgt_obs, _current = self._step_tracker()
             if tgt_obs is not None:
                 self._target_start_pos = tgt_obs.pose_in_pelvis[:3, 3].copy()
                 self._target_start_rot = tgt_obs.pose_in_pelvis[:3, :3].copy()
                 self._last_theta = 0.0  # no displacement yet -- this IS the target's start
+                self._target_found = True
                 print(f"[MarkerSource] Target marker detected (start reference recorded)")
                 found_tgt = True
                 break
             time.sleep(0.05)
         if not found_tgt:
-            raise RuntimeError(
-                f"[MarkerSource] Target marker (id={self._tgt_id}) not detected within {timeout}s"
-            )
+            print(f"[MarkerSource] WARNING: target marker (id={self._tgt_id}) not detected "
+                  f"within {timeout}s -- proceeding to grasp without tracking "
+                  f"(target_found=False; caller should skip the tracking phase).")
 
-        # Phase C: countdown (skip when countdown=0.0)
-        if self._countdown > 0.0:
+        # Phase C: countdown, keypress gate, or skip (countdown=0.0 and no keypress wait)
+        if self._wait_for_keypress:
+            print("[MarkerSource] Both markers visible. Press Enter when ready "
+                  "to begin tracking (you can reposition the arm now)…")
+            input()
+            # One final refresh so theta/box_center reflect the target's
+            # current reading at the moment of the keypress, not a stale one
+            # from whenever the second marker was first detected.
+            _obj_obs, tgt_obs, _current = self._step_tracker()
+            if tgt_obs is not None:
+                self._last_theta = self._theta_from_target_rotation(tgt_obs.pose_in_pelvis[:3, :3])
+                if self._mode == "6dof":
+                    self._box_center = self._box_center_from_target_position(tgt_obs.pose_in_pelvis[:3, 3])
+            print("[MarkerSource] Go!")
+        elif self._countdown > 0.0:
             print(f"[MarkerSource] Both markers visible. Tracking starts in {self._countdown:.0f}s…")
             t_end = time.monotonic() + self._countdown
             prev_tick = int(self._countdown) + 1
@@ -201,8 +267,7 @@ class MarkerSource:
                     prev_tick = tick
                     print(f"  {tick}…")
                 # Refresh target readings during countdown
-                current = self._tracker.step()
-                tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
+                _obj_obs, tgt_obs, _current = self._step_tracker()
                 if tgt_obs is not None:
                     self._last_theta = self._theta_from_target_rotation(tgt_obs.pose_in_pelvis[:3, :3])
                     if self._mode == "6dof":
@@ -227,10 +292,9 @@ class MarkerSource:
         if self._box_center is None:
             raise RuntimeError("Call startup() before step()")
 
-        current = self._tracker.step()
+        obj_obs, tgt_obs, _current = self._step_tracker()
 
         # --- Target marker ---
-        tgt_obs = next((o for o in current if o.marker_id == self._tgt_id), None)
         self._last_tgt_obs = tgt_obs
         if tgt_obs is not None:
             self._last_theta = self._theta_from_target_rotation(tgt_obs.pose_in_pelvis[:3, :3])
@@ -250,7 +314,6 @@ class MarkerSource:
                 self._stale_warned_3 = True
 
         # --- Object marker monitoring ---
-        obj_obs = next((o for o in current if o.marker_id == self._obj_id), None)
         self._last_obj_obs = obj_obs
         if obj_obs is not None:
             self._object_stale_frames = 0
@@ -269,6 +332,27 @@ class MarkerSource:
         return self._box_center.copy(), self._last_theta
 
     @property
+    def box_center(self):
+        """Current tracked object-center pose (pelvis frame), or None before
+        startup(). This is the corrected/shifted point compute_hand_targets
+        actually builds the L/R hand targets from -- distinct from the raw
+        object marker's own pose (see box_half_height in the class docstring)."""
+        return None if self._box_center is None else self._box_center.copy()
+
+    @property
+    def object_marker_pose(self):
+        """(marker_pos, marker_R) -- the RAW object marker pose as detected
+        in startup()'s Phase A, in the pelvis frame, BEFORE the
+        box_half_height offset (unlike box_center, which IS offset -- see its
+        docstring). None until Phase A completes. Used to place obstacles
+        (e.g. the RRT* head sphere) whose own anchor offset differs from
+        box_half_height's -- see kinematics/collision.py's
+        head_sphere_center_from_marker."""
+        if self._object_marker_pos is None:
+            return None
+        return self._object_marker_pos.copy(), self._object_marker_R.copy()
+
+    @property
     def last_obj_obs(self):
         """Most recent object marker observation from the last step(), or None."""
         return self._last_obj_obs
@@ -277,6 +361,15 @@ class MarkerSource:
     def last_tgt_obs(self):
         """Most recent target marker observation from the last step(), or None."""
         return self._last_tgt_obs
+
+    @property
+    def target_found(self) -> bool:
+        """True if the target marker was detected during startup()'s Phase B.
+        False means startup() timed out waiting for it and proceeded with
+        the grasp anyway (box_center is still valid, from the object
+        marker alone) -- callers should skip the tracking phase (Phase 2)
+        when this is False, since there's no target motion to track."""
+        return self._target_found
 
     @property
     def target_stale_seconds(self) -> float:

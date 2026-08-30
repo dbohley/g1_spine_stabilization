@@ -16,6 +16,18 @@ def make_se3(xyz, R):
     return T
 
 
+def se3_from_xyz_rpy(xyz, rpy):
+    """Build a 4x4 SE3 from position + fixed-axis roll/pitch/yaw (radians).
+
+    URDF/ROS convention: R = Rz(yaw) @ Ry(pitch) @ Rx(roll) -- matches the
+    convention already used independently in perception/frames.py's
+    optical_to_d435_from_config() and scripts/calibrate_camera_extrinsics.py.
+    """
+    rpy = np.asarray(rpy, dtype=float)
+    R = Rotation.from_euler("ZYX", [rpy[2], rpy[1], rpy[0]]).as_matrix()
+    return make_se3(xyz, R)
+
+
 def slerp_rotation(R1, R2, t):
     """Smoothly interpolate between two rotation matrices."""
     key_rots = Rotation.from_matrix(np.stack([R1, R2]))

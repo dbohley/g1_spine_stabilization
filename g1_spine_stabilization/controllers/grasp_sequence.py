@@ -40,6 +40,15 @@ from g1_spine_stabilization.trajectory.targets import (
     R_R_BASE,
 )
 from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep
+from g1_spine_stabilization.controllers.joint_path_execution import (
+    execute_joint_path,
+    log_head_sphere,
+    log_hand_collision_boxes,
+)
+from g1_spine_stabilization.kinematics.rrt_planner import (
+    plan_collision_free_approach,
+    RRTPlanningError,
+)
 
 # Inspire RH56 finger order (matches hand.get_state return order)
 _FINGER_NAMES = [
@@ -154,23 +163,83 @@ def run_grasp_phases(
         R_start_rot = R_cur.rotation.copy()
 
         box_center     = np.array([L_EE_DEFAULT[0], 0.0, L_EE_DEFAULT[2]])
-        box_half_width = cfg["box"]["size"][1] / 2.0
-        L_grasp, R_grasp = compute_hand_targets(box_center, box_half_width, 0.0)
+        box_size       = list(cfg["box"]["size"])
+        box_half_width = box_size[1] / 2.0
+        approach_cfg    = cfg.get("grasp_approach", {})
+        pregrasp_offset = approach_cfg.get("pregrasp_offset", 0.04)
+        close_time      = approach_cfg.get("close_time", 1.5)
+        collision_avoidance_enabled = cfg.get("collision_avoidance", {}).get("enabled", True)
 
-        n_steps = int(interp_time / interp_dt)
-        sol_tauff = np.zeros(14)
-        for i in range(n_steps):
-            alpha = smoothstep(i / n_steps)
-            L_pos = (1 - alpha) * L_start_pos + alpha * L_grasp[:3, 3]
-            R_pos = (1 - alpha) * R_start_pos + alpha * R_grasp[:3, 3]
-            L_R   = slerp_rotation(L_start_rot, L_grasp[:3, :3], alpha)
-            R_R   = slerp_rotation(R_start_rot, R_grasp[:3, :3], alpha)
-            sol_q, sol_tauff = ik.solve_ik(
-                make_se3(L_pos, L_R), make_se3(R_pos, R_R),
-                current_q, np.zeros(14),
+        # No MarkerSource/marker orientation here (grasp_demo has no camera) --
+        # sphere_center is always just box_center, unlike sdk_pose_tracking.py's
+        # marker-top-anchored placement.
+        head_radius = cfg.get("collision_avoidance", {}).get("head_radius_m", 0.10)
+        sphere_center = box_center
+        if preview_enabled:
+            log_head_sphere(sphere_center, head_radius,
+                             cfg.get("collision_avoidance", {}).get("head_margin_m", 0.0))
+
+        # Two-stage approach mirroring sdk_pose_tracking.py's Phase 1a/1b:
+        # gross reach to a pre-grasp standoff (RRT*-covered when
+        # collision_avoidance is enabled), then a short straight-in close
+        # onto the object -- unchanged either way, since the final contact
+        # approach is a different, already-bounded problem (see
+        # kinematics/rrt_planner.py module docstring).
+        L_pre, R_pre = compute_hand_targets(box_center, box_half_width, 0.0, squeeze=-pregrasp_offset)
+
+        print(f"[grasp_demo] Phase 0a: approaching pre-grasp standoff "
+              f"(+{pregrasp_offset * 100:.1f}cm wider) over {interp_time}s…")
+        if collision_avoidance_enabled:
+            goal_q, _ = ik.solve_ik(L_pre, R_pre, current_q, np.zeros(14))
+            waypoints = plan_collision_free_approach(
+                ik, current_q, goal_q, sphere_center, head_radius, cfg,
             )
+            print(f"[grasp_demo] RRT* path to standoff: {len(waypoints)} waypoints.")
+            current_q = execute_joint_path(
+                robot, ik, interp_dt, waypoints, interp_time,
+                gravity_comp_enabled, None,
+                log_collision_geometry=preview_enabled,
+            )
+        else:
+            n_steps = int(interp_time / interp_dt)
+            for i in range(n_steps):
+                alpha = smoothstep(i / n_steps)
+                L_pos = (1 - alpha) * L_start_pos + alpha * L_pre[:3, 3]
+                R_pos = (1 - alpha) * R_start_pos + alpha * R_pre[:3, 3]
+                L_R   = slerp_rotation(L_start_rot, L_pre[:3, :3], alpha)
+                R_R   = slerp_rotation(R_start_rot, R_pre[:3, :3], alpha)
+                sol_q, _ = ik.solve_ik(
+                    make_se3(L_pos, L_R), make_se3(R_pos, R_R),
+                    current_q, np.zeros(14),
+                )
+                robot.arm.set_joint_targets(sol_q, None)
+                current_q = sol_q
+                time.sleep(interp_dt)
+
+        # --- Phase 0b: straight-in lateral close (squeeze -offset -> 0) ---
+        L_cur, R_cur = ik.fk(current_q)
+        L_start_pos = L_cur.translation.copy()
+        R_start_pos = R_cur.translation.copy()
+        L_start_rot = L_cur.rotation.copy()
+        R_start_rot = R_cur.rotation.copy()
+
+        print(f"[grasp_demo] Phase 0b: closing straight in along the inter-palm "
+              f"axis over {close_time}s…")
+        steps_close = max(1, int(close_time / interp_dt))
+        sol_tauff = np.zeros(14)
+        _last_log_t = time.monotonic() - 1.0  # fire on first step
+        for i in range(steps_close):
+            alpha = smoothstep(i / steps_close)
+            squeeze = (1 - alpha) * (-pregrasp_offset)   # -offset -> 0
+            L_target, R_target = compute_hand_targets(
+                box_center, box_half_width, 0.0, squeeze=squeeze,
+            )
+            sol_q, sol_tauff = ik.solve_ik(L_target, R_target, current_q, np.zeros(14))
             robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
             current_q = sol_q
+            if preview_enabled and time.monotonic() - _last_log_t >= 1.0:
+                _last_log_t = time.monotonic()
+                log_hand_collision_boxes(ik, current_q)
             time.sleep(interp_dt)
 
         grasp_arm_q = current_q.copy()
@@ -231,6 +300,15 @@ def run_grasp_phases(
         pending_exc = exc
         print(f"[grasp_demo] WARNING: {exc!r} during grasp/hold phases -- "
               f"proceeding to safe hand-release + arm-return before shutdown.")
+        if isinstance(exc, RRTPlanningError) and preview_enabled:
+            # Same gap as sdk_pose_tracking.py: this logging normally lives
+            # inside execute_joint_path, which a StartInCollisionError/
+            # GoalInCollisionError means never ran -- show the actual hand
+            # boxes at the states involved instead of leaving this a
+            # text-only abort.
+            log_hand_collision_boxes(ik, current_q)
+            if "goal_q" in locals():
+                log_hand_collision_boxes(ik, goal_q)
 
     # ── Phase D: release (lerp back to open) -- ALWAYS attempted ──────────
     # Use last-known-good state, not a fresh hardware read: the fault that

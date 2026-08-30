@@ -9,11 +9,17 @@ import pickle
 import numpy as np
 import pytest
 
-from g1_spine_stabilization.controllers.sdk_pose_tracking import run_pose_tracking_sdk
+from g1_spine_stabilization.controllers.sdk_pose_tracking import (
+    run_pose_tracking_sdk,
+    _get_q,
+)
 from g1_spine_stabilization.data_recording.recorder import RunRecorder
 from g1_spine_stabilization.kinematics.ik_solver import G1HandIK
-from g1_spine_stabilization.trajectory.sources import SineSource
+from g1_spine_stabilization.trajectory.sources import MarkerSource, SineSource
+from g1_spine_stabilization.perception.types import MarkerObservation
+from g1_spine_stabilization.trajectory.targets import R_L_BASE, R_R_BASE
 from g1_spine_stabilization.utils.config import load_config
+from g1_spine_stabilization.utils.transforms import make_se3
 
 
 @pytest.fixture(scope="module")
@@ -42,6 +48,11 @@ def cfg_fast():
     # Phase 1b (straight-in close) defaults to 1.5s; shrink it too so tests stay fast.
     cfg.setdefault("grasp_approach", {})["close_time"] = 0.06
     cfg.setdefault("shutdown", {})["settle_time"] = 0.05
+    # These tests exercise current-pose-start/grip/interrupt/recording behavior,
+    # not collision avoidance -- disable RRT* so Phase 1a keeps using the
+    # simple, deterministic straight-line motion they were written against.
+    # See tests/test_rrt_planner.py for dedicated collision-avoidance coverage.
+    cfg.setdefault("collision_avoidance", {})["enabled"] = False
     return cfg
 
 
@@ -234,6 +245,56 @@ def test_pose_tracking_sdk_grips_and_releases_hands(dry_robot, ik, cfg_fast, mon
     np.testing.assert_allclose(recorded[-1], HAND_OPEN_POSE, atol=1e-3)
 
 
+class _ObjectOnlyMarkerTracker:
+    """Always returns the object marker; never returns the target marker --
+    simulates a torso/target marker that's out of frame or never attached."""
+    OBJ_ID = 0
+    TGT_ID = 1
+
+    def __init__(self, obj_pos):
+        pose = np.eye(4)
+        pose[:3, 3] = obj_pos
+        self._obj_obs = MarkerObservation(
+            marker_id=self.OBJ_ID, pose_in_pelvis=pose, timestamp=0.0,
+            reprojection_error=0.0,
+        )
+
+    def step(self):
+        return [self._obj_obs]
+
+    def get_latest(self, marker_id):
+        return self._obj_obs if marker_id == self.OBJ_ID else None
+
+
+def test_pose_tracking_sdk_skips_tracking_when_target_marker_not_found(
+    dry_robot, ik, cfg_fast, monkeypatch
+):
+    """If the target/torso marker is never detected at startup, the grasp
+    (Phase 0/1/1.5) must still complete and release cleanly -- Phase 2
+    (tracking) must be skipped entirely, not crash the whole run."""
+    from g1_spine_stabilization.controllers.grip_force import HAND_OPEN_POSE
+
+    tracker = _ObjectOnlyMarkerTracker(obj_pos=np.array([0.35, 0.0, 0.1]))
+    source = MarkerSource(tracker, _ObjectOnlyMarkerTracker.OBJ_ID,
+                          _ObjectOnlyMarkerTracker.TGT_ID,
+                          mode="orient-only", countdown=0.0)
+
+    step_calls = []
+    original_step = source.step
+    monkeypatch.setattr(source, "step", lambda: (step_calls.append(1), original_step())[1])
+
+    recorded = _record_hand_commands(monkeypatch, dry_robot)
+
+    run_pose_tracking_sdk(dry_robot, ik, cfg_fast, source, duration=0.05)
+
+    assert source.target_found is False
+    assert step_calls == [], "source.step() is only called in Phase 2 -- it must never run"
+    # Grasp (Phase 1.5) still happened and hands still released (Phase 1.5
+    # gate depends only on _phase1_interrupted, not on tracking_available).
+    assert len(recorded) > 0
+    np.testing.assert_allclose(recorded[-1], HAND_OPEN_POSE, atol=1e-3)
+
+
 def test_pose_tracking_sdk_grip_disabled_skips_hand_commands(dry_robot, ik, cfg_fast, monkeypatch):
     """Arm-only behavior (zero hand commands anywhere in the run) requires BOTH
     grip_force AND palm_press disabled -- palm-press mode still closes the
@@ -330,3 +391,107 @@ def test_pose_tracking_sdk_saves_recording_after_interrupt_during_tracking(
     with open(recorder.output_path, "rb") as f:
         payload = pickle.load(f)
     assert payload["origin"] == "robot"
+
+
+def test_test_start_pose_drives_both_hands_before_source_startup(dry_robot, ik, cfg_fast, monkeypatch):
+    """test_start_pose=(L,R) must actively drive the arm there -- via the
+    same normal position-control interpolation Phase 1a uses, never by
+    backdriving -- before source.startup() runs.
+
+    Checks what was actually COMMANDED (the final solve_ik output during the
+    drive step), matching this file's existing spy-on-set_joint_targets
+    pattern (see test_pose_tracking_sdk_phase1_starts_from_actual_current_pose
+    above) -- not what the dry-run simulation's own velocity-clipped state
+    converged to, which lags behind a continuously-updating target for
+    reasons specific to the SDK's dry-run loop, unrelated to this
+    controller's own correctness."""
+    calls = []
+    original_set_joint_targets = dry_robot.arm.set_joint_targets
+
+    def recording_set_joint_targets(q14, tau_ff14=None):
+        calls.append(np.asarray(q14).copy())
+        return original_set_joint_targets(q14, tau_ff14)
+
+    monkeypatch.setattr(dry_robot.arm, "set_joint_targets", recording_set_joint_targets)
+
+    # cfg_fast's interpolation_time (0.06s) gives only 3 steps at control_dt
+    # =0.02s; smoothstep(i/steps) for i in range(steps) never actually
+    # reaches alpha=1.0, so at very low step counts a real, non-negligible
+    # gap remains (negligible at the real ~150-step default). Use enough
+    # steps here to actually converge, while still keeping the test fast.
+    cfg_fast["control"]["interpolation_time"] = 0.3
+
+    # Orientation uses R_L_BASE/R_R_BASE -- the same "natural" orientation
+    # family compute_hand_targets always builds targets from throughout this
+    # codebase. An arbitrary orientation (e.g. identity) paired with an
+    # arbitrary position can land in a region where position and orientation
+    # cost genuinely compete, leaving a real (not test-artifact) IK residual
+    # -- that's a property of the target chosen, not of _drive_to_test_pose.
+    L_target = make_se3([0.30, 0.20, 0.15], R_L_BASE)
+    R_target = make_se3([0.30, -0.20, 0.15], R_R_BASE)
+    source = SineSource(
+        box_center=np.array([0.35, 0.0, 0.1]),
+        amplitude=cfg_fast["trajectory"]["sine"]["amplitude"],
+        freq=cfg_fast["trajectory"]["sine"]["frequency"],
+    )
+    test_pose_steps = max(1, int(cfg_fast["control"]["interpolation_time"] / cfg_fast["control"]["dt"]))
+
+    run_pose_tracking_sdk(dry_robot, ik, cfg_fast, source, duration=0.05,
+                          test_start_pose=(L_target, R_target))
+
+    last_test_pose_q = calls[test_pose_steps - 1]
+    L_reached, R_reached = ik.fk(last_test_pose_q)
+    # 1cm, not the 5mm documented at the default pose specifically: solve_ik's
+    # 0.02 regularization cost pulls solutions away from an exact match by an
+    # amount that grows with distance from q=0 (CLAUDE.md's "Known accuracy
+    # floor" -- ~1.8mm AT the default pose; these targets are further away).
+    np.testing.assert_allclose(L_reached.translation, L_target[:3, 3], atol=1e-2)
+    np.testing.assert_allclose(R_reached.translation, R_target[:3, 3], atol=1e-2)
+
+
+def test_test_start_pose_one_hand_holds_current(dry_robot, ik, cfg_fast, monkeypatch):
+    """When only one hand's target is given, the other must stay at whatever
+    pose it already had -- not snap to some default."""
+    current_q_before = _get_q(dry_robot)
+    _, R_before = ik.fk(current_q_before)
+    R_before_pos = R_before.translation.copy()
+
+    calls = []
+    original_set_joint_targets = dry_robot.arm.set_joint_targets
+
+    def recording_set_joint_targets(q14, tau_ff14=None):
+        calls.append(np.asarray(q14).copy())
+        return original_set_joint_targets(q14, tau_ff14)
+
+    monkeypatch.setattr(dry_robot.arm, "set_joint_targets", recording_set_joint_targets)
+
+    cfg_fast["control"]["interpolation_time"] = 0.3  # see comment in the test above
+
+    L_target = make_se3([0.32, 0.22, 0.12], R_L_BASE)
+    source = SineSource(
+        box_center=np.array([0.35, 0.0, 0.1]),
+        amplitude=cfg_fast["trajectory"]["sine"]["amplitude"],
+        freq=cfg_fast["trajectory"]["sine"]["frequency"],
+    )
+    test_pose_steps = max(1, int(cfg_fast["control"]["interpolation_time"] / cfg_fast["control"]["dt"]))
+
+    run_pose_tracking_sdk(dry_robot, ik, cfg_fast, source, duration=0.05,
+                          test_start_pose=(L_target, None))
+
+    last_test_pose_q = calls[test_pose_steps - 1]
+    L_reached, R_reached = ik.fk(last_test_pose_q)
+    np.testing.assert_allclose(L_reached.translation, L_target[:3, 3], atol=1e-2)
+    np.testing.assert_allclose(R_reached.translation, R_before_pos, atol=1e-2)
+
+
+def test_test_start_pose_none_is_a_no_op(dry_robot, ik, cfg_fast, capsys):
+    """test_start_pose=None (default) must not print the test-pose-drive
+    message or add any extra phase before source.startup()."""
+    source = SineSource(
+        box_center=np.array([0.35, 0.0, 0.1]),
+        amplitude=cfg_fast["trajectory"]["sine"]["amplitude"],
+        freq=cfg_fast["trajectory"]["sine"]["frequency"],
+    )
+    run_pose_tracking_sdk(dry_robot, ik, cfg_fast, source, duration=0.05)
+    out = capsys.readouterr().out
+    assert "test start pose" not in out.lower()

@@ -34,12 +34,13 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from g1_spine_stabilization.kinematics.ik_solver import G1HandIK
 from g1_spine_stabilization.perception.detector import AprilTagDetector, CameraIntrinsics
 from g1_spine_stabilization.perception.frame_sources import RealSenseSource
 from g1_spine_stabilization.perception.frames import (
-    optical_to_d435_from_config, d435_to_pelvis_from_pinocchio,
+    optical_to_d435_from_config, d435_to_pelvis_from_pinocchio, waist_q_full,
 )
 from g1_spine_stabilization.perception.tracker import MarkerTracker
 from g1_spine_stabilization.perception.types import MarkerObservation
@@ -48,9 +49,11 @@ from g1_spine_stabilization.trajectory.sources import (
     SineSource, MarkerSource, RateLimitedSource, NoiseFilteredSource,
 )
 from g1_spine_stabilization.controllers.sdk_pose_tracking import run_pose_tracking_sdk
+from g1_spine_stabilization.controllers.joint_path_execution import log_marker_observations
 from g1_spine_stabilization.data_recording.recorder import RunRecorder
 from g1_spine_stabilization.sensors.force_torque import ForceTorqueSource
 from g1_spine_stabilization.utils.config import load_config
+from g1_spine_stabilization.utils.transforms import se3_from_xyz_rpy
 
 
 class _AnimatedMockTracker:
@@ -201,6 +204,31 @@ def main():
         "--no-force-sensor", dest="force_sensor", action="store_false",
         help="Disable the F/T sensor for this run (e.g. sensor unplugged).",
     )
+    parser.add_argument(
+        "--wait-for-keypress", action="store_true",
+        help="--source marker only: after both markers are detected, wait for "
+             "Enter instead of the fixed 3s countdown before Phase 1 begins. "
+             "Useful on its own (time to double check the Rerun view before "
+             "committing to Phase 1) and combines with --test-start-left/"
+             "--test-start-right below. Default: off (fixed countdown).",
+    )
+    parser.add_argument(
+        "--test-start-left", type=float, nargs=6, default=None,
+        metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+        help="Actively drive the LEFT hand to this pose (meters, radians, "
+             "pelvis frame, fixed-axis rpy) before tracking begins, to test "
+             "whether Phase 1 correctly recovers from an arbitrary/weird "
+             "starting configuration. The arm is always actively commanded "
+             "there (never physically pushed/backdriven). May be given alone "
+             "(right hand holds its current pose) or together with "
+             "--test-start-right. Default: none (skip).",
+    )
+    parser.add_argument(
+        "--test-start-right", type=float, nargs=6, default=None,
+        metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+        help="Actively drive the RIGHT hand to this pose before tracking "
+             "begins. See --test-start-left.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -293,7 +321,8 @@ def main():
             box_half_height=box_half_height,
         )
         source = MarkerSource(mock_tracker, obj_id, tgt_id, mode=args.tracking, countdown=0.0,
-                              box_half_height=box_half_height)
+                              box_half_height=box_half_height,
+                              on_observations=log_marker_observations)
         duration = None   # use config default
         cam_for_preview = RealSenseCamera(dry_run=True)
         cam_for_preview.connect()
@@ -301,7 +330,10 @@ def main():
 
     elif args.source == "marker":
         print("[preview] Setting up live RealSense + AprilTag tracker…")
-        frame_source = RealSenseSource(preview=preview)
+        frame_source = RealSenseSource(
+            preview=preview,
+            pointcloud=perception.get("pointcloud_enabled", True),
+        )
         native = frame_source.intrinsics_native
         intrinsics = CameraIntrinsics(
             fx=native["fx"], fy=native["fy"],
@@ -314,12 +346,44 @@ def main():
               f"a mismatch here scales solvePnP's recovered translation and can look "
               f"like a calibration error.")
         T_opt_to_d435  = optical_to_d435_from_config(perception["d435_link_to_optical"])
+        # Zero-waist assumption -- corrected below with the robot's actual
+        # live waist reading, once it's connected (low_state isn't populated
+        # yet at this point in the script). Used as-is for sine/mock, and as
+        # the initial value here until the correction below runs.
         T_d435_to_pelvis = d435_to_pelvis_from_pinocchio(ik=ik)
+        # `native` is in OUR convention (fx/fy/cx/cy/resolution, for
+        # CameraIntrinsics above) -- set_camera_intrinsics() expects the SDK's
+        # own shape (width/height/ppx/ppy), so translate rather than pass
+        # native through directly.
+        sdk_intrinsics = {
+            "width": native["resolution"][0],
+            "height": native["resolution"][1],
+            "fx": native["fx"],
+            "fy": native["fy"],
+            "ppx": native["cx"],
+            "ppy": native["cy"],
+        }
+        # The SDK's own RealSenseCamera->preview wiring never passes
+        # T_cam_in_world, so the camera/pointcloud/image entities in Rerun
+        # render at identity instead of the real D435 mount pose. Re-log the
+        # intrinsics ourselves with the pose included so the point cloud lines
+        # up with the robot mesh and marker arrows in the viewer.
+        preview.set_camera_intrinsics(
+            sdk_intrinsics, T_cam_in_world=T_d435_to_pelvis @ T_opt_to_d435,
+        )
+        pelvis_offset_hotfix = perception.get("pelvis_offset_hotfix")
+        if pelvis_offset_hotfix and any(pelvis_offset_hotfix):
+            print(f"[preview] HOTFIX: applying pelvis_offset_hotfix={pelvis_offset_hotfix} "
+                  f"to every marker reading -- experimental, not part of the real "
+                  f"calibration. See configs/default.yaml to revert.")
         tracker = MarkerTracker(
-            frame_source, detector, intrinsics, T_opt_to_d435, T_d435_to_pelvis
+            frame_source, detector, intrinsics, T_opt_to_d435, T_d435_to_pelvis,
+            pelvis_offset=pelvis_offset_hotfix,
         )
         source = MarkerSource(tracker, obj_id, tgt_id, mode=args.tracking, countdown=3.0,
-                              box_half_height=box_half_height)
+                              box_half_height=box_half_height,
+                              wait_for_keypress=args.wait_for_keypress,
+                              on_observations=log_marker_observations)
         duration = float("inf")   # run until Ctrl+C
         # cam_for_preview stays None: RealSenseSource.read() auto-pushes frames via the SDK
 
@@ -402,10 +466,54 @@ def main():
     robot.start_streaming()
     print("[preview] Robot ready. Starting controller…")
 
+    if args.source == "marker" and robot.arm.low_state is not None:
+        # T_d435_to_pelvis above assumed the waist joints sit at exactly
+        # zero -- that's only true if the robot's own balance control never
+        # nudges them (e.g. to counterbalance a loaded, outstretched arm).
+        # low_state is only populated once connected LIVE (dry_run leaves it
+        # None -- there's no real robot to read a waist angle from, so the
+        # zero assumption is what dry-run is supposed to simulate anyway).
+        # Motor indices 12/13/14 = WaistYaw/WaistRoll/WaistPitch (SDK convention).
+        model, _ = ik.get_full_model_and_data()
+        waist_yaw   = robot.arm.low_state.motor_state[12].q
+        waist_roll  = robot.arm.low_state.motor_state[13].q
+        waist_pitch = robot.arm.low_state.motor_state[14].q
+        q_full = waist_q_full(model, waist_yaw, waist_roll, waist_pitch)
+        T_d435_to_pelvis_live = d435_to_pelvis_from_pinocchio(
+            locked_joint_config=q_full, ik=ik,
+        )
+        pos_delta_mm = 1000 * np.linalg.norm(
+            T_d435_to_pelvis_live[:3, 3] - T_d435_to_pelvis[:3, 3]
+        )
+        R_delta = T_d435_to_pelvis[:3, :3].T @ T_d435_to_pelvis_live[:3, :3]
+        angle_delta_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(R_delta).as_rotvec()))
+        print(f"[preview] Live waist angles (deg): "
+              f"yaw={math.degrees(waist_yaw):+.2f} "
+              f"roll={math.degrees(waist_roll):+.2f} "
+              f"pitch={math.degrees(waist_pitch):+.2f}")
+        print(f"[preview] T_d435_to_pelvis shift from the zero-waist assumption: "
+              f"{pos_delta_mm:.1f}mm, {angle_delta_deg:.2f}deg")
+        tracker.set_T_d435_to_pelvis(T_d435_to_pelvis_live)
+        preview.set_camera_intrinsics(
+            sdk_intrinsics, T_cam_in_world=T_d435_to_pelvis_live @ T_opt_to_d435,
+        )
+    elif args.source == "marker":
+        print("[preview] --dry-run: no live robot to read a waist angle from -- "
+              "keeping the zero-waist assumption for T_d435_to_pelvis.")
+
+    test_start_pose = None
+    if args.test_start_left is not None or args.test_start_right is not None:
+        L_test = (se3_from_xyz_rpy(args.test_start_left[:3], args.test_start_left[3:])
+                  if args.test_start_left is not None else None)
+        R_test = (se3_from_xyz_rpy(args.test_start_right[:3], args.test_start_right[3:])
+                  if args.test_start_right is not None else None)
+        test_start_pose = (L_test, R_test)
+
     try:
         run_pose_tracking_sdk(robot, ik, cfg, source, duration=duration,
                               preview=preview, cam_for_preview=cam_for_preview,
-                              recorder=recorder, wrench_source=wrench_source)
+                              recorder=recorder, wrench_source=wrench_source,
+                              test_start_pose=test_start_pose)
     finally:
         robot.shutdown()
         if wrench_source is not None:

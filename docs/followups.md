@@ -1353,6 +1353,371 @@ position/rotation offsets.
   `d435_link_to_optical` correction instead, which is the intended,
   config-tunable place for it.
 
+## Live-marker misalignment investigation + applied-shift diagnostic marker
+
+### What prompted this
+
+A live report: markers shown in Rerun were completely off from their real
+physical position/orientation, and the robot's end effectors went to a
+position that was closer to plausible but still not where the marker
+physically was. Investigated the full pipeline (`detector.py` -> `frames.py`
+-> `tracker.py` -> `MarkerSource` -> `compute_hand_targets` -> `solve_ik` ->
+Rerun logging in `sdk_pose_tracking.py`, plus the SDK's own `RerunPreview`
+robot-mesh rendering) via direct code reads and numeric verification, not just
+inspection.
+
+### Findings
+
+- **CLAUDE.md was stale** — it asserted the old, superseded
+  `rpy: [-1.5708, 0.0, -1.5708]` calibration was "correct" and that the ~10cm
+  discrepancy above was "still unresolved," when this calibration session had
+  already fixed both. The commit that applied the fix updated this file and
+  the YAML but never touched CLAUDE.md. Fixed now (5 locations).
+- **Confirmed, unrelated display bug**: `RerunPreview.set_camera_intrinsics()`
+  in the vendored `g1_inspire_sdk` accepts an optional `T_cam_in_world` to
+  place the camera/pointcloud/image entities in the pelvis frame, but nothing
+  in either repo ever passes it — the SDK's own `RealSenseCamera` ->
+  `_publish_intrinsics_to_preview()` call site only passes intrinsics. So the
+  point cloud/RGB/depth always rendered at Rerun's default identity pose
+  instead of the real D435 mount pose (~0.43m up-torso, ~47.6° pitched down),
+  which would look like a large, obvious misalignment against the robot mesh
+  that has nothing to do with the actual marker-transform pipeline. Fixed
+  from our own code (no vendored-clone edit): `run_pose_tracking_preview.py`'s
+  `--source marker` branch now calls `preview.set_camera_intrinsics(native,
+  T_cam_in_world=T_d435_to_pelvis @ T_opt_to_d435)` itself, right after
+  building those transforms.
+- **Ruled out**: URDF drift between `g1_with_hands.urdf` (used for
+  `T_d435_to_pelvis` via Pinocchio FK) and `g1_inspire_sdk`'s
+  `g1_body29_inspire_hand.urdf` (used to render the robot mesh in Rerun). The
+  two files do split the pelvis->torso->d435 joint chain differently
+  (different waist_roll/waist_pitch z-offsets), but the *cumulative*
+  pelvis-to-`d435_link` z-offset is bit-for-bit identical (0.47387m) in both,
+  with waist locked at zero. Also ruled out: `detector.py` corner-order/
+  object-points (verified synthetically against a generated
+  DICT_APRILTAG_36h11 marker), `frames.py`'s compose order and Euler
+  convention (verified numerically against the URDF fixed-axis formula), and
+  `MarkerSource`'s delta-tracking logic (the "SDK-6 marker-tracking fix" is
+  genuinely present in current code and passes its regression test).
+- **Likely actual root cause**: this calibration's own caveat above ("close
+  to identity with some room for error, I can't set them perfectly") plus
+  `calibrate_camera_extrinsics.py` hardcoding the ground-truth calibration
+  marker orientation as `np.eye(3)` — any real misalignment between the
+  physical calibration marker and true pelvis-frame axes gets baked
+  permanently into `T_optical_to_d435` as a **constant systematic bias**.
+  This explains why the two reported symptoms look so different in severity:
+  `MarkerSource`'s `theta` is a rotation *delta*
+  (`target_start_rot.T @ R_current`), and a constant rotation bias cancels
+  out of that exactly (`(B@R1).T @ (B@R2) == R1.T @ R2` for any rotation
+  `B`) — so the arm's rotation tracking is substantially shielded from this
+  bias. But `sdk_pose_tracking.py`'s raw `markers/object`/`markers/target`
+  Rerun diagnostics log `pose_in_pelvis` directly with zero delta
+  cancellation, so they show the *entire* uncancelled bias in both position
+  and orientation — matching "markers look completely wrong, arm looks
+  merely off" (the arm isn't fully protected either, since `box_center` is
+  still anchored to the absolute `object_start_pos` reading in both tracking
+  modes).
+
+### What was done
+
+- CLAUDE.md's 5 stale calibration references fixed (see above).
+- `run_pose_tracking_preview.py`: the camera-pose fix above.
+- `trajectory/sources.py`: `MarkerSource` gained a public `box_center`
+  property (mirrors `last_obj_obs`/`last_tgt_obs`) exposing the corrected/
+  tracked object-center pose, for diagnostics.
+- `sdk_pose_tracking.py`: `_log_marker_info` now also logs
+  `markers/applied_shift` — `source.box_center` with the tracked `theta`
+  rotation applied (`Rx(theta)`, matching `compute_hand_targets`'s own
+  convention) — in yellow, alongside the existing raw marker triads
+  (`markers/object`/`markers/target`) and per-hand IK targets
+  (`targets/L_hand`/`targets/R_hand`). With `box_half_height > 0` this should
+  sit visibly below `markers/object`, confirming the marker-sits-on-top
+  correction is applied as intended, and gives a third, intermediate
+  reference point for isolating a future misalignment (raw marker vs.
+  corrected/tracked object center vs. final per-hand target).
+- `calibrate_camera_extrinsics.py` gained an optional `--marker-rpy R P Y`
+  argument (default identity, preserving old behavior) so a future
+  recalibration can supply a *measured* ground-truth orientation instead of
+  assuming perfect eyeballed alignment — directly targeting the likely root
+  cause above.
+
+### Still needed (live hardware, human-run — not done in this session)
+
+None of the above changes the actual numbers in `configs/default.yaml`'s
+`d435_link_to_optical` — recalibration is still expected to be necessary.
+
+**Superseded by "Live waist-angle fix + proper multi-point recalibration"
+below**: a live retest after the fixes in this section surfaced a bigger,
+separate issue (the zero-waist assumption) that has to be fixed *before* this
+5-step protocol is re-run, and the protocol itself was upgraded from 2
+collinear points to 3-4 non-collinear ones. Kept here for the historical
+record of what this section actually tried; follow the section below instead.
+
+1. Set up a calibration marker with its orientation *measured* (squared
+   fixture, level/protractor against the pelvis's known axes), not eyeballed.
+2. Re-run `calibrate_camera_extrinsics.py --marker-id <id> --marker-pos <x>
+   <y> <z> --marker-rpy <r> <p> <y>` with that marker; paste the result into
+   `configs/default.yaml`.
+3. `--verify` against a second marker at a different position/distance to
+   confirm the fix generalizes (repeat the 6mm/4.05°-style check above).
+4. Use the new `markers/applied_shift` marker plus `get_diagnostic_pose()`'s
+   existing per-stage prints (`optical`/`d435_mount`/`pelvis`) in
+   `_log_marker_info` to confirm the corrected calibration agrees with
+   physical reality at each transform stage, not just the final pose.
+5. Double check `perception.marker_size: 0.04` against the actual physical
+   printed marker size — a scale mismatch is easy to confuse with a
+   mounting-calibration error (see the `--verify` docstring).
+
+## Live waist-angle fix + proper multi-point recalibration
+
+### What prompted this
+
+A live retest (real robot, `--no-dry-run`) after the fixes above still showed
+the arm reaching "tens of cm" off from the real target — and this time the
+point cloud, marker arrows, and arm target all agreed *with each other*
+(confirming the earlier `set_camera_intrinsics` display-bug fix worked), which
+means the remaining error is one real, shared bias in the transform chain,
+not a rendering artifact.
+
+### Root cause found: the zero-waist assumption was never checked
+
+`pose_in_pelvis = T_d435_to_pelvis @ T_optical_to_d435 @ pose_in_optical`.
+`T_optical_to_d435` is the camera-mount-to-optical calibration above — a
+fixed physical property of the mount that should never change.
+`T_d435_to_pelvis` is different: it's computed via Pinocchio FK through the
+robot's three waist joints (the only joints between pelvis and the camera
+mount), and `d435_to_pelvis_from_pinocchio()`
+(`g1_spine_stabilization/perception/frames.py:24-48`) always used
+`q = np.zeros(model.nq)` — i.e. assumed the waist sits at exactly zero.
+Every call site in the repo left its `locked_joint_config` parameter at the
+default `None`, so the zero branch always fired, unchecked against the
+robot's real state.
+
+The vendored SDK does try to hold the waist at `[0,0,0]` via a real PD loop
+(`waist_kps: [300,300,300]`, `~/g1_inspire_sdk/g1_inspire_sdk/_config/
+g1.yaml:19-24`), but a humanoid's own balance controller can plausibly nudge
+the waist by a few degrees to counterbalance an arm reaching out with a load
+— and empirically (see Tests below), a mere 5° of unaccounted waist_pitch
+alone shifts `T_d435_to_pelvis`'s position by 37mm at the camera mount itself,
+before the further amplification from projecting out to an actual marker
+0.5-1m away. Easily consistent with "tens of cm."
+
+**Why this had to be fixed before recalibrating `T_optical_to_d435` again**:
+that value is supposed to be a fixed constant, but the zero-waist assumption
+means a fresh recalibration attempt couldn't tell "the camera is genuinely
+mounted crooked" (real, fixed, worth fixing) from "the waist happened to be
+tilted during this specific test" (a different, moving-target error that has
+nothing to do with the mount and will differ next time). Recalibrating first
+would have curve-fit today's waist tilt into a value assumed constant.
+
+### What was done
+
+- `g1_spine_stabilization/perception/frames.py`: new `waist_q_full(model,
+  waist_yaw, waist_roll, waist_pitch)` — builds a full-model `q` vector with
+  the three waist angles placed at their correct Pinocchio indices via
+  `getJointId()`/`idx_q` (Pinocchio's `q` ordering is unrelated to the SDK's
+  motor-index ordering, so this can't be a raw positional write). No change
+  to `d435_to_pelvis_from_pinocchio()` itself — its `locked_joint_config`
+  parameter already existed, it just had never been exercised.
+- `g1_spine_stabilization/perception/tracker.py`: new `MarkerTracker.
+  set_T_d435_to_pelvis()`, so the already-constructed tracker's transform can
+  be corrected after the fact.
+- `scripts/run_pose_tracking_preview.py`: after `robot.start_streaming()`
+  (`MarkerTracker` is built, and needs `T_d435_to_pelvis`, *before*
+  `robot.connect()` in this script — deliberately not reordered, since that
+  ordering exists so a camera-setup failure is caught before `initialize()`
+  physically moves the arm, and changing that is a separate live-hardware
+  safety decision), for `--source marker` only: reads
+  `robot.arm.low_state.motor_state[12/13/14].q` (WaistYaw/Roll/Pitch — SDK
+  motor-index convention, confirmed against Unitree's own reference example),
+  builds the corrected transform via `waist_q_full` +
+  `d435_to_pelvis_from_pinocchio(locked_joint_config=...)`, pushes it into the
+  tracker via the new setter, and re-logs the Rerun camera pose so it stays in
+  sync. Prints the measured waist angles and the position/rotation delta from
+  the zero-waist assumption, so it's visible on the next live run whether/how
+  much this mattered. **In `--dry-run` mode `robot.arm.low_state` stays `None`
+  entirely** (not a zero-valued stand-in — confirmed by reading
+  `g1_arm.py:150-152`), so the correction is skipped there with a printed note;
+  the zero-waist assumption is what dry-run is supposed to simulate anyway
+  (there's no real robot to read from).
+
+### Tests
+
+2 new hardware-free tests: `tests/test_perception_frames.py::
+test_waist_q_full_moves_d435_to_pelvis_away_from_zero_assumption` (confirms
+the three joint names resolve in the full model, and that a 5° waist_pitch
+reading actually changes the FK output — this is the same check that produced
+the 37mm figure above); `tests/test_tracker.py::
+test_set_t_d435_to_pelvis_updates_subsequent_steps` (confirms the setter's
+effect is visible on the tracker's next `step()`). 209 tests pass total.
+
+### Flagged, not fixed: `MotionSwitcher`/`ReleaseMode` never called
+
+Unitree's own low-level reference example (`~/g1_inspire_sdk/third_party/
+unitree_sdk2_python/example/g1/low_level/g1_low_level_example.py:89-98`)
+calls `MotionSwitcherClient.CheckMode()`/`ReleaseMode()` before its low-level
+`LowCmd` commands take effect, to release the robot's onboard motion-
+control/balance service. **Neither the vendored SDK nor this repo calls this
+anywhere** (confirmed by an exhaustive grep of both). So whether our own
+position commands — to the waist, or to *any* joint — are fully authoritative
+on this hardware, vs. arbitrated/overridden by the robot's own onboard
+controller, is unverified. The fix above sidesteps needing an answer (it
+reads the waist's real position directly, regardless of who has control
+authority over it), but this is a separate, higher-stakes, robot-control-
+authority question with real safety implications on a live humanoid — it
+needs its own deliberate investigation and human decision, not a fix bundled
+into a calibration session.
+
+### Proper recalibration procedure (do this after confirming the fix above mattered)
+
+This is inherently live, physical, and human-executed — code can only get you
+this far. Using the existing `scripts/calibrate_camera_extrinsics.py`
+(already supports `--marker-rpy` for a measured, non-identity ground-truth
+orientation):
+
+1. **Confirm the waist fix actually mattered first.** Run `--source marker
+   --no-dry-run` and read the new diagnostic print. Small delta (well under a
+   degree / a few mm) → the waist wasn't the dominant error, go straight to
+   recalibrating. Several degrees / multiple cm → likely explains most of the
+   "tens of cm" on its own; confirm live before spending more time here.
+2. **Measure 3-4 calibration points, not 2** — each with a physically
+   measured position (tape measure/fixture against a known pelvis-frame
+   reference) *and* a measured orientation (level/square/protractor, fed via
+   `--marker-rpy`, not left at identity). Spread across genuinely different
+   distances *and* lateral/vertical offsets — not collinear along one axis
+   like the original two-point set (0.40m/0.50m, both on the X axis at
+   Y=Z=0), which can't distinguish a mounting-rotation error from a
+   `marker_size` scale error or catch an off-axis mounting offset.
+3. **Run the single-point tool against each point independently**, collecting
+   the printed correction from each — no new multi-point-fit code needed
+   (deliberately kept simple: procedural rigor over new, hardware-unvalidated
+   least-squares math). If the corrections agree closely, that's good
+   evidence of a genuine, stable, generalizable calibration — average them.
+   If they disagree, check whether the disagreement grows with marker
+   distance (→ `marker_size` scale error) or is roughly distance-independent
+   (→ a real, still-uncorrected mounting rotation/translation).
+4. **Hold out at least one point** from the averaging step, `--verify` the
+   chosen correction against it before committing.
+5. Paste the final `d435_link_to_optical` into `configs/default.yaml`; only
+   drop the `TENTATIVE` comment once verified against a genuinely held-out
+   point with small residual.
+
+### Update: found and fixed an actual marker_size bug, applied a fresh single-point correction
+
+Before doing the multi-point pass above, physically re-measured the real
+printed marker and found `perception.marker_size` (0.04) was wrong — the real
+size is 0.045m. Corrected in `configs/default.yaml`. This matters a lot here:
+a wrong marker size scales `solvePnP`'s recovered distance proportionally,
+and (per this file's own `--verify` docstring) that kind of scale error looks
+identical to a mounting-position error at whatever one distance it was fit
+against, and diverges at a different distance — exactly the ambiguity the
+multi-point procedure above exists to catch.
+
+Ran the calibration tool once more, this time with the corrected
+`marker_size=0.045`, against marker ID=0, **flat** (rpy measured as `0 0 0`,
+same yaw convention markers have used for the whole project — see rationale
+below), physically measured at pelvis-frame `(0.25, 0.0, 0.23)` — a
+genuinely different point from the original two (closer, and off the
+original flat Z=0 line):
+
+```
+[calibrate] Measured error with current calibration:
+  position error: 0.0683 m
+  rotation error: 12.65 deg
+[calibrate] Computed correction:
+  xyz: [-0.0314, -0.0490, -0.0129]
+  rpy: [-1.5885, 0.0723, -1.4808]
+```
+
+The *old* "tentative" calibration (verified as 6mm/4.05° against marker
+ID=2 — see the section above) was fit and checked entirely under the wrong
+`marker_size=0.04`. Diverging this badly (6.83cm/12.65°) at a new,
+non-collinear point confirms it was substantially absorbing the marker_size
+scale error into its rotation/translation numbers, not measuring a real
+mounting problem. Notably, this freshly-computed correction is fairly close
+to the *original, pre-any-calibration* URDF default
+(`rpy: [-1.5708, 0.0, -1.5708]`) — closer than the old tentative value was —
+suggesting the camera mount itself was never that far off, and the original
+~10cm/9° discrepancy that started this whole investigation was likely driven
+substantially by the marker_size bug, not a real mounting error.
+
+**On the `--marker-rpy 0 0 0` input**: the marker was placed flat (roll/pitch
+= 0, physically guaranteed by gravity, assuming the robot itself is
+standing level) and facing the same way markers have faced for the whole
+project (yaw unchanged from established practice, not a new guess) — so
+`0 0 0` here isn't an eyeballed estimate, it's the same ground-truth
+assumption the very first calibration attempt used, now with roll/pitch
+actually physically verified instead of assumed.
+
+**Applied to `configs/default.yaml` per the user's explicit request to try it
+live now rather than wait to collect more averaging points first** — still
+genuinely a single point, so still `TENTATIVE`. Steps 2-4 above (3-4
+non-collinear points, compare/average, hold one out to verify) are still the
+right next step if the live behavior after this isn't fully corrected, but
+trying the immediate live result first was a reasonable call given how much
+the old value was already known to be contaminated by the marker_size bug.
+
+### Update: user moved the calibration marker mid-investigation (root-caused, not a code bug)
+
+Between two calibration runs at the same nominal point, the user intentionally
+repositioned the physical marker, believing `cv2.solvePnP`/ArUco reports a
+corner's position rather than the marker's center. Checked directly against
+`detector.py:47-56`: the object-points array is defined symmetric about
+`(0,0,0)` (`[-half,+half,0]`, `[+half,+half,0]`, `[+half,-half,0]`,
+`[-half,-half,0]`) — `solvePnP`'s returned `tvec` is therefore already the
+marker's **center**, not a corner. No such bug exists in this code. Moving the
+marker while still passing the same `--marker-pos` argument for the second run
+introduced a real mismatch between the typed ground truth and the marker's
+actual position, which fully explains the apparent "instability" between the
+two runs (numerically: half the marker's diagonal, `0.0225*sqrt(2)≈3.18cm`, is
+very close to the observed `3.29cm` discrepancy).
+
+Separately, numerically verified (perturbation test, `frames.py`'s composed
+transform) which axis of `d435_link_to_optical`'s rotation dominates left-right
+(pelvis Y) position error: **yaw** (~8.7mm per degree at a representative 0.5m
+optical-Z reading), vs. roll (~0.6mm/deg, mostly drives depth/height) and pitch
+(~0.2mm/deg, negligible at this pose). Useful reference for anyone debugging a
+"things look shifted left/right" symptom in the future: check yaw first.
+
+**User's assessment (2026-08-23), taken as the working understanding**: the
+calibration marker's yaw has been correct/consistent this whole project, and
+the real source of "the robot thinks the head is farther right/left than it
+actually is" is that **the robot's pelvis itself physically shifts slightly
+in the world during operation** — reaction forces from the hand contacting the
+head nudge the standing robot's base, breaking CLAUDE.md's Critical Assumption
+#1 ("robot is fixed in space"). This is architecturally different from every
+other error source chased in this file (marker_size, camera mount, waist
+joint locked-at-zero) — those are all fixed constants or FK-computable; base
+drift from ground-contact reaction forces is neither, and no amount of camera
+or waist calibration corrects for it.
+
+**Proposed fix (not yet implemented, deliberately deferred by the user to
+focus on a different issue first — see the next section below)**: the
+vendored SDK's `LowState` message includes a full `imu_state`
+(`~/g1_inspire_sdk/third_party/unitree_sdk2_python/unitree_sdk2py/idl/
+unitree_hg/msg/dds_/_IMUState_.py`: `quaternion`, `gyroscope`,
+`accelerometer`, `rpy`), accessible identically to the waist joint state
+already used in the Step 1 fix above (`robot.arm.low_state.imu_state.rpy`).
+An IMU measures orientation against gravity/inertial reference, not against
+another robot part, so a genuine base twist would show up directly in this
+reading. Sketch of the fix, following the same baseline-then-delta pattern
+`MarkerSource` already uses for the target marker:
+1. Capture a baseline IMU reading at the start of tracking, before contact
+   forces are introduced.
+2. Each step, compute the live delta from that baseline
+   (`R_delta = R_baseline.T @ R_current`).
+3. Compose that delta into the transform chain so a real mid-trial base twist
+   is corrected in real time, not just assumed away.
+
+**Open questions before implementing**: (a) the URDF has both `imu_in_torso`
+and `imu_in_pelvis` dummy sensor links, but the SDK's `LowState` exposes only
+one `imu_state` field — need to confirm which physical location it actually
+measures before composing a correction at the right point in the kinematic
+chain (composing it at the wrong point would introduce a new error rather
+than fix this one); (b) whether the drift is fast/dynamic (needs per-step
+correction) or more of a one-time settle-and-stay-shifted after initial
+contact (a single re-baseline after contact begins might suffice, much
+simpler than continuous correction).
+
 ## box_half_height: correcting for the object marker sitting on top of the box
 
 ### What was done

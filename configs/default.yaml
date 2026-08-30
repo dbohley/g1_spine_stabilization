@@ -45,7 +45,8 @@ trajectory:
     ema_alpha: 0.3
 
 box:
-  size: [0.10, 0.11, 0.2]
+  size: [0.10, 0.16, 0.2]  # size[1] (head width, Y) measured against the testing head;
+                           # was 0.11, badly undersized for a real head -- see docs/followups.md
   color: [0.8, 0.3, 0.2]
   mass: 0.2
 
@@ -55,7 +56,11 @@ frames:
 
 perception:
   marker_dict: "DICT_APRILTAG_36h11"   # cv2.aruco constant name
-  marker_size: 0.04                    # meters (4 cm square)
+  marker_size: 0.045                    # meters (4.5 cm square) -- corrected from an
+                                         # incorrect 0.04 after physical measurement;
+                                         # the old value scaled all recovered marker
+                                         # distances by ~11% and was a major hidden
+                                         # contributor to earlier calibration error
   object_marker_id: 0
   target_marker_id: 2
   # Camera intrinsics — used when not auto-loading from a live RealSense.
@@ -70,13 +75,44 @@ perception:
     distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
     resolution: [640, 480]
   # Transform from d435_link (URDF mount frame) to camera optical frame.
-  # Calibrated via scripts/calibrate_camera_extrinsics.py against marker
-  # ID=0 physically measured at pelvis-frame (0.40, 0.0, 0.0). TENTATIVE:
-  # being verified against a second marker before treating as final --
-  # see docs/followups.md.
+  # Re-calibrated via scripts/calibrate_camera_extrinsics.py against marker
+  # ID=0, flat (rpy measured as 0,0,0), physically measured at pelvis-frame
+  # (0.25, 0.0, 0.23), AFTER repositioning the marker to what the user
+  # judged the correct measurement point and AFTER fixing marker_size above
+  # from 0.04 to the correct 0.045. STILL TENTATIVE: from a single point so
+  # far -- see docs/followups.md for the multi-point verification procedure
+  # to run before trusting this fully, and for the full history of prior
+  # values (including the wrong-marker_size-era value and the immediately
+  # preceding single-point fit, both superseded below).
+  #
+  # PREVIOUS VALUES (commented, for easy rollback -- most recent first):
+  #   xyz: [-0.0314, -0.0490, -0.0129]  rpy: [-1.5885, 0.0723, -1.4808]  # before marker was repositioned, marker_size=0.045
+  #   xyz: [-0.0860, -0.0002, -0.0384]  rpy: [-1.4118, 0.0076, -1.5896]  # before marker_size fix (was 0.04)
+  #   xyz: [0.0, 0.0, 0.0]              rpy: [-1.5708, 0.0, -1.5708]     # original, non-calibrated URDF default
   d435_link_to_optical:
-    xyz: [-0.0860, -0.0002, -0.0384] #  xyz: [0.0, 0.0, 0.0] urdf non-calibrated
-    rpy: [-1.4118, 0.0076, -1.5896]  #  rpy: [-1.5708, 0.0, -1.5708] urdf non-calibrated
+    xyz: [-0.0500, -0.0919, 0.0154]
+    rpy: [-1.7103, 0.0446, -1.4039]
+
+  # HOTFIX / EXPERIMENTAL (added 2026-08-23) -- NOT part of the real
+  # calibration above. A raw, fixed offset applied directly in the pelvis
+  # frame to every detected marker's position (X fwd, Y left, Z up), on top
+  # of everything else, purely to empirically test the effect of shifting
+  # perceived marker position +5cm toward the robot's left. Only wired into
+  # the live tracking path (run_pose_tracking_preview.py --source marker),
+  # deliberately NOT into calibrate_camera_extrinsics.py, so it can never
+  # silently contaminate a future real calibration fit. Revert by setting
+  # back to [0.0, 0.0, 0.0] (or deleting this key).
+  pelvis_offset_hotfix: [0.0, 0.05, 0.0]
+
+  pointcloud_enabled: true   # request a 3D point cloud from the D435 (marker
+                              # mode / real hardware only -- sine/mock/dry-run
+                              # camera paths always synthesize empty point
+                              # arrays regardless of this flag). Logged to
+                              # Rerun under camera/pointcloud, positioned by
+                              # the same T_cam_in_world already set via
+                              # preview.set_camera_intrinsics() above -- lets
+                              # you compare markers/the collision sphere
+                              # against real depth data live.
 
 gravity_comp:
   enabled: true  # Runtime Pinocchio inertia correction for 1.0 kg Inspire hands
@@ -193,9 +229,71 @@ grasp_approach:
   # snagged on the object edges. The close is a squeeze ramp -pregrasp_offset->0,
   # continuous with the Phase 2 palm-press squeeze (0 -> +s).
   pregrasp_offset: 0.04   # m: palms stand off this much wider per side before the
-                          #    straight-in close. MUST be < box_half_width (0.055).
+                          #    straight-in close. MUST be < box_half_width (0.08).
                           #    Set to 0.0 to disable the standoff (direct approach).
   close_time: 1.5         # s: duration of the straight-in lateral close (Phase 1b)
+
+collision_avoidance:
+  # Joint-space RRT* planner (kinematics/rrt_planner.py) that replaces the
+  # straight-line interpolation for the GROSS REACH to the pre-grasp standoff
+  # only -- sdk_pose_tracking.py Phase 1a and grasp_sequence.py Phase 0a. The
+  # final straight-in close onto the object (Phase 1b / Phase 0b) is
+  # unchanged either way -- that's a different, already-bounded problem, not
+  # a long reach that could swing through the head.
+  enabled: true           # false = old single straight-line approach (no RRT*, no
+                          #         collision checking at all)
+  head_radius_m: 0.10      # m: PLACEHOLDER -- MEASURE THE REAL HEAD/OBJECT
+                          # RADIUS AND SET THIS DIRECTLY before the next live
+                          # test. Replaces the old axis-aligned box.size-based
+                          # obstacle with a sphere (orientation-invariant --
+                          # box.size still does grasp-width duty elsewhere,
+                          # untouched). The sphere's CENTER is placed so its
+                          # TOP surface sits at the object marker's own
+                          # measured position, shifted down along the
+                          # marker's measured "out of surface" axis by this
+                          # radius (mirrors box_half_height's convention in
+                          # trajectory/sources.py) -- so this radius should be
+                          # the real physical distance from the marker down to
+                          # the head/object's centroid, not a half-width guess.
+  head_margin_m: 0.015     # m: safety margin added to box.size for the swept-path
+                          # ("transit") check only -- buffers known marker/
+                          # calibration uncertainty (~0.5-1.5cm today). Does NOT
+                          # affect the standoff goal itself, which is checked
+                          # against the exact (unpadded) box.size. NOTE: measured
+                          # empirically that 0.04 (originally chosen) is actually
+                          # TOO TIGHT here -- it makes the thumb collision-geometry
+                          # at the natural resting pose (ARM_DEFAULT_Q, which already
+                          # holds the hands close around the default box_center by
+                          # design) register as already-colliding before any motion
+                          # starts (StartInCollisionError on essentially every
+                          # approach). 0.015 keeps that pose valid while still
+                          # exceeding the documented calibration residual.
+  max_iters: 3000          # cheap to raise -- typical successful plans finish in
+                          # ~0.05-0.1s, well under time_budget_s, so extra iteration
+                          # headroom costs nothing in the common case and measurably
+                          # improves worst-case reliability (see rrt_planner.py).
+  time_budget_s: 2.0
+  step_size_rad: 0.3
+  goal_bias: 0.15          # fraction of samples that are q_goal exactly
+  segment_bias: 0.8        # fraction of samples drawn near the straight-line
+                          # q_start->q_goal segment (+ segment_sigma_rad spread) --
+                          # pure uniform sampling in 14D was measured to fail
+                          # entirely on a real test obstruction; see
+                          # kinematics/rrt_planner.py module docstring. Remaining
+                          # 1 - goal_bias - segment_bias fraction is pure uniform,
+                          # for detours wider than segment_sigma_rad can reach.
+  segment_sigma_rad: 0.2   # rad: Gaussian spread of segment-biased samples. Tuned
+                          # against a realistic recovery scenario (~90%+ success
+                          # rate at max_iters=1500; ~93% at 3000) -- occasional
+                          # failure is expected of a stochastic one-shot planner
+                          # and is SAFE (raises RRTBudgetExhaustedError -> hard
+                          # abort -> return-to-default), not a collision risk.
+  rewire_radius_rad: 0.6   # fixed radius, not the asymptotic shrinking-ball formula
+                          # -- see kinematics/rrt_planner.py module docstring
+  goal_connect_radius_rad: 0.4
+  edge_check_resolution_rad: 0.05
+  shortcut_attempts: 150
+  seed: null               # int for reproducible tests; null = nondeterministic live
 
 palm_press:
   # Palm-force PRESS control (sdk_pose_tracking.py, --source *). When enabled,
@@ -227,7 +325,7 @@ palm_press:
 
   # --- Press-loop dynamics ---
   kappa: 0.0005          # integral gain (m/N per step): s += kappa*(F_des - F)
-  squeeze_max: 0.02      # max press depth s (m); MUST be < box_half_width (=0.055)
+  squeeze_max: 0.02      # max press depth s (m); MUST be < box_half_width (=0.08)
 
   # --- Signal conditioning ---
   baseline_frames: 20    # no-contact frames averaged at Phase 1.5 to zero the palm
@@ -262,7 +360,7 @@ palm_press:
   mode: position         # position | jacobian
   kappa_f: 0.5           # force-loop trim gain (N per step per N error); jacobian mode
   seat_squeeze: 0.0      # m: fixed "just touching" seat depth held in jacobian mode
-                         #    (0.0 = palms at the object faces, since box_half_width=0.055
+                         #    (0.0 = palms at the object faces, since box_half_width=0.08
                          #    already sits at the surface). Force comes from tau_ff, not this.
   f_des_ramp_time: 2.0   # s: ramp F_des 0 -> force_target (soft-start; never step torque on contact)
   force_feedforward: true # jacobian mode: include the F_des feedforward term (fast). false =

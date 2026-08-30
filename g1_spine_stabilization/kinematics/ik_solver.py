@@ -349,6 +349,8 @@ class G1HandIK:
         self.opti.subject_to(
             self.opti.bounded(lower, self.var_q, upper)
         )
+        self._eff_lower = lower.copy()
+        self._eff_upper = upper.copy()
 
         # Cost weights:
         #  50.0 * trans   — position accuracy
@@ -473,6 +475,26 @@ class G1HandIK:
         data = self.reduced.model.createData()
         pin.framesForwardKinematics(self.reduced.model, data, q)
         return data.oMf[self.L_ee_id], data.oMf[self.R_ee_id]
+
+    def effective_joint_limits(self):
+        """(lower, upper) joint position limits, INCLUDING the tightened
+        shoulder_roll bounds solve_ik()'s IPOPT constraints already enforce.
+        Read-only -- exposed so other code (e.g. the RRT* planner) samples
+        within the exact same box instead of duplicating
+        L_SHOULDER_ROLL_MIN/R_SHOULDER_ROLL_MAX as a separate constant.
+        """
+        return self._eff_lower.copy(), self._eff_upper.copy()
+
+    def gravity_torque(self, q):
+        """Pure gravity compensation torque (14,) at joint config q, via the
+        same corrected-inertia reduced model solve_ik()'s RNEA call uses.
+        Unlike solve_ik()'s sol_tauff, this is not passed through
+        tauff_filter -- callers wanting that smoothing apply it themselves.
+        """
+        q = np.asarray(q, dtype=float)
+        return pin.computeGeneralizedGravity(
+            self.reduced.model, self.reduced.data, q,
+        ).copy()
 
     def ee_jacobians(self, q):
         """End-effector Jacobians (J_L, J_R), each 6x14, at joint config q.
