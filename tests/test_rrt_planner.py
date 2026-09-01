@@ -74,7 +74,7 @@ def test_straight_line_precondition_actually_clips_the_obstacle(ik):
     below wouldn't actually be testing collision avoidance at all."""
     q_start, q_goal, sphere_center, radius = _obstructed_start_goal(ik)
     head = build_head_obstacle(sphere_center, radius, margin_m=0.0)
-    checker = CollisionChecker(ik, head)
+    checker = CollisionChecker(ik, [head])
 
     clips = any(
         not checker.is_valid_transit((1 - t) * q_start + t * q_goal)
@@ -92,7 +92,7 @@ def test_finds_path_around_deliberately_placed_obstacle(ik):
     np.testing.assert_allclose(path[-1], q_goal)
 
     head = build_head_obstacle(sphere_center, radius, margin_m=0.0)
-    checker = CollisionChecker(ik, head)
+    checker = CollisionChecker(ik, [head])
     n = len(path)
     for i in range(n - 1):
         # Last segment is checked against the true (unpadded) sphere -- see
@@ -161,6 +161,65 @@ def test_start_in_collision_raises_start_error(ik):
         plan_collision_free_approach(ik, q_start, q_goal, sphere_center, radius, cfg)
 
 
+def _stack_hitting_only_the_second_sphere(ik, q_goal, radius=0.05):
+    """Build a 2-obstacle stack (primary + 1 stacked) where the PRIMARY
+    sphere is placed far away (no collision), and the STACKED sphere is
+    placed exactly at q_goal's hand position (guaranteed collision) --
+    i.e. simulate the actual hand-under-head scenario: a config that
+    clears the primary sphere but intrudes on the extended volume a
+    stacked sphere represents. Built directly from two build_head_obstacle
+    calls (not build_head_obstacle_stack's own spacing math) so the two
+    centers can be placed independently and unambiguously far apart,
+    regardless of stack_spacing_m's own overlap-tuning concerns (covered
+    separately by test_head_obstacle.py)."""
+    Lg, _ = ik.fk(q_goal)
+    far_away_primary_center = Lg.translation.copy() + np.array([5.0, 5.0, 5.0])
+    primary = build_head_obstacle(far_away_primary_center, radius, margin_m=0.0)
+    stacked = build_head_obstacle(Lg.translation.copy(), radius, margin_m=0.0)
+    return [primary, stacked]
+
+
+def test_stacked_sphere_catches_a_config_that_clears_the_primary_sphere(ik):
+    """Regression test for the actual hand-under-head scenario: a config
+    that has full clearance from the PRIMARY sphere but intrudes on a
+    STACKED sphere below it must still be reported as a collision --
+    is_valid_transit/is_valid_contact must check EVERY obstacle in the
+    stack, not just the primary one."""
+    q_goal = np.zeros(14)
+    q_goal[0] = 0.5
+    q_goal[1] = 1.2
+    q_goal[3] = -1.2
+
+    stack_obstacles = _stack_hitting_only_the_second_sphere(ik, q_goal)
+
+    # Sanity: q_goal is comfortably clear of the PRIMARY sphere alone.
+    checker_primary_only = CollisionChecker(ik, [stack_obstacles[0]])
+    assert checker_primary_only.is_valid_contact(q_goal), (
+        "test fixture is broken: q_goal should be clear of the primary sphere alone"
+    )
+
+    checker_stack = CollisionChecker(ik, stack_obstacles)
+    assert not checker_stack.is_valid_contact(q_goal), (
+        "q_goal collides with the STACKED sphere but is_valid_contact did not catch it -- "
+        "CollisionChecker must check every obstacle in the stack, not just the primary"
+    )
+
+
+def test_first_colliding_geometry_names_a_link_against_a_stacked_sphere(ik):
+    """first_colliding_geometry's obstacle-membership check must generalize
+    correctly to multiple obstacles -- confirms it doesn't only recognize
+    the primary sphere's geometry ids."""
+    q_goal = np.zeros(14)
+    q_goal[0] = 0.5
+    q_goal[1] = 1.2
+    q_goal[3] = -1.2
+
+    stack_obstacles = _stack_hitting_only_the_second_sphere(ik, q_goal)
+    checker = CollisionChecker(ik, stack_obstacles)
+    culprit = checker.first_colliding_geometry(q_goal, checker._true_pair_ids)
+    assert culprit is not None, "expected a named colliding link against the stacked sphere"
+
+
 def test_budget_exhausted_raises_distinct_error_not_silent_fallback(ik):
     """A near-impossible budget (1 iteration) on a genuinely obstructed
     scenario must raise RRTBudgetExhaustedError, not silently return
@@ -168,7 +227,7 @@ def test_budget_exhausted_raises_distinct_error_not_silent_fallback(ik):
     q_start, q_goal, sphere_center, radius = _obstructed_start_goal(ik)
     lower, upper = ik.effective_joint_limits()
     head = build_head_obstacle(sphere_center, radius, margin_m=0.0)
-    checker = CollisionChecker(ik, head)
+    checker = CollisionChecker(ik, [head])
     planner = RRTStarPlanner(lower, upper, checker, max_iters=1, time_budget_s=100.0, seed=7)
 
     with pytest.raises(RRTBudgetExhaustedError):

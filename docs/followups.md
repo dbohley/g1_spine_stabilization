@@ -2231,3 +2231,193 @@ scripts run fine with `load_cell_wrench_*` = `None`.
 Test count: 15 new tests (13 in test_force_torque.py + 2 net in
 test_recorder.py). Full count confirmed via `pytest tests/ -v` at 207.
 
+## `d435_link_to_optical` reverted to the original standard-convention default
+
+### What changed and why
+
+`perception.d435_link_to_optical` (`T_optical_to_d435`) is reverted from its
+most recent tentative single-point fit back to the original, non-empirical
+default it started life as: `xyz: [0.0, 0.0, 0.0]`, `rpy: [-1.5708, 0.0,
+-1.5708]` (the standard ROS mount-to-optical-frame convention).
+
+For continuity: the value being reverted *from* — `xyz: [-0.0500, -0.0919,
+0.0154]`, `rpy: [-1.7103, 0.0446, -1.4039]` — was never written up here. It
+came from a live session that repositioned the physical calibration marker
+to what the user judged the correct measurement point, then re-ran
+`scripts/calibrate_camera_extrinsics.py` at `marker_size=0.045` (post the
+marker_size fix documented above). That session's outcome only made it into
+the `configs/default.yaml` comment, not this file — this entry backfills
+that gap.
+
+**Why revert rather than keep chasing a better single-point fit:** every
+value this key has ever held — the marker_size-bug era, the fit right after
+fixing marker_size, and the marker-repositioning fit above — was a single
+measured point. None of them ever received the multi-point (3-4
+non-collinear points) verification the "Live waist-angle fix + proper
+multi-point recalibration" section above says the calibration procedure
+actually needs to be trusted; a single point structurally can't distinguish
+a real mounting-rotation error from a `marker_size` scale error or an
+off-axis mounting offset. And there's a specific, already-documented reason
+to suspect the mount was never meaningfully off in the first place: once the
+real `marker_size` bug was fixed, the freshly-recomputed correction landed
+close to this same original default (see "Update: found and fixed an actual
+marker_size bug" above) — i.e. the ~10cm/9° error that kicked off this whole
+investigation was mostly that bug, not the physical camera mount. Given that,
+and given no fit since has been verified against a genuinely held-out point,
+reverting to the un-fit default is more trustworthy than keeping whichever
+single-point number happened to be measured most recently.
+
+**Not touched:** `T_d435_to_pelvis` (`d435_to_pelvis_from_pinocchio()` in
+`perception/frames.py`) — this is Pinocchio FK against `assets/
+g1_with_hands.urdf`'s `pelvis → ... → torso_link → d435_joint → d435_link`
+chain, was never empirically calibrated, and this change doesn't touch it.
+The two transforms are architecturally separate (see `frames.py`'s module
+docstring); only the mount-to-optical piece is affected here.
+
+**Path back to a calibrated value:** if a future session runs the multi-point
+procedure documented earlier in this file (3-4 non-collinear points,
+including at least one held-out `--verify` point) and it converges on a
+stable correction, that can replace this default again. Until then, this
+default is the trusted value.
+
+**Files changed:** `configs/default.yaml` (`perception.d435_link_to_optical`
+value + comment, rollback-history list updated to include the reverted-from
+value); `CLAUDE.md` (corrected the now-stale "current value" references in
+Current Status, Key Components, Pipeline Overview, and Open Design
+Questions — same four-occurrence pattern noted earlier in this file). No
+code changes — `optical_to_d435_from_config()` and everything downstream
+already just reads whatever is in this YAML key.
+
+No new tests — this is a data-only config revert, not a behavior change; the
+existing `test_perception_frames.py`/`test_calibration.py`/`test_tracker.py`
+tests already exercise `optical_to_d435_from_config()` against synthetic
+transforms, not this specific live value.
+
+## IK smoothing-filter staleness + goal_q local-minimum (Phase 1a→1b jump, round 6)
+
+After five prior rounds of fixes to the RRT approach's "smooth then
+violent" motion bug (see CLAUDE.md's Current Status for the full round-by-
+round history — segment discretization collapse, smoothstep peak-vs-average
+speed caps, Phase 1b/0b's missing speed cap, a `RateLimitedSource` gap-
+inflation bug, and a Cartesian arrival gate before Phase 1b), a live-
+hardware retest still showed the same symptom. Rather than propose another
+guessed mechanism, reproduced the exact reported scenario in dry-run using
+`run_pose_tracking_preview.py`'s `--test-start-left`/`--test-start-right`
+flags (drive the arm to an arbitrary/extreme specified pose before Phase 1
+begins) combined with `--diagnostic-log`/`--log-joint-path` for full per-
+tick instrumentation. Unlike round 3's earlier dry-run attempt (which used
+a normal, non-extreme start and came back clean), this DID reproduce a real
+jump: Phase 1a→1b's handoff `q` was byte-identical (`gap_norm=0.0` — no
+stale-*robot*-state issue), but Phase 1b's very first `solve_ik()` tick
+alone produced a 0.60 rad joint-space delta, decaying over the next few
+ticks.
+
+**Root cause 1 — `G1HandIK.smooth_filter` staleness across a phase that
+never calls `solve_ik()`.** `smooth_filter` (the 4-tap output-smoothing
+`WeightedMovingFilter`, weights `[0.4, 0.3, 0.2, 0.1]`) is only ever fed via
+`solve_ik()`'s internal `add_data()` call. Phase 1a's RRT-planned approach
+(`execute_joint_path`, `controllers/joint_path_execution.py`) moves the arm
+through many real waypoints via `set_joint_targets()` directly — it never
+calls `solve_ik()`, so the filter's 4-sample queue sits completely frozen
+throughout all of Phase 1a, still holding samples from whatever solve last
+ran before Phase 1a started. The instant Phase 1b calls `solve_ik()` for
+the first time, IPOPT itself converges correctly (warm-started from and
+penalized toward the real `current_q`, which *is* set correctly each call),
+but the filtered *output* blends that correct solution (weight 0.4) against
+3 stale, pre-Phase-1a samples (combined weight 0.6) — producing a large
+one-shot corrective jump. Confirmed in isolation (no RRT planner, no robot)
+with a best-case repro (target Cartesian-unchanged from the prior tick):
+still a 0.84 rad jump, decaying `0.84→0.64→0.41→0.15→0.11→0.08` over the
+next 5 ticks — the same shape as the real captured trace.
+
+**Fix:** `G1HandIK.reset_smoothing(q)` (`kinematics/ik_solver.py`) reseeds
+`smooth_filter`'s queue (with `window_size` copies of `q`, so the very next
+`solve_ik()` call blends against `q` itself rather than a discontinuity or
+a multi-tick ramp-up) and `init_data`, discarding prior history. Called
+immediately after `execute_joint_path` returns, in both
+`sdk_pose_tracking.py`'s Phase 1a and `grasp_sequence.py`'s Phase 0a (only
+inside the `collision_avoidance_enabled` branch — the old straight-line
+`else` branch already calls `solve_ik()` every tick, so its filter state
+is never stale to begin with). Does NOT touch `tauff_filter` (separate
+feedforward-torque EMA filter, not implicated — the jump is in `q_cmd`, not
+`tau_ff`).
+
+**Root cause 2 — independent, found while verifying fix 1 wasn't fully
+sufficient.** After applying the `reset_smoothing` fix and re-running the
+exact same repro, the jump shrank (0.60→0.49 rad) but did not disappear.
+Investigating further: `q_1a_final` (Phase 1a's actual endpoint, which
+`execute_joint_path` played back exactly as commanded — confirmed via a
+`fast_path` 2-waypoint RRT plan where the final waypoint equals `goal_q`
+exactly) was itself ~11cm away in Cartesian space from the pregrasp-standoff
+target Phase 1b's first tick asks for. That target should have been nearly
+identical to what `goal_q` was solved for in the first place — so `goal_q`
+itself (computed by the single `solve_ik(L_pre, R_pre, current_q, ...)`
+call that seeds the RRT planner's target, `sdk_pose_tracking.py` line ~496)
+was a bad solution to begin with. Direct investigation of that one solve
+(bypassing `solve_ik()`'s filtering to see the raw IPOPT output): IPOPT
+reported `Solve_Succeeded` in only 14 iterations (well under `max_iter=30`
+— not an exhaustion/convergence failure), yet the raw position error was
+still 3.2cm. Re-warm-starting a second solve from that same raw output
+converged much further (1.0cm). This is a local-minimum/warm-start-quality
+effect: when `solve_ik()`'s warm start is very far from the target in joint
+space (e.g. the extreme test-start pose used here), a single IPOPT pass can
+terminate "successfully" by its own tolerance at a solution that is still
+meaningfully off in an absolute sense, especially since `0.1 * smooth_cost
+= ||q - q_prev||²` actively penalizes moving far from that far-away warm
+start. Confirmed this is warm-start-distance-dependent, not universal: the
+same `goal_q` solve starting from the robot's normal `ARM_DEFAULT_Q` rest
+pose (not an extreme test pose) converges to ~1.4cm error, close to the
+documented ~1.8mm regularization floor plus slack.
+
+**Fix:** `G1HandIK.solve_ik_refined(L_target, R_target, current_q,
+n_refine=3)` (`kinematics/ik_solver.py`) re-solves the same target 2-3
+times, re-warm-starting from each solve's own output. Used only for the
+one-shot `goal_q` seed call (both `sdk_pose_tracking.py` Phase 1a and
+`grasp_sequence.py` Phase 0a), not per-tick tracking calls — the extra
+solve cost isn't worth paying every tick, and `smooth_cost`'s "stay near
+the previous timestep" meaning doesn't really apply to a one-shot seed
+solve the way it does to continuous tracking.
+
+**Combined measured result** on the exact repro command: peak Phase 1b
+first-tick jump dropped from 0.60 rad → 0.16 rad (~4x), and the decay shape
+changed from a sharp discontinuity to a smooth ramp-down.
+
+**Not fully resolved — residual ~0.16 rad first-tick delta.** At
+`control_dt=0.02s` that's ~7.8 rad/s on the very first Phase 1b tick, still
+elevated versus later Phase 1b ticks. Root cause of the residual not yet
+investigated — candidates worth checking in a future session: (a) Phase 1b
+currently has NO per-tick joint-space speed cap of its own (unlike Phase
+1a's `max_step_rad=0.05`) — only `close_phase_steps`'s Cartesian speed
+floor, which per its own docstring does not bound joint-space speed (a
+joint-space overshoot is possible for a small Cartesian step near a
+singularity); (b) `solve_ik_refined`'s `n_refine=3` may not be enough
+passes to fully converge from a very far warm start — worth checking
+whether more passes shrink the residual further, and whether there's a
+principled stopping criterion (e.g. iterate until Cartesian error stops
+improving, rather than a fixed count); (c) whether turning on the existing-
+but-inactive `cartesian_arrival_tolerance_m`/`_rad` gate (`collision_
+avoidance` config, currently `null`) would catch this residual before
+Phase 1b begins, buying time for a slower correction instead of a fast one.
+
+**Not yet verified live** — human-only per Hard Rules. This is the first
+fix across all six rounds that reproduces the exact failure mode in
+isolation, outside the RRT planner and dry-run harness entirely, from first
+principles (see `tests/test_kinematics.py`'s
+`test_reset_smoothing_clears_stale_queue_and_prevents_jump` and
+`test_solve_ik_refined_converges_closer_than_a_single_solve` for the
+isolated repros turned into regression tests) — a stronger basis for
+confidence than prior rounds had before their own live retests, but the
+residual delta means a live retest may still show a smaller, non-zero snap
+worth watching for.
+
+**Files changed:** `kinematics/ik_solver.py` (`reset_smoothing`,
+`solve_ik_refined`); `controllers/sdk_pose_tracking.py` (Phase 1a: calls
+`reset_smoothing` after `execute_joint_path`, uses `solve_ik_refined` for
+`goal_q`); `controllers/grasp_sequence.py` (identical Phase 0a mirror).
+4 new tests: `tests/test_kinematics.py` (`test_reset_smoothing_seeds_
+filter_and_init_data`, `test_reset_smoothing_clears_stale_queue_and_
+prevents_jump`, `test_solve_ik_refined_converges_closer_than_a_single_
+solve`), `tests/test_sdk_transport.py`
+(`test_phase1a_resets_ik_smoothing_after_execute_joint_path`, a spy-based
+integration test). 287 tests pass total.
+

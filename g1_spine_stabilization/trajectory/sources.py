@@ -413,17 +413,39 @@ class RateLimitedSource:
     WeightedMovingFilter (a moving average on the IK's OUTPUT), so the two
     do not double-filter.
 
+    `max_dt` caps the dt used in the rate-limit math itself (default 0.5s).
+    Root cause this fixes: dt is measured since the LAST step() call, with
+    no assumption step() is called on any particular schedule -- callers in
+    this codebase only start calling step() once Phase 2 (tracking) begins,
+    so a long real gap (Phase 1a's RRT reach + Phase 1b's straight-in close
+    + Phase 1.5's hand-close, easily several real seconds combined) can
+    elapse between startup() and the first step() call, or between the last
+    Phase 2 iteration before an interruption and a subsequent resumption.
+    Without this cap, that inflated dt scales max_theta_rate*dt /
+    max_pos_rate*dt proportionally, so a multi-second gap can let the
+    limiter permit a swing far larger than the sine/marker signal's own
+    amplitude in one single step -- i.e. the rate limiter provides
+    essentially NO protection on exactly the tick right after such a gap,
+    the opposite of its purpose. Capping dt at a small ceiling means a long
+    real gap is treated as if only max_dt of time passed, preserving the
+    limiter's real per-tick constraint regardless of how long the caller
+    went without calling step(). Does not affect normal operation: an
+    active Phase 2 loop's real inter-step gaps (even with the documented
+    ~90-180ms IK solve cost) stay well under the default 0.5s ceiling.
+
     Duck-types the same .startup()/.step() contract as SineSource/MarkerSource,
     so it wraps either uniformly. Unknown attributes (e.g. MarkerSource's
     last_obj_obs/object_lost/target_stale_seconds) are proxied to the
     wrapped source via __getattr__.
     """
 
-    def __init__(self, inner, max_theta_rate, max_pos_rate, clock=time.monotonic):
+    def __init__(self, inner, max_theta_rate, max_pos_rate, clock=time.monotonic,
+                 max_dt=0.5):
         self._inner = inner
         self._max_theta_rate = float(max_theta_rate)  # rad/s
         self._max_pos_rate = float(max_pos_rate)       # m/s
         self._clock = clock
+        self._max_dt = float(max_dt)                   # s
         self._last_t = None
         self._last_box_center = None
         self._last_theta = None
@@ -446,6 +468,7 @@ class RateLimitedSource:
             return box_center.copy(), theta
 
         dt = max(now - self._last_t, 1e-6)
+        dt = min(dt, self._max_dt)
         self._last_t = now
 
         dtheta = theta - self._last_theta

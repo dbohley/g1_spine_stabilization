@@ -41,7 +41,8 @@ R_R_BASE = np.array([
 ])
 
 
-def compute_hand_targets(box_center, box_half_width, theta, squeeze=0.0):
+def compute_hand_targets(box_center, box_half_width, theta, squeeze=0.0,
+                          grasp_frame_R=None):
     """
     Compute left and right hand SE3 targets for a given object rotation.
 
@@ -57,10 +58,29 @@ def compute_hand_targets(box_center, box_half_width, theta, squeeze=0.0):
                         (see controllers/palm_force.py, docs/palm_force_control.md).
                         squeeze=0.0 (default) reproduces the original geometry
                         exactly.
+        grasp_frame_R:  optional 3x3 rotation (pelvis frame), default None
+                        (== identity -- reproduces the original pelvis-Y
+                        behavior exactly, byte-for-byte). Represents the
+                        object's own basis: column 1 (grasp_frame_R[:, 1])
+                        becomes the inter-palm arc axis, replacing the
+                        hardcoded world/pelvis Y [0,1,0], and R_L_BASE/
+                        R_R_BASE are expressed in this frame too
+                        (grasp_frame_R @ R_L_BASE) so palm ORIENTATION
+                        rotates along with palm POSITION -- both position
+                        and orientation must move together, since applying
+                        this rotation to position alone would arc the palms
+                        to the right spot while leaving them facing the old
+                        pelvis-relative direction instead of each other.
+                        Pass the object marker's own measured rotation here
+                        so a yawed/tilted object still gets grasped along
+                        its own true left-right axis, not the robot's fixed
+                        one. theta's existing Rx(theta) tracking rotation
+                        composes on top of this, unchanged.
 
     Returns:
         L_target, R_target: 4x4 SE3 homogeneous matrices
     """
+    G = np.eye(3) if grasp_frame_R is None else np.asarray(grasp_frame_R, dtype=float)
     R = Rx(theta)
 
     # Effective half-width after the inward press. Clamp at 0 so a squeeze
@@ -68,12 +88,17 @@ def compute_hand_targets(box_center, box_half_width, theta, squeeze=0.0):
     # press loop's squeeze_max should prevent this upstream, but clamp anyway).
     w = max(box_half_width - squeeze, 0.0)
 
-    # Hand positions arc around object center in the y-z plane
-    L_pos = np.array(box_center) + R @ np.array([0.0,  w, 0.0])
-    R_pos = np.array(box_center) + R @ np.array([0.0, -w, 0.0])
+    # Hand positions arc around object center in the (grasp_frame_R-rotated)
+    # y-z plane -- G[:, 1] is [0,1,0] itself when grasp_frame_R is identity.
+    axis = G[:, 1]
+    L_pos = np.array(box_center) + R @ (w * axis)
+    R_pos = np.array(box_center) + R @ (-w * axis)
 
-    # Apply object rotation on top of base orientations
-    return make_se3(L_pos, R @ R_L_BASE), make_se3(R_pos, R @ R_R_BASE)
+    # Apply object rotation on top of base orientations, themselves first
+    # re-expressed in the object's own frame (G @ R_L_BASE) -- see
+    # grasp_frame_R's docstring above for why this must move together with
+    # the position arc axis rather than independently.
+    return make_se3(L_pos, R @ G @ R_L_BASE), make_se3(R_pos, R @ G @ R_R_BASE)
 
 
 def compute_press_wrenches(theta, F_cmd):

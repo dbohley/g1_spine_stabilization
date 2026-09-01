@@ -35,6 +35,7 @@ import math
 import time
 
 import numpy as np
+import pinocchio as pin
 from scipy.spatial.transform import Rotation as _Rot
 
 try:
@@ -52,14 +53,21 @@ from g1_spine_stabilization.controllers.palm_force import (
 )
 from g1_spine_stabilization.controllers.joint_path_execution import (
     execute_joint_path,
+    close_phase_steps,
     log_head_sphere,
     log_hand_collision_boxes,
+    log_hand_goal_targets,
+    log_hand_goal_targets_actual,
 )
-from g1_spine_stabilization.kinematics.collision import head_sphere_center_from_marker
+from g1_spine_stabilization.kinematics.collision import (
+    head_sphere_center_from_marker,
+    build_head_obstacle_stack,
+)
 from g1_spine_stabilization.kinematics.rrt_planner import (
     plan_collision_free_approach,
     RRTPlanningError,
 )
+from g1_spine_stabilization.diagnostics.run_log import RUN_LOG
 from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep, Rx
 from g1_spine_stabilization.trajectory.targets import (
     compute_hand_targets,
@@ -276,7 +284,8 @@ def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=No
 
 def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                           preview=None, cam_for_preview=None, recorder=None,
-                          wrench_source=None, test_start_pose=None):
+                          wrench_source=None, test_start_pose=None,
+                          log_joint_path=None):
     """Run the three-phase pose-tracking controller via the SDK transport.
 
     Args:
@@ -290,6 +299,10 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                          (marker-driven interactive mode).
         preview:         RerunPreview instance; enables Rerun marker-frame logging.
         cam_for_preview: RealSenseCamera(dry_run=True) pre-attached to preview; capture()
+        log_joint_path:  optional file path -- if given, Phase 1a's execute_joint_path
+                         writes a per-tick CSV log of every RRT*-approach joint command
+                         there (see execute_joint_path's log_path docstring). None (default)
+                         = no logging, current behavior.
                          is called every step to push synthetic frames to the Rerun camera pane.
                          Pass None for marker mode (frames arrive via the tracker).
         recorder:        optional RunRecorder (data_recording.recorder). If provided,
@@ -430,14 +443,51 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     # even when avoidance itself is off.
     # ---------------------------------------------------------------
     head_radius = cfg.get("collision_avoidance", {}).get("head_radius_m", 0.10)
+    head_center_offset = cfg.get("collision_avoidance", {}).get("head_center_offset_m", [0.0, 0.0, 0.0])
+    head_anchor_distance = cfg.get("collision_avoidance", {}).get("head_anchor_distance_m", None)
     marker_pose = getattr(source, "object_marker_pose", None)
     if marker_pose is not None:
-        sphere_center = head_sphere_center_from_marker(*marker_pose, head_radius)
+        sphere_center = head_sphere_center_from_marker(
+            *marker_pose, head_radius, head_center_offset, head_anchor_distance,
+        )
+        # Captured ONCE here (not re-read per-tick) since the object's
+        # physical orientation doesn't change mid-grasp -- only the tracked
+        # rotation for Phase 2 (theta) does, which is separate. Passed to
+        # every compute_hand_targets call below so the standoff/grasp arc
+        # follows the object's own left-right axis instead of the pelvis's
+        # fixed one -- see compute_hand_targets's grasp_frame_R docstring.
+        _, grasp_frame_R = marker_pose
+        # Direction any configured head_stack_count spheres extend along,
+        # past the primary sphere -- the SAME "into the object" depth axis
+        # head_sphere_center_from_marker already offsets the primary sphere
+        # along, so a stacked sphere continues into the same physical
+        # volume (more head/neck/table) rather than an arbitrary direction.
+        sphere_stack_axis = -grasp_frame_R[:, 2]
     else:
         sphere_center = box_center
+        grasp_frame_R = None
+        # No real marker orientation available (SineSource/no camera) --
+        # fall back to world -Z (gravity-down), matching grasp_sequence.py's
+        # unconditional fallback for the same reason: a physically
+        # reasonable default when there's no measured "into the object"
+        # axis to use instead.
+        sphere_stack_axis = np.array([0.0, 0.0, -1.0])
+    ca_cfg = cfg.get("collision_avoidance", {})
+    head_stack_count = ca_cfg.get("head_stack_count", 0)
+    head_stack_spacing = ca_cfg.get("head_stack_spacing_m", 0.0)
     if _HAS_RERUN and preview is not None:
-        log_head_sphere(sphere_center, head_radius,
-                         cfg.get("collision_avoidance", {}).get("head_margin_m", 0.0))
+        # Pure geometry (no Pinocchio model construction) -- cheap to build
+        # here just for the sphere centers, separately from the real
+        # obstacle stack plan_collision_free_approach builds for planning
+        # below (rebuilding is simpler than threading the same list through
+        # both call sites, and this is not the hot planning loop).
+        stack_obstacles = build_head_obstacle_stack(
+            sphere_center, head_radius, ca_cfg.get("head_margin_m", 0.0),
+            stack_count=head_stack_count, stack_spacing_m=head_stack_spacing,
+            axis=sphere_stack_axis,
+        )
+        stack_centers = [obs.placement.translation for obs in stack_obstacles]
+        log_head_sphere(stack_centers, head_radius, ca_cfg.get("head_margin_m", 0.0))
 
     # ---------------------------------------------------------------
     # Phase 1: two-stage approach.
@@ -456,7 +506,10 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     close_time      = approach_cfg.get("close_time", 1.5)
 
     steps_interp = int(interpolation_time / control_dt)
-    steps_close  = max(1, int(close_time / control_dt))
+    steps_close  = close_phase_steps(
+        close_time, pregrasp_offset, control_dt,
+        cfg.get("collision_avoidance", {}).get("max_hand_speed_m_s", None),
+    )
 
     current_q = _get_q(robot)
     L_current_pose, R_current_pose = ik.fk(current_q)
@@ -465,7 +518,14 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     L_start_rot = L_current_pose.rotation.copy()
     R_start_rot = R_current_pose.rotation.copy()
 
-    L_pre, R_pre = compute_hand_targets(box_center, box_half_width, 0.0, squeeze=-pregrasp_offset)
+    L_pre, R_pre = compute_hand_targets(box_center, box_half_width, 0.0,
+                                        squeeze=-pregrasp_offset, grasp_frame_R=grasp_frame_R)
+    if _HAS_RERUN and preview is not None:
+        # Lets a human directly compare "where is Phase 1a/1b's IK/RRT goal"
+        # against the head obstacle sphere (log_head_sphere, logged above)
+        # in Rerun -- previously invisible during Phase 1a/1b (targets/
+        # L_hand/R_hand only existed inside Phase 2's _log_marker_info).
+        log_hand_goal_targets(L_pre, R_pre)
 
     _last_log_t = time.monotonic() - 1.0  # fire on first step
     _phase1_interrupted = False
@@ -479,16 +539,80 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
             # RRT* plans ONLY this gross reach, in joint space, treating the
             # head as a static obstacle -- solve_ik() is called once (for the
             # standoff goal), not per sample. See kinematics/rrt_planner.py.
-            goal_q, _ = ik.solve_ik(L_pre, R_pre, current_q, np.zeros(14))
+            # Uses solve_ik_refined (not a single solve_ik() call): a
+            # one-shot solve from a warm start far from the target (a large
+            # RRT-scale reach, or an extreme start pose) can land in a
+            # locally-optimal solution several cm off the real target even
+            # though IPOPT reports success -- confirmed via an isolated
+            # repro (see G1HandIK.solve_ik_refined's docstring). The RRT
+            # planner then faithfully reaches that wrong goal_q, so any
+            # error here becomes a real Cartesian gap Phase 1b inherits.
+            goal_q = ik.solve_ik_refined(L_pre, R_pre, current_q)
+
+            # Reachability observability ONLY -- no gating/abort. solve_ik()
+            # never signals when a target is unreachable (confirmed via an
+            # isolated test: a target 1.5m out of reach still reports IPOPT
+            # convergence, ipopt_exhaustion_count untouched), and
+            # RRTStarPlanner.plan()'s only preconditions on q_goal are
+            # collision checks against the head sphere -- it has no idea
+            # whether q_goal's FK actually matches L_pre/R_pre, so it will
+            # happily plan a perfectly smooth, safe path straight to a
+            # silently-wrong pose. This measures and surfaces that gap so it
+            # can be observed across different marker poses in Rerun/the
+            # diagnostic log, without changing control flow.
+            L_goal_actual, R_goal_actual = ik.fk(goal_q)
+            L_goal_pos_err = float(np.linalg.norm(L_goal_actual.translation - L_pre[:3, 3]))
+            R_goal_pos_err = float(np.linalg.norm(R_goal_actual.translation - R_pre[:3, 3]))
+            L_goal_rot_err = float(np.linalg.norm(pin.log3(L_goal_actual.rotation @ L_pre[:3, :3].T)))
+            R_goal_rot_err = float(np.linalg.norm(pin.log3(R_goal_actual.rotation @ R_pre[:3, :3].T)))
+            goal_pos_err = max(L_goal_pos_err, R_goal_pos_err)
+            goal_rot_err = max(L_goal_rot_err, R_goal_rot_err)
+            print(f"[SDKController] Pregrasp standoff reachability: "
+                  f"pos_err={goal_pos_err * 100:.1f}cm, rot_err={math.degrees(goal_rot_err):.1f}° "
+                  f"(worst of L/R)")
+            print(f"  L: pos_err={L_goal_pos_err * 100:.1f}cm, rot_err={math.degrees(L_goal_rot_err):.1f}°")
+            print(f"  R: pos_err={R_goal_pos_err * 100:.1f}cm, rot_err={math.degrees(R_goal_rot_err):.1f}°")
+            if _HAS_RERUN and preview is not None:
+                log_hand_goal_targets_actual(L_goal_actual, R_goal_actual)
+
             waypoints = plan_collision_free_approach(
                 ik, current_q, goal_q, sphere_center, head_radius, cfg,
+                axis=sphere_stack_axis,
             )
             print(f"[SDKController] RRT* path: {len(waypoints)} waypoints.")
+            _seg_lengths = np.linalg.norm(np.diff(waypoints, axis=0), axis=1) if len(waypoints) > 1 else np.array([])
+            RUN_LOG.log("phase1a", "plan",
+                        n_waypoints=len(waypoints),
+                        fast_path=(len(waypoints) == 2),
+                        waypoints=waypoints.tolist(),
+                        seg_lengths_rad=_seg_lengths.tolist(),
+                        collision_avoidance_enabled=collision_avoidance_enabled,
+                        q_start=current_q.tolist(), q_goal=goal_q.tolist(),
+                        goal_pos_err=float(goal_pos_err), goal_rot_err=float(goal_rot_err),
+                        L_goal_pos_err=L_goal_pos_err, R_goal_pos_err=R_goal_pos_err,
+                        L_goal_rot_err=L_goal_rot_err, R_goal_rot_err=R_goal_rot_err)
             current_q = execute_joint_path(
                 robot, ik, control_dt, waypoints, interpolation_time,
                 gravity_comp_enabled, cam_for_preview,
                 log_collision_geometry=(_HAS_RERUN and preview is not None),
+                max_speed_rad_s=cfg.get("collision_avoidance", {}).get("max_path_speed_rad_s", None),
+                max_cartesian_speed_m_s=cfg.get("collision_avoidance", {}).get("max_hand_speed_m_s", None),
+                arrival_tolerance_rad=cfg.get("collision_avoidance", {}).get("arrival_tolerance_rad", None),
+                arrival_timeout_s=cfg.get("collision_avoidance", {}).get("arrival_timeout_s", 2.0),
+                arrival_poll_interval_s=cfg.get("collision_avoidance", {}).get("arrival_poll_interval_s", 0.02),
+                max_step_rad=cfg.get("collision_avoidance", {}).get("max_step_rad", None),
+                log_path=log_joint_path,
+                cartesian_arrival_tolerance_m=cfg.get("collision_avoidance", {}).get("cartesian_arrival_tolerance_m", None),
+                cartesian_arrival_tolerance_rad=cfg.get("collision_avoidance", {}).get("cartesian_arrival_tolerance_rad", None),
             )
+            # execute_joint_path drives the arm via set_joint_targets()
+            # directly, never calling solve_ik() -- ik.smooth_filter's queue
+            # is therefore frozen at whatever it held before Phase 1a
+            # started. Without this reset, Phase 1b's first solve_ik() call
+            # blends a correct fresh solution against 3 stale, pre-Phase-1a
+            # samples, producing a large spurious corrective jump. See
+            # G1HandIK.reset_smoothing's docstring.
+            ik.reset_smoothing(current_q)
             print("  100%")
         else:
             for i in range(steps_interp):
@@ -517,19 +641,40 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                     if _HAS_RERUN and preview is not None:
                         log_hand_collision_boxes(ik, current_q)
 
+        # Phase transition diagnostic: compare what Phase 1a handed off
+        # against a fresh robot.get_state() read taken at the same instant,
+        # to directly measure any gap between "what the controller thinks
+        # current_q is" and what the SDK's own dry-run clipper (_sim_q) has
+        # actually reached -- see diagnostics/run_log.py's module docstring.
+        try:
+            _fresh_state_q = np.asarray(robot.get_state()["arm"]["q"], dtype=float)
+            _gap_norm = float(np.linalg.norm(current_q - _fresh_state_q))
+        except Exception:
+            _fresh_state_q = None
+            _gap_norm = None
+        RUN_LOG.log("phase_transition", "1a_to_1b",
+                    handoff_q=current_q.tolist(),
+                    fresh_state_q=(None if _fresh_state_q is None else _fresh_state_q.tolist()),
+                    gap_norm=_gap_norm)
+
         # --- Phase 1b: straight-in lateral close (squeeze -offset -> 0) ---
         print(f"[SDKController] Phase 1b: closing straight in along the inter-palm "
               f"axis over {close_time}s…")
+        _prev_phase1b_q = current_q.copy()
         for i in range(steps_close):
             alpha = smoothstep(i / steps_close)
             squeeze = (1 - alpha) * (-pregrasp_offset)   # -offset -> 0
 
             L_target, R_target = compute_hand_targets(
-                box_center, box_half_width, 0.0, squeeze=squeeze,
+                box_center, box_half_width, 0.0, squeeze=squeeze, grasp_frame_R=grasp_frame_R,
             )
             current_dq = np.zeros(14)
             sol_q, sol_tauff = ik.solve_ik(L_target, R_target, current_q, current_dq)
             robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
+            RUN_LOG.log("phase1b", "tick", i=i, alpha=alpha, squeeze=squeeze,
+                        sol_q=sol_q.tolist(), prev_q=_prev_phase1b_q.tolist(),
+                        delta_norm=float(np.linalg.norm(sol_q - _prev_phase1b_q)))
+            _prev_phase1b_q = sol_q.copy()
             current_q = sol_q
             if cam_for_preview is not None:
                 cam_for_preview.capture()
@@ -661,7 +806,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                             squeeze = press_ctrl.step(F_palm, F_guard)
 
                     L_target, R_target = compute_hand_targets(
-                        box_center, box_half_width, theta, squeeze=squeeze,
+                        box_center, box_half_width, theta, squeeze=squeeze, grasp_frame_R=grasp_frame_R,
                     )
 
                     current_dq = np.zeros(14)
@@ -788,6 +933,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
 
     steps_return = int(interpolation_time / control_dt)
     _last_log_t = time.monotonic() - 1.0   # fire on first step
+    _prev_phase3_q = current_q.copy()
     try:
         for i in range(steps_return):
             alpha = smoothstep(i / steps_return)
@@ -804,6 +950,10 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                 current_q, current_dq,
             )
             robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
+            RUN_LOG.log("phase3", "tick", i=i, alpha=alpha,
+                        sol_q=sol_q.tolist(), prev_q=_prev_phase3_q.tolist(),
+                        delta_norm=float(np.linalg.norm(sol_q - _prev_phase3_q)))
+            _prev_phase3_q = sol_q.copy()
             current_q = sol_q
             if cam_for_preview is not None:
                 cam_for_preview.capture()

@@ -48,22 +48,77 @@ def build_head_obstacle(center, radius: float, margin_m: float) -> HeadObstacle:
     return HeadObstacle(placement=placement, padded_shape=padded_shape, true_shape=true_shape)
 
 
-def head_sphere_center_from_marker(marker_pos, marker_R, radius: float) -> np.ndarray:
+def build_head_obstacle_stack(center, radius: float, margin_m: float,
+                               stack_count: int = 0, stack_spacing_m: float = 0.0,
+                               axis=None) -> "list[HeadObstacle]":
+    """[primary] + stack_count additional HeadObstacles, each the same
+    radius as the primary, spaced stack_spacing_m apart along axis (a unit
+    or non-unit 3-vector -- normalized here so callers don't have to).
+
+    Root cause this addresses: a single sphere only models the volume right
+    around the tracked marker -- in some configurations RRT* correctly finds
+    the single sphere collision-free by routing a hand UNDER it, which is
+    unsafe in reality since there is more physical head/neck and the table
+    surface below the sphere that the single-sphere model doesn't represent
+    at all. Stacking extends the modeled obstacle volume further along the
+    same "into the object" depth direction the primary sphere is already
+    offset along (see head_sphere_center_from_marker), so a hand routing
+    under the primary sphere runs into a stacked one instead.
+
+    stack_count=0 (default) returns exactly [build_head_obstacle(center,
+    radius, margin_m)] -- today's single-sphere behavior, unchanged. For
+    the stacked spheres to leave no gap an RRT edge could slip through,
+    stack_spacing_m should be less than 2*radius (so consecutive spheres
+    overlap); this is the caller's responsibility to configure sensibly,
+    not enforced here.
+    """
+    center = np.asarray(center, dtype=float)
+    obstacles = [build_head_obstacle(center, radius, margin_m)]
+    if stack_count <= 0:
+        return obstacles
+    axis = np.array([0.0, 0.0, -1.0]) if axis is None else np.asarray(axis, dtype=float)
+    norm = np.linalg.norm(axis)
+    if norm > 0:
+        axis = axis / norm
+    for i in range(1, stack_count + 1):
+        stacked_center = center + i * stack_spacing_m * axis
+        obstacles.append(build_head_obstacle(stacked_center, radius, margin_m))
+    return obstacles
+
+
+def head_sphere_center_from_marker(marker_pos, marker_R, radius: float, offset=None, anchor_distance=None) -> np.ndarray:
     """Sphere center such that the sphere's TOP surface sits at the marker.
 
     Mirrors trajectory/sources.py's box_half_height convention: the object
     marker is mounted on top of the physical head/object, so its raw detected
     position is shifted down along its own measured "out of surface" axis
-    (column 2 of its rotation matrix) by the sphere's radius to recover the
-    obstacle's true center.
+    (column 2 of its rotation matrix) by `anchor_distance` (default: the
+    sphere's own radius) to recover the obstacle's true center.
+
+    `anchor_distance`, if given, decouples the marker-to-center depth from
+    `radius`: the marker sits a fixed physical distance above the head's true
+    centroid regardless of how big a collision-avoidance radius is chosen, so
+    conflating the two means tuning the radius also silently relocates the
+    sphere. `None` (the default) reproduces the old coupled behavior
+    (anchor depth == radius) exactly.
+
+    `offset`, if given, is an additional [x, y, z] nudge expressed in the
+    marker's own rotation frame (same axis convention as the shift above),
+    rotated into world frame and added on top of it -- lets the center be
+    fit to a non-perfectly-spherical/off-center head. `None` (the default)
+    reproduces the plain behavior exactly.
     """
     marker_pos = np.asarray(marker_pos, dtype=float)
     marker_R = np.asarray(marker_R, dtype=float)
-    return marker_pos - float(radius) * marker_R[:, 2]
+    depth = float(radius) if anchor_distance is None else float(anchor_distance)
+    center = marker_pos - depth * marker_R[:, 2]
+    if offset is not None:
+        center = center + marker_R @ np.asarray(offset, dtype=float)
+    return center
 
 
 class CollisionChecker:
-    """Checks a 14-DOF joint config against a HeadObstacle.
+    """Checks a 14-DOF joint config against one or more HeadObstacles.
 
     Builds its own per-instance copy of the collision model/data (via
     copy.deepcopy) so repeated construction across planning calls never
@@ -72,35 +127,46 @@ class CollisionChecker:
     between grasp attempts).
     """
 
-    def __init__(self, ik, head: HeadObstacle):
+    def __init__(self, ik, obstacles: "list[HeadObstacle]"):
         self.model = ik.reduced.model
         self.data = self.model.createData()
         self.gmodel = copy.deepcopy(ik.reduced.collision_model)
 
-        self._padded_id = self.gmodel.addGeometryObject(
-            pin.GeometryObject("head_padded", 0, head.placement, head.padded_shape)
-        )
-        self._true_id = self.gmodel.addGeometryObject(
-            pin.GeometryObject("head_true", 0, head.placement, head.true_shape)
-        )
-
-        # Only pair the head against geometry whose pose actually depends on
-        # q (parentJoint > 0 -- the 14 arm/hand DOFs). Static leg/waist/torso
-        # geoms (parentJoint == 0) are excluded: their pose relative to the
-        # head never changes for a fixed box_center, and including them
-        # would falsely report every sample as colliding if the tracked head
-        # position happened to already sit near a static torso shape -- a
-        # failure no arm motion could ever fix.
+        # Every obstacle (the primary sphere, plus any stacked ones -- see
+        # build_head_obstacle_stack) gets its own uniquely-named padded/true
+        # geometry pair, but ALL of them feed the SAME _padded_pair_ids/
+        # _true_pair_ids lists below -- is_valid_transit/is_valid_contact
+        # already just check "any collision among these pair ids," so a
+        # single-obstacle vs. multi-obstacle stack needs no change to those
+        # methods, only to how these lists get populated here.
+        self._obstacle_geom_ids = set()
         self._padded_pair_ids = []
         self._true_pair_ids = []
-        for i, geom in enumerate(self.gmodel.geometryObjects):
-            if i in (self._padded_id, self._true_id):
-                continue
-            if geom.parentJoint > 0:
-                self._padded_pair_ids.append(len(self.gmodel.collisionPairs))
-                self.gmodel.addCollisionPair(pin.CollisionPair(i, self._padded_id))
-                self._true_pair_ids.append(len(self.gmodel.collisionPairs))
-                self.gmodel.addCollisionPair(pin.CollisionPair(i, self._true_id))
+        for obs_idx, head in enumerate(obstacles):
+            padded_id = self.gmodel.addGeometryObject(
+                pin.GeometryObject(f"head_padded_{obs_idx}", 0, head.placement, head.padded_shape)
+            )
+            true_id = self.gmodel.addGeometryObject(
+                pin.GeometryObject(f"head_true_{obs_idx}", 0, head.placement, head.true_shape)
+            )
+            self._obstacle_geom_ids.add(padded_id)
+            self._obstacle_geom_ids.add(true_id)
+
+            # Only pair the head against geometry whose pose actually depends
+            # on q (parentJoint > 0 -- the 14 arm/hand DOFs). Static leg/
+            # waist/torso geoms (parentJoint == 0) are excluded: their pose
+            # relative to the head never changes for a fixed box_center, and
+            # including them would falsely report every sample as colliding
+            # if the tracked head position happened to already sit near a
+            # static torso shape -- a failure no arm motion could ever fix.
+            for i, geom in enumerate(self.gmodel.geometryObjects):
+                if i in self._obstacle_geom_ids:
+                    continue
+                if geom.parentJoint > 0:
+                    self._padded_pair_ids.append(len(self.gmodel.collisionPairs))
+                    self.gmodel.addCollisionPair(pin.CollisionPair(i, padded_id))
+                    self._true_pair_ids.append(len(self.gmodel.collisionPairs))
+                    self.gmodel.addCollisionPair(pin.CollisionPair(i, true_id))
         if not self._padded_pair_ids:
             raise RuntimeError(
                 "[CollisionChecker] No arm/hand collision geometry found "
@@ -153,6 +219,6 @@ class CollisionChecker:
         for k in pair_ids:
             if self.gdata.collisionResults[k].isCollision():
                 pair = self.gmodel.collisionPairs[k]
-                geom_idx = pair.first if pair.second in (self._padded_id, self._true_id) else pair.second
+                geom_idx = pair.first if pair.second in self._obstacle_geom_ids else pair.second
                 return self.gmodel.geometryObjects[geom_idx].name
         return None

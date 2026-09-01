@@ -122,3 +122,61 @@ def test_straight_in_close_moves_only_along_inter_palm_axis():
     # Y moves monotonically inward (left palm decreasing, right palm increasing)
     assert np.all(np.diff(L_positions[:, 1]) < 0)
     assert np.all(np.diff(R_positions[:, 1]) > 0)
+
+
+def test_grasp_frame_r_none_matches_original_behavior():
+    """grasp_frame_R=None (default) must reproduce today's pelvis-Y
+    geometry byte-for-byte -- regression guard for every existing caller
+    that doesn't pass it."""
+    box_center = np.array([0.35, 0.02, 0.10])
+    hw = 0.11
+    for theta in (0.0, 0.3, -0.7):
+        for squeeze in (0.0, 0.02, -0.04):
+            L0, R0 = compute_hand_targets(box_center, hw, theta, squeeze=squeeze)
+            L1, R1 = compute_hand_targets(box_center, hw, theta, squeeze=squeeze,
+                                          grasp_frame_R=None)
+            np.testing.assert_array_equal(L0, L1)
+            np.testing.assert_array_equal(R0, R1)
+
+
+def test_grasp_frame_r_identity_matches_none():
+    """grasp_frame_R=np.eye(3) is a true no-op, identical to leaving it
+    unset -- identity is not treated specially/differently from None."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    hw = 0.11
+    L0, R0 = compute_hand_targets(box_center, hw, 0.3, squeeze=0.02)
+    L1, R1 = compute_hand_targets(box_center, hw, 0.3, squeeze=0.02,
+                                  grasp_frame_R=np.eye(3))
+    np.testing.assert_allclose(L0, L1, atol=1e-12)
+    np.testing.assert_allclose(R0, R1, atol=1e-12)
+
+
+def test_grasp_frame_r_rotates_position_and_orientation_together():
+    """A non-trivial grasp_frame_R must move BOTH the arc axis (position)
+    AND the base orientations (R_L_BASE/R_R_BASE) consistently -- the main
+    risk this parameter's design guards against is orientation lagging
+    behind position (palms arriving at the right spot but still facing the
+    old pelvis-relative direction instead of the object's own)."""
+    from g1_spine_stabilization.trajectory.targets import R_L_BASE, R_R_BASE
+
+    box_center = np.array([0.35, 0.0, 0.10])
+    hw = 0.11
+    # 90 degree rotation about pelvis Z: object's local Y (column 1) now
+    # points along world -X instead of world +Y.
+    c, s = np.cos(np.pi / 2), np.sin(np.pi / 2)
+    G = np.array([
+        [c, -s, 0.0],
+        [s,  c, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    L, R = compute_hand_targets(box_center, hw, 0.0, grasp_frame_R=G)
+
+    axis = G[:, 1]
+    expected_L_pos = box_center + hw * axis
+    expected_R_pos = box_center - hw * axis
+    np.testing.assert_allclose(L[:3, 3], expected_L_pos, atol=1e-9)
+    np.testing.assert_allclose(R[:3, 3], expected_R_pos, atol=1e-9)
+
+    # Orientation must be re-based through G too (at theta=0, R == identity).
+    np.testing.assert_allclose(L[:3, :3], G @ R_L_BASE, atol=1e-12)
+    np.testing.assert_allclose(R[:3, :3], G @ R_R_BASE, atol=1e-12)

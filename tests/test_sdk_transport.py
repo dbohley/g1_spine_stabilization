@@ -13,6 +13,7 @@ from g1_spine_stabilization.controllers.sdk_pose_tracking import (
     run_pose_tracking_sdk,
     _get_q,
 )
+from g1_spine_stabilization.controllers.joint_path_execution import close_phase_steps
 from g1_spine_stabilization.data_recording.recorder import RunRecorder
 from g1_spine_stabilization.kinematics.ik_solver import G1HandIK
 from g1_spine_stabilization.trajectory.sources import MarkerSource, SineSource
@@ -135,6 +136,69 @@ def test_pose_tracking_sdk_phase1_starts_from_actual_current_pose(
     )
 
 
+def test_phase1a_resets_ik_smoothing_after_execute_joint_path(
+    dry_robot, ik, cfg_fast, monkeypatch
+):
+    """Regression test: when collision avoidance is enabled, Phase 1a's
+    RRT*-planned execute_joint_path moves the arm via set_joint_targets()
+    directly, never calling solve_ik() -- so ik.smooth_filter's queue is
+    left stale relative to where the arm actually ends up. Without an
+    explicit reset, Phase 1b's first solve_ik() call blends a correct fresh
+    solution against that stale history, producing a large spurious jump
+    (root-caused via an isolated dry-run repro; see
+    G1HandIK.reset_smoothing). This confirms the reset is actually wired in
+    at the Phase 1a -> Phase 1b boundary, with the value execute_joint_path
+    returned."""
+    cfg = dict(cfg_fast)
+    cfg["collision_avoidance"] = {
+        **cfg_fast.get("collision_avoidance", {}),
+        "enabled": True,
+        "seed": 7,
+        "max_iters": 500,
+        "time_budget_s": 3.0,
+        "step_size_rad": 0.3,
+        "goal_bias": 0.15,
+        "segment_bias": 0.8,
+        "segment_sigma_rad": 0.2,
+        "rewire_radius_rad": 0.6,
+        "goal_connect_radius_rad": 0.4,
+        "edge_check_resolution_rad": 0.05,
+        "shortcut_attempts": 20,
+        "head_radius_m": 0.01,
+        "head_margin_m": 0.0,
+    }
+
+    reset_calls = []
+    original_reset = ik.reset_smoothing
+
+    def recording_reset(q):
+        reset_calls.append(np.asarray(q, dtype=float).copy())
+        return original_reset(q)
+
+    monkeypatch.setattr(ik, "reset_smoothing", recording_reset)
+
+    returned_q = {}
+    from g1_spine_stabilization.controllers import sdk_pose_tracking as spt
+    original_execute = spt.execute_joint_path
+
+    def recording_execute(*args, **kwargs):
+        result = original_execute(*args, **kwargs)
+        returned_q["value"] = result.copy()
+        return result
+
+    monkeypatch.setattr(spt, "execute_joint_path", recording_execute)
+
+    source = SineSource(
+        box_center=np.array([0.35, 0.0, 0.1]),
+        amplitude=cfg["trajectory"]["sine"]["amplitude"],
+        freq=cfg["trajectory"]["sine"]["frequency"],
+    )
+    run_pose_tracking_sdk(dry_robot, ik, cfg, source, duration=0.05)
+
+    assert len(reset_calls) >= 1, "ik.reset_smoothing was never called"
+    np.testing.assert_allclose(reset_calls[0], returned_q["value"])
+
+
 def test_pose_tracking_sdk_phase1_keyboard_interrupt_skips_to_phase3(
     dry_robot, ik, cfg_fast, monkeypatch, capsys
 ):
@@ -184,8 +248,19 @@ def test_pose_tracking_sdk_phase3_keyboard_interrupt_still_settles(
     original_solve_ik = ik.solve_ik
 
     dt = cfg_fast["control"]["dt"]
+    # Phase 1b's step count is floored by close_phase_steps against
+    # collision_avoidance.max_hand_speed_m_s (see controllers/
+    # joint_path_execution.py) -- must match that function's real output,
+    # not the old fixed close_time/dt formula, or this test's hardcoded
+    # KeyboardInterrupt injection point drifts out of sync with Phase 1b's
+    # actual call count.
     phase1_calls = (int(cfg_fast["control"]["interpolation_time"] / dt)
-                    + max(1, int(cfg_fast["grasp_approach"]["close_time"] / dt)))
+                    + close_phase_steps(
+                        cfg_fast["grasp_approach"]["close_time"],
+                        cfg_fast["grasp_approach"].get("pregrasp_offset", 0.04),
+                        dt,
+                        cfg_fast.get("collision_avoidance", {}).get("max_hand_speed_m_s", None),
+                    ))
 
     def fault_solve_ik(*args, **kwargs):
         call_count["n"] += 1
@@ -332,8 +407,19 @@ def test_pose_tracking_sdk_releases_hands_after_interrupt_during_tracking(
     original_solve_ik = ik.solve_ik
 
     dt = cfg_fast["control"]["dt"]
+    # Phase 1b's step count is floored by close_phase_steps against
+    # collision_avoidance.max_hand_speed_m_s (see controllers/
+    # joint_path_execution.py) -- must match that function's real output,
+    # not the old fixed close_time/dt formula, or this test's hardcoded
+    # KeyboardInterrupt injection point drifts out of sync with Phase 1b's
+    # actual call count.
     phase1_calls = (int(cfg_fast["control"]["interpolation_time"] / dt)
-                    + max(1, int(cfg_fast["grasp_approach"]["close_time"] / dt)))
+                    + close_phase_steps(
+                        cfg_fast["grasp_approach"]["close_time"],
+                        cfg_fast["grasp_approach"].get("pregrasp_offset", 0.04),
+                        dt,
+                        cfg_fast.get("collision_avoidance", {}).get("max_hand_speed_m_s", None),
+                    ))
 
     def fault_solve_ik(*args, **kwargs):
         call_count["n"] += 1
@@ -374,8 +460,19 @@ def test_pose_tracking_sdk_saves_recording_after_interrupt_during_tracking(
     original_solve_ik = ik.solve_ik
 
     dt = cfg_fast["control"]["dt"]
+    # Phase 1b's step count is floored by close_phase_steps against
+    # collision_avoidance.max_hand_speed_m_s (see controllers/
+    # joint_path_execution.py) -- must match that function's real output,
+    # not the old fixed close_time/dt formula, or this test's hardcoded
+    # KeyboardInterrupt injection point drifts out of sync with Phase 1b's
+    # actual call count.
     phase1_calls = (int(cfg_fast["control"]["interpolation_time"] / dt)
-                    + max(1, int(cfg_fast["grasp_approach"]["close_time"] / dt)))
+                    + close_phase_steps(
+                        cfg_fast["grasp_approach"]["close_time"],
+                        cfg_fast["grasp_approach"].get("pregrasp_offset", 0.04),
+                        dt,
+                        cfg_fast.get("collision_avoidance", {}).get("max_hand_speed_m_s", None),
+                    ))
 
     def fault_solve_ik(*args, **kwargs):
         call_count["n"] += 1

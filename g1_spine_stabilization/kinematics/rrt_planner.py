@@ -256,19 +256,33 @@ def shortcut_path(path: np.ndarray, checker,
 
 def plan_collision_free_approach(ik, q_start: np.ndarray, q_goal: np.ndarray,
                                   center: np.ndarray, radius: float,
-                                  cfg: dict) -> np.ndarray:
-    """The one function controllers call. Builds a HeadObstacle (sphere) +
+                                  cfg: dict, axis=None) -> np.ndarray:
+    """The one function controllers call. Builds a HeadObstacle stack (the
+    primary sphere at `center`, plus any configured stacked spheres) +
     CollisionChecker from cfg['collision_avoidance'], runs RRTStarPlanner,
     shortcuts the result, and returns the final waypoint array. Raises
     RRTPlanningError subclasses on failure -- callers must not silently fall
-    back to straight-line motion (see module docstring)."""
+    back to straight-line motion (see module docstring).
+
+    `axis`, if given, is the direction (3-vector, need not be normalized)
+    any configured stacked spheres extend along, past the primary sphere --
+    see build_head_obstacle_stack. Only matters when
+    collision_avoidance.head_stack_count > 0; ignored (and no stack built)
+    otherwise, so passing None here is always safe for the default
+    single-sphere behavior.
+    """
     # Imported here (not at module top) to keep collision.py's hppfcl/coal
     # dependency lazy for any caller that only needs the planner's exceptions.
-    from g1_spine_stabilization.kinematics.collision import build_head_obstacle, CollisionChecker
+    from g1_spine_stabilization.kinematics.collision import build_head_obstacle_stack, CollisionChecker
 
     ca_cfg = cfg.get("collision_avoidance", {})
-    head = build_head_obstacle(center, radius, ca_cfg.get("head_margin_m", 0.0))
-    checker = CollisionChecker(ik, head)
+    obstacles = build_head_obstacle_stack(
+        center, radius, ca_cfg.get("head_margin_m", 0.0),
+        stack_count=ca_cfg.get("head_stack_count", 0),
+        stack_spacing_m=ca_cfg.get("head_stack_spacing_m", 0.0),
+        axis=axis,
+    )
+    checker = CollisionChecker(ik, obstacles)
     lower, upper = ik.effective_joint_limits()
 
     planner = RRTStarPlanner(

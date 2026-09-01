@@ -54,6 +54,8 @@ from g1_spine_stabilization.data_recording.recorder import RunRecorder
 from g1_spine_stabilization.sensors.force_torque import ForceTorqueSource
 from g1_spine_stabilization.utils.config import load_config
 from g1_spine_stabilization.utils.transforms import se3_from_xyz_rpy
+from g1_spine_stabilization.diagnostics.run_log import RUN_LOG
+from g1_spine_stabilization.diagnostics.sdk_state_tap import start_sdk_state_tap
 
 
 class _AnimatedMockTracker:
@@ -229,7 +231,38 @@ def main():
         help="Actively drive the RIGHT hand to this pose before tracking "
              "begins. See --test-start-left.",
     )
+    parser.add_argument(
+        "--log-joint-path", default=None, metavar="PATH",
+        help="Write a per-tick CSV log of every joint command sent during "
+             "Phase 1a's RRT*-planned approach (controllers/"
+             "joint_path_execution.py's execute_joint_path) to this path -- "
+             "timestamp, segment index, step index, segment length/time/"
+             "n_steps, per-tick delta norm, and the full q_cmd vector. "
+             "Diagnostic tool for tracing a sudden-motion incident back to "
+             "the exact waypoint/tick that produced it; independent of "
+             "Rerun. No-op if collision_avoidance.enabled is false (Phase 1a "
+             "doesn't call execute_joint_path in that case). Default: off.",
+    )
+    parser.add_argument(
+        "--diagnostic-log", default=None, metavar="PATH",
+        help="Write ONE global, wall-clock-anchored JSONL log spanning the "
+             "whole run to this path -- every command this codebase sends "
+             "(Phase 1a per-tick, Phase 1b per-tick, Phase 3 per-tick, the "
+             "Phase1a->1b transition handoff-vs-fresh-state gap, the RRT "
+             "waypoint plan) PLUS a read-only poll of the vendored SDK's "
+             "own internal dry-run arm state (G1Arm._q_target/_cmd_q_state/"
+             "_sim_q/_arm_velocity_limit -- see diagnostics/sdk_state_tap.py) "
+             "at ~4ms resolution. Built to root-cause a smooth-then-violent "
+             "motion bug by watching real data instead of guessing at a "
+             "mechanism -- see diagnostics/run_log.py. Independent of "
+             "--log-joint-path (which stays Phase-1a-only, CSV). "
+             "Default: off (zero added overhead).",
+    )
     args = parser.parse_args()
+
+    if args.diagnostic_log is not None:
+        RUN_LOG.start(args.diagnostic_log)
+        print(f"[preview] Diagnostic log: {args.diagnostic_log}")
 
     cfg = load_config(args.config)
     perception = cfg["perception"]
@@ -411,13 +444,15 @@ def main():
     if rate_limit_cfg.get("enabled", True):
         max_theta_rate_deg_s = rate_limit_cfg.get("max_theta_rate_deg_s", 60.0)
         max_pos_rate_m_s = rate_limit_cfg.get("max_pos_rate_m_s", 0.3)
+        max_dt_s = rate_limit_cfg.get("max_dt_s", 0.5)
         source = RateLimitedSource(
             source,
             max_theta_rate=math.radians(max_theta_rate_deg_s),
             max_pos_rate=max_pos_rate_m_s,
+            max_dt=max_dt_s,
         )
         print(f"[preview] Rate limiter enabled: {max_theta_rate_deg_s:.1f} deg/s, "
-              f"{max_pos_rate_m_s:.2f} m/s")
+              f"{max_pos_rate_m_s:.2f} m/s (max_dt={max_dt_s:.2f}s)")
 
     # -------------------------------------------------------------------
     # Optional data recording (--record). See g1_spine_stabilization/
@@ -466,6 +501,9 @@ def main():
     robot.start_streaming()
     print("[preview] Robot ready. Starting controller…")
 
+    if args.diagnostic_log is not None:
+        start_sdk_state_tap(robot)
+
     if args.source == "marker" and robot.arm.low_state is not None:
         # T_d435_to_pelvis above assumed the waist joints sit at exactly
         # zero -- that's only true if the robot's own balance control never
@@ -513,7 +551,8 @@ def main():
         run_pose_tracking_sdk(robot, ik, cfg, source, duration=duration,
                               preview=preview, cam_for_preview=cam_for_preview,
                               recorder=recorder, wrench_source=wrench_source,
-                              test_start_pose=test_start_pose)
+                              test_start_pose=test_start_pose,
+                              log_joint_path=args.log_joint_path)
     finally:
         robot.shutdown()
         if wrench_source is not None:
@@ -522,6 +561,8 @@ def main():
             cam_for_preview.shutdown()
         if args.source == "marker":
             frame_source.close()
+        if args.diagnostic_log is not None:
+            RUN_LOG.stop()
         print("[preview] Shutdown complete.")
 
 

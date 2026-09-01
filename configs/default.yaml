@@ -22,6 +22,19 @@ trajectory:
     # 6dof-mode only (box_center tracking). No measurement of real hand-held
     # marker motion speed exists yet -- starting placeholder, tune with real data.
     max_pos_rate_m_s: 0.3
+    # s: caps the wall-clock dt used in the rate-limit math itself (see
+    # trajectory/sources.py's RateLimitedSource docstring). Root-cause fix:
+    # dt is measured since the LAST step() call, but this codebase's
+    # controllers only start calling step() once Phase 2 (tracking) begins
+    # -- Phase 1a/1b/1.5 (RRT reach, straight-in close, hand-close) can
+    # combine to several real seconds with NO step() calls at all. Without
+    # this cap, that inflated dt scales the allowed per-step delta
+    # proportionally, so the limiter provides essentially NO protection on
+    # the very first step() call after such a gap -- exactly backwards from
+    # its purpose. 0.5s is generous relative to a normally-running Phase 2
+    # loop's real inter-step gaps (even the documented ~90-180ms IK solve
+    # cost) while still bounding the worst case after a multi-second gap.
+    max_dt_s: 0.5
   noise_filter:
     # Smooths real AprilTag solvePnP jitter BEFORE the rate limiter above.
     # Complementary, not a replacement: the rate limiter only clamps deltas
@@ -75,23 +88,27 @@ perception:
     distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
     resolution: [640, 480]
   # Transform from d435_link (URDF mount frame) to camera optical frame.
-  # Re-calibrated via scripts/calibrate_camera_extrinsics.py against marker
-  # ID=0, flat (rpy measured as 0,0,0), physically measured at pelvis-frame
-  # (0.25, 0.0, 0.23), AFTER repositioning the marker to what the user
-  # judged the correct measurement point and AFTER fixing marker_size above
-  # from 0.04 to the correct 0.045. STILL TENTATIVE: from a single point so
-  # far -- see docs/followups.md for the multi-point verification procedure
-  # to run before trusting this fully, and for the full history of prior
-  # values (including the wrong-marker_size-era value and the immediately
-  # preceding single-point fit, both superseded below).
+  # REVERTED (2026-08-30) to the original standard-convention default. Every
+  # value below it in PREVIOUS VALUES was a single, non-collinear-unverified
+  # point fit via scripts/calibrate_camera_extrinsics.py -- the multi-point
+  # (3-4 non-collinear points) verification the procedure actually calls for
+  # was never run for any of them. After the marker_size bug (0.04 vs the
+  # correct 0.045) was fixed, the freshly-recomputed correction landed close
+  # to this same original default -- evidence the camera mount itself was
+  # never far off, and that the original ~10cm/9deg discrepancy that started
+  # this whole investigation was mostly the marker_size bug, not a real
+  # mounting error. See docs/followups.md for the full history. This does
+  # NOT touch T_d435_to_pelvis (Pinocchio FK against the URDF, never
+  # calibrated, untouched by any of this). Only replace this default again
+  # once a real multi-point-verified calibration exists.
   #
   # PREVIOUS VALUES (commented, for easy rollback -- most recent first):
-  #   xyz: [-0.0314, -0.0490, -0.0129]  rpy: [-1.5885, 0.0723, -1.4808]  # before marker was repositioned, marker_size=0.045
-  #   xyz: [-0.0860, -0.0002, -0.0384]  rpy: [-1.4118, 0.0076, -1.5896]  # before marker_size fix (was 0.04)
-  #   xyz: [0.0, 0.0, 0.0]              rpy: [-1.5708, 0.0, -1.5708]     # original, non-calibrated URDF default
+  #   xyz: [-0.0500, -0.0919, 0.0154]    rpy: [-1.7103, 0.0446, -1.4039]  # tentative single-point fit, marker repositioned again, marker_size=0.045
+  #   xyz: [-0.0314, -0.0490, -0.0129]   rpy: [-1.5885, 0.0723, -1.4808]  # before marker was repositioned, marker_size=0.045
+  #   xyz: [-0.0860, -0.0002, -0.0384]   rpy: [-1.4118, 0.0076, -1.5896]  # before marker_size fix (was 0.04)
   d435_link_to_optical:
-    xyz: [-0.0500, -0.0919, 0.0154]
-    rpy: [-1.7103, 0.0446, -1.4039]
+    xyz: [0.0, 0.0, 0.0]
+    rpy: [-1.5708, 0.0, -1.5708]
 
   # HOTFIX / EXPERIMENTAL (added 2026-08-23) -- NOT part of the real
   # calibration above. A raw, fixed offset applied directly in the pelvis
@@ -102,7 +119,7 @@ perception:
   # deliberately NOT into calibrate_camera_extrinsics.py, so it can never
   # silently contaminate a future real calibration fit. Revert by setting
   # back to [0.0, 0.0, 0.0] (or deleting this key).
-  pelvis_offset_hotfix: [0.0, 0.05, 0.0]
+  pelvis_offset_hotfix: [0.0, 0.0, 0.0]
 
   pointcloud_enabled: true   # request a 3D point cloud from the D435 (marker
                               # mode / real hardware only -- sine/mock/dry-run
@@ -228,10 +245,25 @@ grasp_approach:
   # old single straight-line approach that brought the palms in diagonally and
   # snagged on the object edges. The close is a squeeze ramp -pregrasp_offset->0,
   # continuous with the Phase 2 palm-press squeeze (0 -> +s).
-  pregrasp_offset: 0.04   # m: palms stand off this much wider per side before the
+  pregrasp_offset: 0.06   # m: palms stand off this much wider per side before the
                           #    straight-in close. MUST be < box_half_width (0.08).
                           #    Set to 0.0 to disable the standoff (direct approach).
-  close_time: 1.5         # s: duration of the straight-in lateral close (Phase 1b)
+  close_time: 1.5         # s: duration of the straight-in lateral close (Phase 1b /
+                          #    Phase 0b). This is a MINIMUM, not a fixed budget, once
+                          #    collision_avoidance.max_hand_speed_m_s is configured --
+                          #    close_phase_steps() (controllers/joint_path_execution.py)
+                          #    floors the step count so the close's smoothstep-peak
+                          #    Cartesian speed never exceeds that cap, extending past
+                          #    close_time whenever pregrasp_offset needs more time
+                          #    under it. Root-cause fix for a confirmed live-hardware
+                          #    incident: this phase used to be governed SOLELY by
+                          #    close_time, completely ignoring max_hand_speed_m_s --
+                          #    with pregrasp_offset=0.08 the true peak speed was a
+                          #    fixed ~0.08 m/s regardless of any configured cap (8x
+                          #    over a 0.01 m/s target), landing the hands on the
+                          #    object at unsafe speed right at the end of the
+                          #    approach even with Phase 1a/0a's own (correctly
+                          #    capped) RRT* reach already fixed.
 
 collision_avoidance:
   # Joint-space RRT* planner (kinematics/rrt_planner.py) that replaces the
@@ -242,7 +274,7 @@ collision_avoidance:
   # a long reach that could swing through the head.
   enabled: true           # false = old single straight-line approach (no RRT*, no
                           #         collision checking at all)
-  head_radius_m: 0.10      # m: PLACEHOLDER -- MEASURE THE REAL HEAD/OBJECT
+  head_radius_m: 0.05      # m: PLACEHOLDER -- MEASURE THE REAL HEAD/OBJECT
                           # RADIUS AND SET THIS DIRECTLY before the next live
                           # test. Replaces the old axis-aligned box.size-based
                           # obstacle with a sphere (orientation-invariant --
@@ -268,6 +300,51 @@ collision_avoidance:
                           # starts (StartInCollisionError on essentially every
                           # approach). 0.015 keeps that pose valid while still
                           # exceeding the documented calibration residual.
+  head_center_offset_m: [-0.03, 0.0, 0.0]  # additional [x,y,z] nudge to the sphere
+                                          # center, in the object marker's own
+                                          # rotation frame (same axes as the
+                                          # radius-based Z shift above -- X/Y are
+                                          # the marker's in-plane axes, Z is its
+                                          # "out of surface" axis). Added ON TOP
+                                          # of the existing radius-based offset,
+                                          # so [0,0,0] (default) reproduces
+                                          # today's behavior exactly (sphere's
+                                          # top surface sits at the marker, no
+                                          # extra shift). Use this to fit the
+                                          # sphere to a non-perfectly-spherical/
+                                          # off-center head without changing
+                                          # head_radius_m itself.
+  head_anchor_distance_m: null  # m: distance from the marker down to the head's
+                                 # true centroid, DECOUPLED from head_radius_m.
+                                 # null (default) means "same as head_radius_m",
+                                 # reproducing the old coupled behavior where
+                                 # shrinking/growing the radius also silently
+                                 # relocated the sphere's center. Once you have a
+                                 # real measured marker-to-centroid depth, set it
+                                 # here explicitly -- then head_radius_m can be
+                                 # tuned purely for collision-avoidance sizing
+                                 # (bigger = safer margin, smaller = more
+                                 # reachable poses near the head) WITHOUT also
+                                 # moving the sphere's center.
+  head_stack_count: 3      # PLACEHOLDER -- number of ADDITIONAL spheres stacked
+                            # below the primary one, same radius (head_radius_m),
+                            # extending the modeled obstacle volume further along
+                            # the marker's own "into the object" depth axis (world
+                            # -Z when no marker orientation is available, e.g.
+                            # grasp_sequence.py). Exists because a single sphere
+                            # only covers the volume right around the marker --
+                            # in some configurations RRT* correctly finds that one
+                            # sphere collision-free by routing a hand UNDER it,
+                            # which is unsafe in reality since there is more
+                            # physical head/neck and the table surface below that
+                            # a single sphere doesn't represent at all. 0 (default)
+                            # = today's single-sphere behavior, unchanged.
+  head_stack_spacing_m: 0.1  # m: center-to-center distance between consecutive
+                              # stacked spheres (including the primary -> first
+                              # stacked sphere). Should be LESS than
+                              # 2*head_radius_m so consecutive spheres overlap
+                              # and leave no gap an RRT edge could slip through.
+                              # Ignored when head_stack_count is 0.
   max_iters: 3000          # cheap to raise -- typical successful plans finish in
                           # ~0.05-0.1s, well under time_budget_s, so extra iteration
                           # headroom costs nothing in the common case and measurably
@@ -293,6 +370,110 @@ collision_avoidance:
   goal_connect_radius_rad: 0.4
   edge_check_resolution_rad: 0.05
   shortcut_attempts: 150
+  max_path_speed_rad_s: .5  # rad/s: PLACEHOLDER -- cap on the combined 14-DOF
+                               # joint-space speed (same vector-norm convention as
+                               # step_size_rad/rewire_radius_rad) during RRT*
+                               # waypoint playback (execute_joint_path). null
+                               # (default) = no cap, current behavior:
+                               # interpolation_time is a HARD budget regardless of
+                               # planned path length, so a long detour around the
+                               # head moves proportionally faster. When set,
+                               # interpolation_time becomes a MINIMUM instead --
+                               # execution automatically extends past it whenever
+                               # the path is long enough to need more time under
+                               # this cap. This is a bound on the TRUE PEAK rate
+                               # (not the segment average) -- execute_joint_path
+                               # internally scales the required-time derivation by
+                               # smoothstep's 1.5x peak-slope factor, since a live
+                               # incident confirmed the dangerous fast/violent
+                               # motion still happened with this cap active before
+                               # that correction (the cap was silently only
+                               # bounding the average, allowing a 1.5x-higher true
+                               # peak). UNMEASURED: start conservative (e.g.
+                               # 0.5-1.0 rad/s) and tune up live once confirmed
+                               # comfortable/safe.
+  max_hand_speed_m_s: .1  # m/s: PLACEHOLDER -- cap on Cartesian hand-tip
+                             # speed (worst-case of L/R hand, via ik.fk()) during
+                             # RRT* waypoint playback. Complements
+                             # max_path_speed_rad_s: joint-space rad/s alone
+                             # doesn't bound Cartesian speed, since the SAME
+                             # joint-space rate can move the hand much faster
+                             # through space if it comes from large proximal
+                             # joints (shoulder/elbow) vs. distal ones (wrist).
+                             # null (default) = no cap. Same true-peak-vs-average
+                             # correction as max_path_speed_rad_s applies here too
+                             # (see that comment) -- this bounds the true peak
+                             # Cartesian speed, not the segment average.
+                             # UNMEASURED: start conservative (e.g. 0.1-0.2 m/s)
+                             # and tune up live once confirmed comfortable/safe.
+  arrival_tolerance_rad: .05  # rad: PLACEHOLDER -- combined joint-space vector-norm
+                                # tolerance (same convention as step_size_rad) for
+                                # verifying the robot ACTUALLY reached the final
+                                # execute_joint_path waypoint before the phase is
+                                # declared done, instead of trusting total_time (fixed
+                                # or cap-derived) as a proxy for arrival. null (default)
+                                # = no check, current behavior. UNMEASURED: start
+                                # conservative (e.g. 0.05 rad) and tune live.
+  arrival_timeout_s: 5.0       # s: max time to wait for convergence before printing a
+                                # warning and proceeding anyway (no hard abort). Raised
+                                # from 2.0 -- real hardware settling after a multi-
+                                # waypoint RRT* reach can plausibly take longer than a
+                                # dry-run sim (no real actuator lag) would suggest.
+  arrival_poll_interval_s: 0.02  # s: how often to re-check convergence while waiting.
+  cartesian_arrival_tolerance_m: null    # m: PLACEHOLDER -- SECOND, independent arrival
+                                          # check alongside arrival_tolerance_rad, sharing
+                                          # the same poll loop and arrival_timeout_s budget
+                                          # (not a separate sequential wait). Requires
+                                          # BOTH this AND cartesian_arrival_tolerance_rad
+                                          # to be set (both null = this check disabled,
+                                          # current behavior). Checks the end effector's
+                                          # ACTUAL Cartesian position (via ik.fk(actual_q),
+                                          # worst of L/R hand) against the intended final
+                                          # Phase 1a/0a waypoint's pose -- arrival_tolerance_rad
+                                          # alone only confirms joint-space closeness, which
+                                          # does not guarantee Cartesian closeness (the same
+                                          # joint-space delta produces different Cartesian
+                                          # displacement depending on which joints it's
+                                          # concentrated in). Added because Phase 1b/0b's
+                                          # first solve_ik() call warm-starts from whatever
+                                          # current_q this function returns -- on live
+                                          # hardware (where the real arm can lag behind
+                                          # commanded targets, unlike the dry-run sim), a
+                                          # stale Cartesian handoff pose is a plausible
+                                          # source of a large first-tick jump right at the
+                                          # Phase1a->1b seam. UNMEASURED: start conservative
+                                          # (e.g. 0.01 m) and tune live.
+  cartesian_arrival_tolerance_rad: null  # rad: rotation-error companion to
+                                          # cartesian_arrival_tolerance_m above (angle-axis
+                                          # norm via pin.log3, same convention ik_solver.py's
+                                          # own IK cost function uses for rotation error;
+                                          # worst of L/R hand). Both must be set (non-null)
+                                          # to enable the Cartesian arrival check -- see that
+                                          # comment for the full reasoning. UNMEASURED: start
+                                          # conservative (e.g. 0.05 rad) and tune live.
+  max_step_rad: 0.05  # rad: HARD per-tick floor on execute_joint_path's n_steps --
+                       # no single commanded tick may move a segment more than this
+                       # many radians (combined 14-DOF vector norm), REGARDLESS of
+                       # max_path_speed_rad_s/max_hand_speed_m_s or the fixed
+                       # interpolation_time default. Root-cause fix for a confirmed
+                       # live-hardware incident: per-segment time was allocated
+                       # purely proportional to joint-space arc length, then
+                       # discretized via int(seg_time/control_dt) with NO floor --
+                       # a segment that happened to get a thin time slice (e.g. the
+                       # final RRT* goal-connect edge, after shortcut_path left
+                       # earlier segments consuming most of the budget) could
+                       # collapse to n_steps=1: one command at q_from, the very next
+                       # command one control_dt (20ms) later already at q_to. That's
+                       # a near-instant full-amplitude joint jump with nothing to
+                       # catch it (execute_joint_path calls set_joint_targets
+                       # directly, unlike every solve_ik()-driven phase which routes
+                       # through set_ee_targets's low-pass filter). This floor makes
+                       # that collapse structurally impossible: n_steps is now
+                       # max(time-derived, ceil(seg_length/max_step_rad)). 0.05 rad
+                       # matches edge_check_resolution_rad's granularity as a
+                       # starting point -- tune down for smoother-but-slower, up for
+                       # faster-but-still-bounded, but never remove/null this once a
+                       # live incident has been reproduced (see docs/followups.md).
   seed: null               # int for reproducible tests; null = nondeterministic live
 
 palm_press:

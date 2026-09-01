@@ -470,11 +470,52 @@ class G1HandIK:
 
         return sol_q, sol_tauff
 
+    def solve_ik_refined(self, L_target, R_target, current_q, n_refine=3):
+        """Repeatedly re-solve the same target, re-warm-starting from each
+        solve's own output, before returning.
+
+        For a single-shot solve_ik() call whose warm start (current_q) is far
+        from the target in joint space, IPOPT can terminate "successfully"
+        (converged within its own tolerance, well under max_iter) at a
+        solution that is still meaningfully off in Cartesian space -- e.g. a
+        confirmed 3cm position error from a single pass when current_q was an
+        extreme test-start pose, vs. ~1cm after a second pass re-warm-started
+        from that same output. This is a local-minimum/warm-start-quality
+        effect, not an IPOPT convergence failure (ipopt_exhaustion_count is
+        untouched by it), so raising max_iter alone would not help -- the
+        fix is simply to solve more than once from progressively better warm
+        starts. Intended for one-shot target solves used to seed something
+        else (e.g. the RRT planner's goal_q) rather than every-tick tracking
+        calls, since it costs n_refine solve_ik() calls instead of one, and
+        the smooth_cost term's meaning is different for a one-shot seed solve
+        (there is no real "previous timestep" to stay smooth relative to).
+        """
+        q = current_q
+        for _ in range(n_refine):
+            q, _ = self.solve_ik(L_target, R_target, q, np.zeros(self.reduced.model.nv))
+        return q
+
     def fk(self, q):
         """Forward kinematics — returns EE poses for a given joint config."""
         data = self.reduced.model.createData()
         pin.framesForwardKinematics(self.reduced.model, data, q)
         return data.oMf[self.L_ee_id], data.oMf[self.R_ee_id]
+
+    def reset_smoothing(self, q):
+        """Reseed the IK output smoothing filter and warm-start state from an
+        explicit joint config, discarding prior history.
+
+        Call this whenever the arm was moved by something other than
+        solve_ik() (e.g. execute_joint_path's direct set_joint_targets()
+        playback) -- otherwise smooth_filter's queue keeps blending fresh
+        solve_ik() output against stale pre-gap samples that have nothing to
+        do with where that motion actually left the arm, producing a
+        spurious corrective jump on the first solve_ik() call after the gap.
+        """
+        q = np.asarray(q, dtype=float).copy()
+        self.smooth_filter.queue = [q.copy() for _ in range(self.smooth_filter.window_size)]
+        self.smooth_filter.filtered = q.copy()
+        self.init_data = q.copy()
 
     def effective_joint_limits(self):
         """(lower, upper) joint position limits, INCLUDING the tightened

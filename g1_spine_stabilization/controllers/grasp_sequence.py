@@ -42,9 +42,12 @@ from g1_spine_stabilization.trajectory.targets import (
 from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep
 from g1_spine_stabilization.controllers.joint_path_execution import (
     execute_joint_path,
+    close_phase_steps,
     log_head_sphere,
     log_hand_collision_boxes,
+    log_hand_goal_targets,
 )
+from g1_spine_stabilization.kinematics.collision import build_head_obstacle_stack
 from g1_spine_stabilization.kinematics.rrt_planner import (
     plan_collision_free_approach,
     RRTPlanningError,
@@ -124,6 +127,7 @@ def run_grasp_phases(
     rate: float,
     preview_enabled: bool = False,
     dry_run: bool = True,
+    log_joint_path: str = None,
 ) -> None:
     """Run Phase 0 -> A -> B -> C -> D -> R.
 
@@ -175,9 +179,21 @@ def run_grasp_phases(
         # marker-top-anchored placement.
         head_radius = cfg.get("collision_avoidance", {}).get("head_radius_m", 0.10)
         sphere_center = box_center
+        # No marker orientation available here at all -- fall back to world
+        # -Z (gravity-down) for any configured head_stack_count spheres, a
+        # physically reasonable default (object/head sits on a surface below
+        # it) when there's no measured "into the object" axis to use instead.
+        sphere_stack_axis = np.array([0.0, 0.0, -1.0])
+        ca_cfg = cfg.get("collision_avoidance", {})
         if preview_enabled:
-            log_head_sphere(sphere_center, head_radius,
-                             cfg.get("collision_avoidance", {}).get("head_margin_m", 0.0))
+            stack_obstacles = build_head_obstacle_stack(
+                sphere_center, head_radius, ca_cfg.get("head_margin_m", 0.0),
+                stack_count=ca_cfg.get("head_stack_count", 0),
+                stack_spacing_m=ca_cfg.get("head_stack_spacing_m", 0.0),
+                axis=sphere_stack_axis,
+            )
+            stack_centers = [obs.placement.translation for obs in stack_obstacles]
+            log_head_sphere(stack_centers, head_radius, ca_cfg.get("head_margin_m", 0.0))
 
         # Two-stage approach mirroring sdk_pose_tracking.py's Phase 1a/1b:
         # gross reach to a pre-grasp standoff (RRT*-covered when
@@ -186,20 +202,48 @@ def run_grasp_phases(
         # approach is a different, already-bounded problem (see
         # kinematics/rrt_planner.py module docstring).
         L_pre, R_pre = compute_hand_targets(box_center, box_half_width, 0.0, squeeze=-pregrasp_offset)
+        if preview_enabled:
+            # Lets a human directly compare "where is Phase 0a/0b's IK/RRT
+            # goal" against the head obstacle sphere (log_head_sphere,
+            # logged above) in Rerun.
+            log_hand_goal_targets(L_pre, R_pre)
 
         print(f"[grasp_demo] Phase 0a: approaching pre-grasp standoff "
               f"(+{pregrasp_offset * 100:.1f}cm wider) over {interp_time}s…")
         if collision_avoidance_enabled:
-            goal_q, _ = ik.solve_ik(L_pre, R_pre, current_q, np.zeros(14))
+            # solve_ik_refined, not a single solve_ik() call -- see the
+            # matching comment in sdk_pose_tracking.py's Phase 1a: a
+            # one-shot solve from a warm start far from the target can
+            # converge to a locally-optimal solution several cm off, which
+            # the RRT planner then faithfully reaches as if it were correct.
+            goal_q = ik.solve_ik_refined(L_pre, R_pre, current_q)
             waypoints = plan_collision_free_approach(
                 ik, current_q, goal_q, sphere_center, head_radius, cfg,
+                axis=sphere_stack_axis,
             )
             print(f"[grasp_demo] RRT* path to standoff: {len(waypoints)} waypoints.")
             current_q = execute_joint_path(
                 robot, ik, interp_dt, waypoints, interp_time,
                 gravity_comp_enabled, None,
                 log_collision_geometry=preview_enabled,
+                max_speed_rad_s=cfg.get("collision_avoidance", {}).get("max_path_speed_rad_s", None),
+                max_cartesian_speed_m_s=cfg.get("collision_avoidance", {}).get("max_hand_speed_m_s", None),
+                arrival_tolerance_rad=cfg.get("collision_avoidance", {}).get("arrival_tolerance_rad", None),
+                arrival_timeout_s=cfg.get("collision_avoidance", {}).get("arrival_timeout_s", 2.0),
+                arrival_poll_interval_s=cfg.get("collision_avoidance", {}).get("arrival_poll_interval_s", 0.02),
+                max_step_rad=cfg.get("collision_avoidance", {}).get("max_step_rad", None),
+                log_path=log_joint_path,
+                cartesian_arrival_tolerance_m=cfg.get("collision_avoidance", {}).get("cartesian_arrival_tolerance_m", None),
+                cartesian_arrival_tolerance_rad=cfg.get("collision_avoidance", {}).get("cartesian_arrival_tolerance_rad", None),
             )
+            # execute_joint_path drives the arm via set_joint_targets()
+            # directly, never calling solve_ik() -- ik.smooth_filter's queue
+            # is therefore frozen at whatever it held before Phase 0a
+            # started. Without this reset, Phase 0b's first solve_ik() call
+            # blends a correct fresh solution against 3 stale, pre-Phase-0a
+            # samples, producing a large spurious corrective jump. See
+            # G1HandIK.reset_smoothing's docstring.
+            ik.reset_smoothing(current_q)
         else:
             n_steps = int(interp_time / interp_dt)
             for i in range(n_steps):
@@ -225,7 +269,10 @@ def run_grasp_phases(
 
         print(f"[grasp_demo] Phase 0b: closing straight in along the inter-palm "
               f"axis over {close_time}s…")
-        steps_close = max(1, int(close_time / interp_dt))
+        steps_close = close_phase_steps(
+            close_time, pregrasp_offset, interp_dt,
+            cfg.get("collision_avoidance", {}).get("max_hand_speed_m_s", None),
+        )
         sol_tauff = np.zeros(14)
         _last_log_t = time.monotonic() - 1.0  # fire on first step
         for i in range(steps_close):
