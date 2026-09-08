@@ -151,7 +151,12 @@ def main():
 
     frame_source = None
     if args.source == "realsense":
-        frame_source = RealSenseSource(dry_run=args.dry_run)
+        cam_cfg = perception.get("camera", {})
+        frame_source = RealSenseSource(
+            width=cam_cfg.get("width", 640), height=cam_cfg.get("height", 480),
+            fps=cam_cfg.get("fps", 30), stream=cam_cfg.get("stream", "color"),
+            emitter_enabled=cam_cfg.get("emitter_enabled", False), dry_run=args.dry_run,
+        )
         native = frame_source.intrinsics_native
         intrinsics = CameraIntrinsics(
             fx=native["fx"], fy=native["fy"], cx=native["cx"], cy=native["cy"],
@@ -159,6 +164,10 @@ def main():
         )
         detector = AprilTagDetector(perception["marker_dict"], perception["marker_size"])
         T_opt_to_d435 = optical_to_d435_from_config(perception["d435_link_to_optical"])
+        if frame_source.ir_to_color_extrinsic is not None:
+            T_opt_to_d435 = T_opt_to_d435 @ frame_source.ir_to_color_extrinsic
+            print("[record_human_trial] stream=infrared: composed d435_link_to_optical "
+                  "with the camera's live IR-left->color extrinsic.")
         # No robot/IK object in scope -- pure Pinocchio FK on the URDF for a
         # camera-mount-frame constant, same pattern as visualize_markers.py's
         # run_realsense(). No actuation; this is the SAME reference frame the

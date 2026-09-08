@@ -44,6 +44,7 @@ from g1_spine_stabilization.controllers.joint_path_execution import (
     execute_joint_path,
     close_phase_steps,
     log_head_sphere,
+    log_floor_plane,
     log_hand_collision_boxes,
     log_hand_goal_targets,
 )
@@ -194,6 +195,10 @@ def run_grasp_phases(
             )
             stack_centers = [obs.placement.translation for obs in stack_obstacles]
             log_head_sphere(stack_centers, head_radius, ca_cfg.get("head_margin_m", 0.0))
+            floor_z = ca_cfg.get("floor_z_m", None)
+            if floor_z is not None:
+                log_floor_plane(floor_z, ca_cfg.get("floor_margin_m", 0.0),
+                                 center_xy=sphere_center[:2])
 
         # Two-stage approach mirroring sdk_pose_tracking.py's Phase 1a/1b:
         # gross reach to a pre-grasp standoff (RRT*-covered when

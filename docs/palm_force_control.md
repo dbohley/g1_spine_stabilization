@@ -311,6 +311,30 @@ weight fingers; fuse palm + finger signals. Out of scope for v1.
 
 ---
 
+## 7.5 No-target-marker hold + `--target-force` (real-world grip testing)
+
+When `--source marker` finds only the **object** marker (no target/torso marker in
+frame), `sdk_pose_tracking.py` still grasps normally, but instead of releasing
+immediately it **holds the grasp with the grip loop still running live** —
+palm-press keeps converging on/holding `force_target`, and the contact-loss
+watchdog stays armed — until a human presses **SPACE** (or Ctrl-C) in the
+terminal. This is deliberately non-blocking (`utils/keyboard.py`'s
+`SpacebarWatcher`, cbreak mode, no Enter needed) rather than a blocking
+`input()` gate, precisely so the press loop and safety watchdog don't go dead
+for the whole hold. Periodic status lines print the live force/press reading.
+
+`run_pose_tracking_preview.py --target-force N` overrides `palm_press.force_target`
+for that one run, clamped into the configured `[force_min, force_max]` bounds
+(`controllers/palm_force.py`'s `clamp_target_force`) — a value above `force_max`
+is clamped to it with a printed warning rather than actually attempted. No
+effect if `palm_press.enabled` is false (a warning prints instead). This is the
+supported way to try a specific grip force live without hand-editing YAML:
+
+```
+python scripts/run_pose_tracking_preview.py --source marker --tracking orient-only \
+    --target-force 3.0 --no-dry-run
+```
+
 ## 8. Safety / Hard Rules
 
 - Live steps (`--no-dry-run`, any actuation) are **human-run only**, robot

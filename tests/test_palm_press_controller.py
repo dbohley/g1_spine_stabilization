@@ -8,7 +8,7 @@ clamping into [force_min, force_max], and reset.
 import numpy as np
 import pytest
 
-from g1_spine_stabilization.controllers.palm_force import PalmPressController
+from g1_spine_stabilization.controllers.palm_force import PalmPressController, clamp_target_force
 
 
 def _make(**kw):
@@ -87,3 +87,34 @@ def test_no_guard_uses_F_for_guard():
 def test_rejects_min_greater_than_max():
     with pytest.raises(ValueError):
         PalmPressController(kappa=1e-3, s_max=0.05, force_min=10.0, force_target=5.0, force_max=1.0)
+
+
+# ---------------------------------------------------------------------
+# clamp_target_force -- the --target-force CLI safety clamp
+# ---------------------------------------------------------------------
+
+def test_clamp_target_force_within_bounds_is_unchanged():
+    value, warning = clamp_target_force(3.0, force_min=0.7, force_max=8.0)
+    assert value == 3.0
+    assert warning is None
+
+
+def test_clamp_target_force_above_max_is_clamped_with_warning():
+    value, warning = clamp_target_force(50.0, force_min=0.7, force_max=8.0)
+    assert value == 8.0
+    assert warning is not None
+    assert "force_max" in warning
+
+
+def test_clamp_target_force_below_min_is_clamped_with_warning():
+    value, warning = clamp_target_force(0.1, force_min=0.7, force_max=8.0)
+    assert value == 0.7
+    assert warning is not None
+    assert "force_min" in warning
+
+
+def test_clamp_target_force_at_exact_bounds_is_unchanged_no_warning():
+    lo, warn_lo = clamp_target_force(0.7, force_min=0.7, force_max=8.0)
+    hi, warn_hi = clamp_target_force(8.0, force_min=0.7, force_max=8.0)
+    assert lo == 0.7 and warn_lo is None
+    assert hi == 8.0 and warn_hi is None

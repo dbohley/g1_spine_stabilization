@@ -115,6 +115,63 @@ true/padded convention as the single-sphere case) as one multi-sphere
 `obstacles/head_true`/`obstacles/head_padded` Rerun entity, so the whole
 stack is visible together in the viewer.
 
+## Floor/table plane (`floor_z_m`)
+
+Spheres (single or stacked) are still an approximation of the real
+obstacle volume. `collision_avoidance.floor_z_m` adds a **hard Z-axis
+limit** instead — a half-space "wall," solid on the side at or below a
+configured pelvis-frame height, that RRT* (and the goal check) treat
+exactly like any other obstacle. This is the simplest, most direct way to
+guarantee the arm never goes below a physical surface (a table, or the
+floor), independent of how well the head sphere/stack happens to be sized
+or placed.
+
+Implemented via `kinematics/collision.py`'s `build_floor_obstacle(z_min,
+margin_m, normal)`, using `hppfcl.Halfspace` — a genuine
+`CollisionGeometry`, the same base class as the sphere's `hppfcl.Sphere` —
+reusing the existing `HeadObstacle` container (placement + padded/true
+shape pair) with zero changes to `CollisionChecker`. The floor is appended
+to the same obstacle list the head sphere/stack already builds, so it's
+checked alongside them automatically whenever `floor_z_m` is configured;
+no controller call-site changes are needed (unlike the head sphere, the
+floor is a fixed world/pelvis-frame constant, not derived from a tracked
+marker, so it's read directly from config inside
+`plan_collision_free_approach`).
+
+**Both tiers matter here, not just transit — this is the one place the
+sphere's own goal-exception rationale does NOT apply.** For the head
+sphere, the goal is *meant* to sit close to the true surface (the whole
+point of a standoff), so the goal check uses the unpadded radius. For a
+floor/table, there's no such exception: neither the transit path NOR the
+final grasp goal should ever legitimately be below a real physical
+surface. So `floor_z_m`'s `padded_shape` (transit) sits `floor_margin_m`
+**higher** than `true_shape` (goal) — same "padded = more conservative"
+direction as `head_margin_m`, just applied uniformly here since there's no
+goal carve-out to make.
+
+Config (`collision_avoidance:`):
+```yaml
+floor_z_m: null        # null (default) = disabled, today's behavior unchanged
+floor_margin_m: 0.0     # transit floor sits this much higher than the exact
+                        # floor_z_m used for the goal check
+```
+
+**Tuning trap, worth stating plainly:** `floor_z_m` must sit BELOW every Z
+height the arm legitimately needs to reach — its resting pose, and every
+grasp/standoff height — or it will immediately trigger a failure mode the
+moment collision avoidance runs: `StartInCollisionError` if the resting
+pose itself is already "below the floor" (checked against the *padded*
+tier), or `GoalInCollisionError` if the standoff/grasp goal is (checked
+against the *true* tier). Verified directly: with `floor_z_m` set well
+above the robot's normal working height, `plan_collision_free_approach`'s
+very first precondition check raised `StartInCollisionError` naming a real
+arm link — the safety-abort path works exactly like the head sphere's, no
+special-casing needed. Set it comfortably below the lowest Z the arm
+actually needs during the approach/grasp, verify visually in Rerun
+(`obstacles/floor_true`/`obstacles/floor_padded`, same red/orange
+convention, rendered as a wide flat box near the tracked object/workspace)
+before trusting it live.
+
 ## Failure modes
 
 All three planning failures are subclasses of `RRTPlanningError`

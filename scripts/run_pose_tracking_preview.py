@@ -49,6 +49,7 @@ from g1_spine_stabilization.trajectory.sources import (
     SineSource, MarkerSource, RateLimitedSource, NoiseFilteredSource,
 )
 from g1_spine_stabilization.controllers.sdk_pose_tracking import run_pose_tracking_sdk
+from g1_spine_stabilization.controllers.palm_force import clamp_target_force
 from g1_spine_stabilization.controllers.joint_path_execution import log_marker_observations
 from g1_spine_stabilization.data_recording.recorder import RunRecorder
 from g1_spine_stabilization.sensors.force_torque import ForceTorqueSource
@@ -120,7 +121,12 @@ class _AnimatedMockTracker:
 def _run_detect(perception, obj_id, tgt_id):
     """Open the camera, scan for ~5s, print detected AprilTag IDs, then return."""
     print("[detect] Opening RealSense camera…")
-    frame_source = RealSenseSource()
+    cam_cfg = perception.get("camera", {})
+    frame_source = RealSenseSource(
+        width=cam_cfg.get("width", 640), height=cam_cfg.get("height", 480),
+        fps=cam_cfg.get("fps", 30), stream=cam_cfg.get("stream", "color"),
+        emitter_enabled=cam_cfg.get("emitter_enabled", False),
+    )
     native = frame_source.intrinsics_native
     intrinsics = CameraIntrinsics(
         fx=native["fx"], fy=native["fy"],
@@ -207,6 +213,17 @@ def main():
         help="Disable the F/T sensor for this run (e.g. sensor unplugged).",
     )
     parser.add_argument(
+        "--target-force", type=float, default=None, metavar="N",
+        help="Override palm_press.force_target (Newtons) for this run -- the "
+             "palm-press loop will drive the hands together until this force "
+             "is read on the palms, then hold it. Clamped to the configured "
+             "[force_min, force_max] safety bounds (force_max is the hard "
+             "crush-guard ceiling -- see docs/palm_force_control.md for how "
+             "to pick a reasonable value via a pull-test). No effect if "
+             "palm_press.enabled is false in config. Default: use the "
+             "configured palm_press.force_target unchanged.",
+    )
+    parser.add_argument(
         "--wait-for-keypress", action="store_true",
         help="--source marker only: after both markers are detected, wait for "
              "Enter instead of the fixed 3s countdown before Phase 1 begins. "
@@ -269,6 +286,24 @@ def main():
     obj_id = perception["object_marker_id"]
     tgt_id = perception["target_marker_id"]
 
+    if args.target_force is not None:
+        palm_press_cfg = cfg.setdefault("palm_press", {})
+        if not palm_press_cfg.get("enabled", False):
+            print(f"[preview] WARNING: --target-force {args.target_force:.2f}N was "
+                  f"given but palm_press.enabled is false in config -- palm-press "
+                  f"grip is off, so this has NO effect. (Finger-force mode's "
+                  f"equivalent, grip_force.tau_baseline, is config-only.)")
+        else:
+            force_min = palm_press_cfg.get("force_min", 0.0)
+            force_max = palm_press_cfg.get("force_max", 0.0)
+            effective, warning = clamp_target_force(args.target_force, force_min, force_max)
+            if warning is not None:
+                print(f"[preview] WARNING: {warning}")
+            print(f"[preview] Palm-press target force: requested={args.target_force:.2f}N, "
+                  f"effective={effective:.2f}N  "
+                  f"(configured bounds: force_min={force_min:.2f}N, force_max={force_max:.2f}N)")
+            palm_press_cfg["force_target"] = effective
+
     print("[preview] Marker roles (configurable in configs/default.yaml):")
     print(f"  Object marker  ID={obj_id}  → attach to the held object/box  (captures starting pose)")
     print(f"  Target marker  ID={tgt_id}  → the reference you move to command the arms")
@@ -306,6 +341,7 @@ def main():
     # Default box center in pelvis frame (same as run_pose_tracking_sim)
     box_size = list(cfg["box"]["size"])
     box_half_height = box_size[2] / 2   # object marker sits on TOP of the box, not its center
+    box_center_offset = cfg["box"].get("center_offset_m")
     box_center_pelvis = np.array([
         L_EE_DEFAULT[0], 0.0, L_EE_DEFAULT[2],
     ])
@@ -355,6 +391,7 @@ def main():
         )
         source = MarkerSource(mock_tracker, obj_id, tgt_id, mode=args.tracking, countdown=0.0,
                               box_half_height=box_half_height,
+                              box_center_offset=box_center_offset,
                               on_observations=log_marker_observations)
         duration = None   # use config default
         cam_for_preview = RealSenseCamera(dry_run=True)
@@ -363,7 +400,11 @@ def main():
 
     elif args.source == "marker":
         print("[preview] Setting up live RealSense + AprilTag tracker…")
+        cam_cfg = perception.get("camera", {})
         frame_source = RealSenseSource(
+            width=cam_cfg.get("width", 640), height=cam_cfg.get("height", 480),
+            fps=cam_cfg.get("fps", 30), stream=cam_cfg.get("stream", "color"),
+            emitter_enabled=cam_cfg.get("emitter_enabled", False),
             preview=preview,
             pointcloud=perception.get("pointcloud_enabled", True),
         )
@@ -379,6 +420,14 @@ def main():
               f"a mismatch here scales solvePnP's recovered translation and can look "
               f"like a calibration error.")
         T_opt_to_d435  = optical_to_d435_from_config(perception["d435_link_to_optical"])
+        if frame_source.ir_to_color_extrinsic is not None:
+            # Infrared mode: perception.d435_link_to_optical is calibrated for
+            # the color optical frame, so bridge the gap with the camera's own
+            # live-queried factory extrinsic (IR-left -> color) rather than
+            # requiring a second manual calibration.
+            T_opt_to_d435 = T_opt_to_d435 @ frame_source.ir_to_color_extrinsic
+            print(f"[preview] stream=infrared: composed d435_link_to_optical with the "
+                  f"camera's live IR-left->color extrinsic.")
         # Zero-waist assumption -- corrected below with the robot's actual
         # live waist reading, once it's connected (low_state isn't populated
         # yet at this point in the script). Used as-is for sine/mock, and as
@@ -415,6 +464,7 @@ def main():
         )
         source = MarkerSource(tracker, obj_id, tgt_id, mode=args.tracking, countdown=3.0,
                               box_half_height=box_half_height,
+                              box_center_offset=box_center_offset,
                               wait_for_keypress=args.wait_for_keypress,
                               on_observations=log_marker_observations)
         duration = float("inf")   # run until Ctrl+C

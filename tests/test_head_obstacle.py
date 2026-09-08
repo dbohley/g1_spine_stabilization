@@ -6,9 +6,12 @@ No G1HandIK needed -- fast.
 import numpy as np
 import pytest
 
+import hppfcl
+
 from g1_spine_stabilization.kinematics.collision import (
     build_head_obstacle,
     build_head_obstacle_stack,
+    build_floor_obstacle,
     head_sphere_center_from_marker,
 )
 
@@ -228,3 +231,48 @@ def test_stacked_spheres_overlap_when_spacing_less_than_two_radius():
     )
     dist = np.linalg.norm(obstacles[1].placement.translation - obstacles[0].placement.translation)
     assert dist < obstacles[0].true_shape.radius + obstacles[1].true_shape.radius
+
+
+def test_floor_shapes_are_halfspaces():
+    floor = build_floor_obstacle(0.05, margin_m=0.02)
+    assert isinstance(floor.true_shape, hppfcl.Halfspace)
+    assert isinstance(floor.padded_shape, hppfcl.Halfspace)
+
+
+def test_floor_true_shape_d_equals_z_min():
+    floor = build_floor_obstacle(0.05, margin_m=0.02)
+    assert floor.true_shape.d == pytest.approx(0.05)
+
+
+def test_floor_padded_shape_d_is_z_min_plus_margin():
+    """Padded (transit) sits HIGHER than true (goal) -- opposite-feeling
+    from the sphere case at first glance, but the same underlying
+    convention (padded = more conservative): a floor has no goal
+    exception, so raising the transit floor by margin_m is what makes it
+    the more conservative of the two."""
+    floor = build_floor_obstacle(0.05, margin_m=0.02)
+    assert floor.padded_shape.d == pytest.approx(0.07)
+
+
+def test_floor_margin_zero_matches_true_and_padded():
+    floor = build_floor_obstacle(0.05, margin_m=0.0)
+    assert floor.padded_shape.d == pytest.approx(floor.true_shape.d)
+
+
+def test_floor_default_normal_is_world_z():
+    floor = build_floor_obstacle(0.05)
+    np.testing.assert_allclose(floor.true_shape.n, [0.0, 0.0, 1.0])
+
+
+def test_floor_custom_normal_is_normalized():
+    floor = build_floor_obstacle(0.05, normal=[0.0, 0.0, 5.0])
+    np.testing.assert_allclose(floor.true_shape.n, [0.0, 0.0, 1.0])
+
+
+def test_floor_placement_is_trivial():
+    """The plane's location is carried entirely in each shape's own `d`,
+    not in `placement` (unlike the sphere builders) -- placement should be
+    identity/zero regardless of z_min."""
+    floor = build_floor_obstacle(0.42)
+    np.testing.assert_allclose(floor.placement.translation, np.zeros(3))
+    np.testing.assert_allclose(floor.placement.rotation, np.eye(3))

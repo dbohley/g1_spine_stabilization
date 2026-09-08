@@ -228,6 +228,85 @@ def test_box_half_height_zero_default_matches_pre_change_behavior():
     np.testing.assert_allclose(box_center, obj_pos, atol=1e-9)
 
 
+def test_box_center_offset_none_default_matches_pre_change_behavior():
+    """box_center_offset=None (default) reproduces the exact old behavior:
+    no additional nudge beyond box_half_height."""
+    obj_pos = np.array([0.35, 0.0, 0.20])
+    H = 0.08
+    tracker = _StaticObjTracker(obj_pos, obj_theta=0.0, tgt_pos=BOX_CENTER)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0,
+                          box_half_height=H)
+    box_center = source.startup()
+    expected = obj_pos - np.array([0.0, 0.0, H])
+    np.testing.assert_allclose(box_center, expected, atol=1e-9)
+
+
+def test_box_center_offset_world_z_case_orient_only():
+    """With an identity-rotation object marker, box_center_offset is added
+    directly in world/pelvis axes, on top of the box_half_height shift."""
+    obj_pos = np.array([0.35, 0.0, 0.20])
+    H = 0.08
+    offset = np.array([-0.03, 0.01, 0.0])
+    tracker = _StaticObjTracker(obj_pos, obj_theta=0.0, tgt_pos=BOX_CENTER)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0,
+                          box_half_height=H, box_center_offset=offset)
+    box_center = source.startup()
+    expected = obj_pos - np.array([0.0, 0.0, H]) + offset
+    np.testing.assert_allclose(box_center, expected, atol=1e-9)
+
+
+def test_box_center_offset_follows_tilted_marker_orientation():
+    """With a tilted object marker, box_center_offset is expressed in the
+    marker's own rotation frame and rotated into world frame -- proving it
+    doesn't assume world axes, mirroring box_half_height's own tilt test.
+
+    Uses a Y-component offset (not X): theta rotates about X, so an X-only
+    offset is invariant under the tilt and couldn't distinguish "rotated
+    correctly" from "added raw in world axes" -- Y actually moves (into Z
+    here), which is what makes this test meaningful."""
+    obj_pos = np.array([0.35, 0.0, 0.20])
+    H = 0.08
+    theta = math.pi / 2
+    offset = np.array([0.0, 0.02, 0.0])
+    tracker = _StaticObjTracker(obj_pos, obj_theta=theta, tgt_pos=BOX_CENTER)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0,
+                          box_half_height=H, box_center_offset=offset)
+    box_center = source.startup()
+
+    ct, st = math.cos(theta), math.sin(theta)
+    R = np.array([[1, 0, 0], [0, ct, -st], [0, st, ct]])
+    expected = obj_pos - H * R[:, 2] + R @ offset
+    np.testing.assert_allclose(box_center, expected, atol=1e-9)
+
+    world_frame_expected = obj_pos - H * R[:, 2] + offset
+    assert not np.allclose(box_center, world_frame_expected, atol=1e-3), (
+        "box_center_offset should follow the marker's tilted orientation, "
+        "not be added in raw world axes"
+    )
+
+
+def test_box_center_offset_propagates_through_6dof_tracking():
+    """The offset is baked into the anchor (_object_start_pos) at startup(),
+    so it must still be present after the target marker moves in 6dof mode --
+    not just at the initial startup() reading."""
+    obj_pos = np.array([0.35, 0.0, 0.20])
+    H = 0.08
+    offset = np.array([-0.03, 0.0, 0.0])
+    tgt_start = np.array([0.5, 0.0, 0.3])
+    tracker = _SequenceTracker([
+        (obj_pos, tgt_start, 0.0),
+        (obj_pos, tgt_start, 0.0),
+        (obj_pos, tgt_start + np.array([0.05, 0.0, 0.0]), 0.0),
+    ])
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="6dof", countdown=0.0,
+                          box_half_height=H, box_center_offset=offset)
+    source.startup()
+    box_center, _theta = source.step()
+    expected_anchor = obj_pos - np.array([0.0, 0.0, H]) + offset
+    expected = expected_anchor + np.array([0.05, 0.0, 0.0])
+    np.testing.assert_allclose(box_center, expected, atol=1e-9)
+
+
 def test_step_returns_last_known_on_empty_frame():
     """When no new detection, step() returns the previously seen values."""
     class _TwoShotThenEmpty:

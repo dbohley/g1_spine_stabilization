@@ -341,12 +341,31 @@ class _ObjectOnlyMarkerTracker:
         return self._obj_obs if marker_id == self.OBJ_ID else None
 
 
+class _FakeReleaseWatcher:
+    """Injectable stand-in for keyboard.SpacebarWatcher -- reports pressed()
+    True once its `after`-th call is reached, so tests can drive the
+    no-target-marker hold loop deterministically without a real TTY."""
+
+    def __init__(self, after=0, raise_on_call=None):
+        self.after = after
+        self.raise_on_call = raise_on_call
+        self.calls = 0
+
+    def pressed(self):
+        self.calls += 1
+        if self.raise_on_call is not None and self.calls >= self.raise_on_call:
+            raise KeyboardInterrupt()
+        return self.calls > self.after
+
+
 def test_pose_tracking_sdk_skips_tracking_when_target_marker_not_found(
     dry_robot, ik, cfg_fast, monkeypatch
 ):
     """If the target/torso marker is never detected at startup, the grasp
     (Phase 0/1/1.5) must still complete and release cleanly -- Phase 2
-    (tracking) must be skipped entirely, not crash the whole run."""
+    (tracking) must be skipped entirely, not crash the whole run. Uses a fake
+    release_watcher that reports pressed immediately, so the new hold-until-
+    space phase (see below) exits right away for this test's purposes."""
     from g1_spine_stabilization.controllers.grip_force import HAND_OPEN_POSE
 
     tracker = _ObjectOnlyMarkerTracker(obj_pos=np.array([0.35, 0.0, 0.1]))
@@ -360,12 +379,70 @@ def test_pose_tracking_sdk_skips_tracking_when_target_marker_not_found(
 
     recorded = _record_hand_commands(monkeypatch, dry_robot)
 
-    run_pose_tracking_sdk(dry_robot, ik, cfg_fast, source, duration=0.05)
+    run_pose_tracking_sdk(dry_robot, ik, cfg_fast, source, duration=0.05,
+                          release_watcher=_FakeReleaseWatcher(after=0))
 
     assert source.target_found is False
     assert step_calls == [], "source.step() is only called in Phase 2 -- it must never run"
     # Grasp (Phase 1.5) still happened and hands still released (Phase 1.5
     # gate depends only on _phase1_interrupted, not on tracking_available).
+    assert len(recorded) > 0
+    np.testing.assert_allclose(recorded[-1], HAND_OPEN_POSE, atol=1e-3)
+
+
+def test_pose_tracking_sdk_holds_grasp_until_release_watcher_signals(
+    dry_robot, ik, cfg_fast, monkeypatch, capsys
+):
+    """No target marker: the arm must be actively held (repeated
+    set_joint_targets calls, i.e. the grip loop runs LIVE) across several
+    ticks before release, not release on the very first check -- this is the
+    real-world grip-strength-testing scenario the hold phase exists for."""
+    tracker = _ObjectOnlyMarkerTracker(obj_pos=np.array([0.35, 0.0, 0.1]))
+    source = MarkerSource(tracker, _ObjectOnlyMarkerTracker.OBJ_ID,
+                          _ObjectOnlyMarkerTracker.TGT_ID,
+                          mode="orient-only", countdown=0.0)
+
+    arm_calls = []
+    original_set_arm_targets = dry_robot.arm.set_joint_targets
+
+    def recording_set_arm_targets(q14, tau_ff14=None):
+        arm_calls.append(np.asarray(q14).copy())
+        return original_set_arm_targets(q14, tau_ff14)
+
+    monkeypatch.setattr(dry_robot.arm, "set_joint_targets", recording_set_arm_targets)
+
+    n_before_hold = len(arm_calls)
+    watcher = _FakeReleaseWatcher(after=5)
+
+    run_pose_tracking_sdk(dry_robot, ik, cfg_fast, source, duration=0.05,
+                          release_watcher=watcher)
+
+    assert watcher.calls == 6, "hold loop should tick exactly `after`+1 times before releasing"
+    out = capsys.readouterr().out
+    assert "Holding grasp" in out
+    assert "Phase 3" in out
+    assert "Settling for" in out
+
+
+def test_pose_tracking_sdk_hold_keyboard_interrupt_still_releases(
+    dry_robot, ik, cfg_fast, monkeypatch
+):
+    """A KeyboardInterrupt raised while waiting in the no-target-marker hold
+    phase must not propagate out -- hands must still release and Phase 3
+    must still run, mirroring the existing Phase-2-interrupt guarantee."""
+    from g1_spine_stabilization.controllers.grip_force import HAND_OPEN_POSE
+
+    tracker = _ObjectOnlyMarkerTracker(obj_pos=np.array([0.35, 0.0, 0.1]))
+    source = MarkerSource(tracker, _ObjectOnlyMarkerTracker.OBJ_ID,
+                          _ObjectOnlyMarkerTracker.TGT_ID,
+                          mode="orient-only", countdown=0.0)
+    recorded = _record_hand_commands(monkeypatch, dry_robot)
+    watcher = _FakeReleaseWatcher(after=100, raise_on_call=2)
+
+    # Must not raise.
+    run_pose_tracking_sdk(dry_robot, ik, cfg_fast, source, duration=0.05,
+                          release_watcher=watcher)
+
     assert len(recorded) > 0
     np.testing.assert_allclose(recorded[-1], HAND_OPEN_POSE, atol=1e-3)
 

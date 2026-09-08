@@ -72,6 +72,35 @@ def log_head_sphere(center, radius, margin_m):
         ))
 
 
+def log_floor_plane(z_min, margin_m, center_xy=(0.0, 0.0), half_extent=1.0):
+    """Log the RRT* floor/table obstacle (collision_avoidance.floor_z_m) to
+    Rerun as a large, thin, translucent box at z=z_min (pelvis frame) --
+    same true (red)/padded (orange) convention as log_head_sphere, so the
+    two obstacle types read consistently in the viewer. The actual
+    collision check is an infinite half-space (X/Y don't matter to it at
+    all) -- `center_xy`/`half_extent` are PURE rendering choices, letting
+    the visualized patch sit near the tracked object/workspace (pass
+    sphere_center[:2] or box_center[:2]) instead of defaulting to the
+    pelvis origin, which would render far from where the arm actually
+    works. No preview parameter (matches log_head_sphere's convention) --
+    callers gate the call themselves. No-op if rerun isn't installed."""
+    if not _HAS_RERUN:
+        return
+    _THICKNESS = 0.001
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    rr.log("obstacles/floor_true", rr.Boxes3D(
+        centers=[[cx, cy, float(z_min)]],
+        half_sizes=[[half_extent, half_extent, _THICKNESS]],
+        colors=[[255, 80, 80, 90]], fill_mode="solid",
+    ))
+    if margin_m > 0:
+        rr.log("obstacles/floor_padded", rr.Boxes3D(
+            centers=[[cx, cy, float(z_min) + margin_m]],
+            half_sizes=[[half_extent, half_extent, _THICKNESS]],
+            colors=[[255, 200, 80, 40]], fill_mode="solid",
+        ))
+
+
 def log_hand_goal_targets(L_target, R_target):
     """Log the Cartesian SE3 targets Phase 1a/1b's IK/RRT are solving
     toward (targets/L_hand, targets/R_hand -- same entity names and

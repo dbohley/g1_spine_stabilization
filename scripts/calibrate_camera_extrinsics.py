@@ -126,13 +126,22 @@ def main():
     T_optical_to_d435 = optical_to_d435_from_config(perception["d435_link_to_optical"])
 
     print("[calibrate] Opening RealSense camera...")
-    frame_source = RealSenseSource()
+    cam_cfg = perception.get("camera", {})
+    frame_source = RealSenseSource(
+        width=cam_cfg.get("width", 640), height=cam_cfg.get("height", 480),
+        fps=cam_cfg.get("fps", 30), stream=cam_cfg.get("stream", "color"),
+        emitter_enabled=cam_cfg.get("emitter_enabled", False),
+    )
     native = frame_source.intrinsics_native
     intrinsics = CameraIntrinsics(
         fx=native["fx"], fy=native["fy"],
         cx=native["cx"], cy=native["cy"],
         distortion=np.asarray(native["distortion"]),
     )
+    if frame_source.ir_to_color_extrinsic is not None:
+        T_optical_to_d435 = T_optical_to_d435 @ frame_source.ir_to_color_extrinsic
+        print("[calibrate] stream=infrared: composed d435_link_to_optical with the "
+              "camera's live IR-left->color extrinsic.")
     detector = AprilTagDetector(perception["marker_dict"], perception["marker_size"])
     tracker = MarkerTracker(
         frame_source, detector, intrinsics, T_optical_to_d435, T_d435_to_pelvis

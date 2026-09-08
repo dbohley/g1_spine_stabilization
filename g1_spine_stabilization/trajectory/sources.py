@@ -105,6 +105,21 @@ class MarkerSource:
                            placed perfectly level. Default 0.0 preserves the
                            old behavior (marker position taken as box_center
                            directly).
+        box_center_offset: additional [x, y, z] nudge to box_center, expressed
+                           in the object marker's own rotation frame (same
+                           axis convention as box_half_height's shift above --
+                           X/Y are the marker's in-plane axes, Z is its "out
+                           of surface" axis), rotated into world/pelvis frame
+                           and added on top of the box_half_height shift at
+                           startup() Phase A. Mirrors kinematics/collision.py's
+                           head_sphere_center_from_marker `offset` param
+                           exactly, but for the actual grasp target rather
+                           than the (separate, unrelated) RRT collision
+                           sphere. Lets the real grasp point be fit to a
+                           marker that isn't perfectly centered on the held
+                           object, without touching box_half_height itself.
+                           None (default) reproduces the old behavior exactly
+                           (no additional nudge).
         on_observations:   optional callback(obj_obs, tgt_obs) invoked on
                            EVERY self._tracker.step() call this class makes
                            (Phase A/B/C's wait/countdown loops AND step()),
@@ -122,8 +137,8 @@ class MarkerSource:
 
     def __init__(self, tracker, object_marker_id, target_marker_id,
                  mode="orient-only", countdown=0.0, control_dt=0.02,
-                 box_half_height=0.0, wait_for_keypress=False,
-                 on_observations=None):
+                 box_half_height=0.0, box_center_offset=None,
+                 wait_for_keypress=False, on_observations=None):
         if mode not in ("orient-only", "6dof"):
             raise ValueError(f"mode must be 'orient-only' or '6dof', got {mode!r}")
         self._tracker = tracker
@@ -134,6 +149,8 @@ class MarkerSource:
         self._wait_for_keypress = wait_for_keypress
         self._control_dt = control_dt
         self._box_half_height = float(box_half_height)
+        self._box_center_offset = (None if box_center_offset is None
+                                   else np.asarray(box_center_offset, dtype=float))
         self._on_observations = on_observations  # see _step_tracker()
         self._object_start_pos = None  # object's own position, set once by startup(), never changes
         self._object_marker_pos = None  # RAW object marker pose (pre-box_half_height-offset),
@@ -209,6 +226,9 @@ class MarkerSource:
                 # Marker sits on top of the object -- shift down along its own
                 # measured "out of the surface" axis to recover the true center.
                 self._object_start_pos = marker_pos - self._box_half_height * marker_R[:, 2]
+                if self._box_center_offset is not None:
+                    self._object_start_pos = (self._object_start_pos
+                                              + marker_R @ self._box_center_offset)
                 self._box_center = self._object_start_pos.copy()
                 marker_rpy_deg = np.degrees(Rotation.from_matrix(marker_R).as_euler('xyz'))
                 print(f"[MarkerSource] Object marker detected: box_center={np.round(self._box_center, 4)}")

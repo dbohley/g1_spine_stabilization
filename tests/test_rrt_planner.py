@@ -13,7 +13,11 @@ import numpy as np
 import pytest
 
 from g1_spine_stabilization.kinematics.ik_solver import G1HandIK
-from g1_spine_stabilization.kinematics.collision import build_head_obstacle, CollisionChecker
+from g1_spine_stabilization.kinematics.collision import (
+    build_head_obstacle,
+    build_floor_obstacle,
+    CollisionChecker,
+)
 from g1_spine_stabilization.kinematics.rrt_planner import (
     plan_collision_free_approach,
     RRTStarPlanner,
@@ -159,6 +163,84 @@ def test_start_in_collision_raises_start_error(ik):
 
     with pytest.raises(StartInCollisionError):
         plan_collision_free_approach(ik, q_start, q_goal, sphere_center, radius, cfg)
+
+
+def _low_q(shoulder_pitch=1.0384615384615388):
+    """A joint config with a genuinely low left-hand Z (~-0.105m), found by
+    sweeping shoulder_pitch -- verified manually before this session's
+    floor-obstacle implementation. Everything else stays at zero."""
+    q = np.zeros(14)
+    q[0] = shoulder_pitch
+    return q
+
+
+def test_floor_obstacle_catches_a_genuinely_low_hand(ik):
+    """Direct CollisionChecker test (no RRT/config involved) mirroring the
+    manual verification done before implementing build_floor_obstacle: a
+    low hand pose is correctly flagged by both tiers, a normal/resting
+    pose is not. floor_z=0.02/margin=0.02 (padded floor at 0.04) is chosen
+    so the WHOLE zero-config arm/hand chain clears it -- the lowest zero-
+    config arm/hand geometry (a finger segment) sits at z~0.065, comfortably
+    above 0.04; a naive higher floor_z would instead catch a finger/elbow
+    at zero config too, which isn't what this test is checking."""
+    floor = build_floor_obstacle(0.02, margin_m=0.02)
+    checker = CollisionChecker(ik, [floor])
+
+    q_low = _low_q()
+    assert not checker.is_valid_contact(q_low)
+    assert not checker.is_valid_transit(q_low)
+
+    q_normal = np.zeros(14)
+    assert checker.is_valid_contact(q_normal)
+    assert checker.is_valid_transit(q_normal)
+
+
+def test_floor_obstacle_names_the_colliding_link(ik):
+    floor = build_floor_obstacle(0.02, margin_m=0.0)
+    checker = CollisionChecker(ik, [floor])
+    culprit = checker.first_colliding_geometry(_low_q(), checker._true_pair_ids)
+    assert culprit is not None
+
+
+def test_plan_collision_free_approach_raises_goal_error_for_floor_via_config(ik):
+    """The config-driven path (floor_z_m read inside plan_collision_free_approach
+    itself, not a direct CollisionChecker construction) must also raise --
+    confirms the actual wiring, not just build_floor_obstacle in isolation.
+    Head sphere placed far away so only the floor plays a role here."""
+    q_start = np.zeros(14)
+    q_goal = _low_q()
+    far_away_center = np.array([50.0, 50.0, 50.0])
+    cfg = {
+        **_TEST_CA_CFG,
+        "collision_avoidance": {**_TEST_CA_CFG["collision_avoidance"], "floor_z_m": 0.05},
+    }
+
+    with pytest.raises(GoalInCollisionError):
+        plan_collision_free_approach(ik, q_start, q_goal, far_away_center, 0.01, cfg)
+
+
+def test_plan_collision_free_approach_raises_start_error_for_floor_via_config(ik):
+    q_start = _low_q()
+    q_goal = np.zeros(14)
+    far_away_center = np.array([50.0, 50.0, 50.0])
+    cfg = {
+        **_TEST_CA_CFG,
+        "collision_avoidance": {**_TEST_CA_CFG["collision_avoidance"], "floor_z_m": 0.05},
+    }
+
+    with pytest.raises(StartInCollisionError):
+        plan_collision_free_approach(ik, q_start, q_goal, far_away_center, 0.01, cfg)
+
+
+def test_plan_collision_free_approach_unaffected_when_floor_z_m_absent(ik):
+    """floor_z_m absent (not just None-but-present) from config must not
+    change behavior at all -- the .get(..., None) default path."""
+    q_start, q_goal, sphere_center, radius = _obstructed_start_goal(ik)
+    # _TEST_CA_CFG has no floor_z_m key at all -- this should behave
+    # identically to test_finds_path_around_deliberately_placed_obstacle.
+    path = plan_collision_free_approach(ik, q_start, q_goal, sphere_center, radius, _TEST_CA_CFG)
+    np.testing.assert_allclose(path[0], q_start)
+    np.testing.assert_allclose(path[-1], q_goal)
 
 
 def _stack_hitting_only_the_second_sphere(ik, q_goal, radius=0.05):

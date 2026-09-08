@@ -207,6 +207,33 @@ class PalmForceReader:
         self._subs.clear()
 
 
+def clamp_target_force(requested: float, force_min: float, force_max: float):
+    """Clamp a requested palm-press force_target (N) into the configured
+    [force_min, force_max] safety bounds -- the same bounds PalmPressController
+    already enforces at runtime via its release-only crush guard, applied here
+    up front so a CLI override can't even ask for an unsafe target.
+
+    Returns (effective_value, warning) -- warning is None unless requested was
+    above force_max (the crush-guard ceiling), in which case it's a short
+    human-readable string explaining the clamp.
+    """
+    requested = float(requested)
+    if requested > force_max:
+        return float(force_max), (
+            f"requested target force {requested:.2f}N exceeds the configured "
+            f"crush-guard ceiling force_max={force_max:.2f}N -- clamping to "
+            f"{force_max:.2f}N. See docs/palm_force_control.md for how force_max "
+            f"is set (pull-test)."
+        )
+    if requested < force_min:
+        return float(force_min), (
+            f"requested target force {requested:.2f}N is below the configured "
+            f"hold floor force_min={force_min:.2f}N -- clamping to "
+            f"{force_min:.2f}N."
+        )
+    return requested, None
+
+
 class PalmPressController:
     """Outer Cartesian press loop: bounded scalar integral law on press depth s.
 

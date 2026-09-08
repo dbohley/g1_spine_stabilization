@@ -273,7 +273,9 @@ def plan_collision_free_approach(ik, q_start: np.ndarray, q_goal: np.ndarray,
     """
     # Imported here (not at module top) to keep collision.py's hppfcl/coal
     # dependency lazy for any caller that only needs the planner's exceptions.
-    from g1_spine_stabilization.kinematics.collision import build_head_obstacle_stack, CollisionChecker
+    from g1_spine_stabilization.kinematics.collision import (
+        build_head_obstacle_stack, build_floor_obstacle, CollisionChecker,
+    )
 
     ca_cfg = cfg.get("collision_avoidance", {})
     obstacles = build_head_obstacle_stack(
@@ -282,6 +284,13 @@ def plan_collision_free_approach(ik, q_start: np.ndarray, q_goal: np.ndarray,
         stack_spacing_m=ca_cfg.get("head_stack_spacing_m", 0.0),
         axis=axis,
     )
+    # Floor/table plane: a fixed pelvis-frame constant (unlike the head
+    # sphere/stack, which depend on the tracked marker), so it's read
+    # directly from config here rather than threaded through as a caller
+    # argument -- applies automatically to every call site once configured.
+    floor_z = ca_cfg.get("floor_z_m", None)
+    if floor_z is not None:
+        obstacles.append(build_floor_obstacle(floor_z, ca_cfg.get("floor_margin_m", 0.0)))
     checker = CollisionChecker(ik, obstacles)
     lower, upper = ik.effective_joint_limits()
 

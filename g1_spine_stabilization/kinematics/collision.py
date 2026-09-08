@@ -26,9 +26,16 @@ import hppfcl
 
 @dataclass
 class HeadObstacle:
+    """Generic static collision obstacle: a placement plus a padded/true
+    CollisionGeometry shape pair. Despite the name (this module started
+    sphere-only), the fields are shape-agnostic in practice --
+    CollisionChecker only ever calls generic CollisionGeometry/Pinocchio
+    APIs on padded_shape/true_shape, so this same dataclass is reused for
+    both sphere obstacles (build_head_obstacle) and plane obstacles
+    (build_floor_obstacle, an hppfcl.Halfspace instead of an hppfcl.Sphere)."""
     placement: pin.SE3
-    padded_shape: "hppfcl.Sphere"
-    true_shape: "hppfcl.Sphere"
+    padded_shape: "hppfcl.CollisionGeometry"
+    true_shape: "hppfcl.CollisionGeometry"
 
 
 def build_head_obstacle(center, radius: float, margin_m: float) -> HeadObstacle:
@@ -84,6 +91,37 @@ def build_head_obstacle_stack(center, radius: float, margin_m: float,
         stacked_center = center + i * stack_spacing_m * axis
         obstacles.append(build_head_obstacle(stacked_center, radius, margin_m))
     return obstacles
+
+
+def build_floor_obstacle(z_min: float, margin_m: float = 0.0,
+                          normal=(0.0, 0.0, 1.0)) -> HeadObstacle:
+    """Static half-space obstacle (a 'floor' or 'table') -- everything on
+    the solid side of the plane (by default, z <= z_min in pelvis frame) is
+    treated as an obstacle. Reuses HeadObstacle's generic
+    placement+padded/true-shape structure (despite the name, it's shape-
+    agnostic -- CollisionChecker only ever calls generic
+    CollisionGeometry/pin APIs on padded_shape/true_shape, verified working
+    identically for hppfcl.Halfspace as for hppfcl.Sphere).
+
+    Unlike the head sphere (where the goal is MEANT to sit close to the
+    true surface), there's no legitimate reason for either RRT transit OR
+    the final goal to be below a real physical floor/table -- so padded
+    (transit) sits margin_m HIGHER than true (goal), same directional
+    convention as head_margin_m (padded = more conservative), applied
+    here to both checks since there's no goal exception to carve out.
+
+    `normal`, default world/pelvis +Z: the direction pointing AWAY from
+    the solid region (i.e. "up" off the floor). placement is trivial
+    (identity, zero translation) -- the plane's location is carried
+    entirely in each shape's own `d` parameter for simplicity, unlike the
+    sphere builders which carry their center in `placement`.
+    """
+    n = np.asarray(normal, dtype=float)
+    n = n / np.linalg.norm(n)
+    placement = pin.SE3(np.eye(3), np.zeros(3))
+    padded_shape = hppfcl.Halfspace(n, float(z_min) + float(margin_m))
+    true_shape = hppfcl.Halfspace(n, float(z_min))
+    return HeadObstacle(placement=placement, padded_shape=padded_shape, true_shape=true_shape)
 
 
 def head_sphere_center_from_marker(marker_pos, marker_R, radius: float, offset=None, anchor_distance=None) -> np.ndarray:
