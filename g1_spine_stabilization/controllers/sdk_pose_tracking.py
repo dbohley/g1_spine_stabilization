@@ -53,9 +53,11 @@ except ImportError:
 from g1_spine_stabilization.controllers.grip_force import GraspController
 from g1_spine_stabilization.controllers.palm_force import (
     PalmForceReader,
+    WristWrenchForceReader,
     PalmPressController,
     PalmContactWatchdog,
     PalmForceController,
+    PressSeatDetector,
 )
 from g1_spine_stabilization.controllers.joint_path_execution import (
     execute_joint_path,
@@ -76,9 +78,10 @@ from g1_spine_stabilization.kinematics.rrt_planner import (
 )
 from g1_spine_stabilization.diagnostics.run_log import RUN_LOG
 from g1_spine_stabilization.utils.keyboard import SpacebarWatcher
-from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep, Rx
+from g1_spine_stabilization.utils.transforms import make_se3, slerp_rotation, smoothstep, as_rotation
 from g1_spine_stabilization.trajectory.targets import (
     compute_hand_targets,
+    apply_palm_tilt,
     compute_press_wrenches,
     R_L_BASE,
     R_R_BASE,
@@ -184,7 +187,8 @@ def _obs_rotation(obs):
     return obs.pose_in_pelvis[:3, :3]
 
 
-def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=None):
+def _log_marker_info(source, rotation, elapsed, preview, L_target=None, R_target=None,
+                     verbose=False):
     """Print augmented per-step marker diagnostics and optionally push to Rerun.
 
     L_target/R_target (optional): the actual computed compute_hand_targets()
@@ -194,33 +198,51 @@ def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=No
     lets a human directly compare "where is the IK target" vs. "where is the
     marker" vs. "where does the arm actually end up" in the live Rerun view.
 
-    Also logs markers/applied_shift: source.box_center (+ the tracked theta
+    Also logs markers/applied_shift: source.box_center (+ the tracked
     rotation), the corrected/tracked object-center pose compute_hand_targets
     is actually built from -- distinct from the raw object marker's own pose.
     With box_half_height > 0 this should sit visibly below markers/object,
     confirming the marker-sits-on-top correction is applied as intended.
+
+    `rotation` (renamed from `theta`) is the tracked rotation fed to
+    compute_hand_targets this step -- scalar or (3,3), same convention as
+    compute_hand_targets's own theta arg. Since the fix in
+    docs/six_dof_tracking_fix.md, it's normally a full (3,3) rotation, so
+    the diagnostic below prints full roll/pitch/yaw + total angle instead of
+    a single X-axis degree value.
     """
+    _R = as_rotation(rotation)
+    _rpy = _rpy_deg(_R)
+    _angle_deg = math.degrees(np.linalg.norm(_Rot.from_matrix(_R).as_rotvec()))
     print(f"[SDKController] t={elapsed:.1f}s  "
-          f"theta_Rx (target marker rot about robot X axis) = {math.degrees(theta):+.1f}°")
+          f"tracked rotation (pelvis frame): rpy=[{_rpy[0]:+.1f}°, {_rpy[1]:+.1f}°, "
+          f"{_rpy[2]:+.1f}°]  |angle|={_angle_deg:.1f}°")
 
     obj_obs = getattr(source, 'last_obj_obs', None)
     tgt_obs = getattr(source, 'last_tgt_obs', None)
 
-    if obj_obs is not None:
-        p = obj_obs.pose_in_pelvis[:3, 3]
-        rpy = _rpy_deg(obj_obs.pose_in_pelvis[:3, :3])
-        print(f"  Object marker:  pos=[{p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f}]  "
-              f"rpy=[{rpy[0]:+.1f}°, {rpy[1]:+.1f}°, {rpy[2]:+.1f}°]")
-    else:
-        print("  Object marker:  (no observation this step)")
+    # Raw per-marker pose dump -- verbose only, same rationale as the
+    # transform-chain block below: it is a calibration/perception debugging
+    # aid, and at ~1Hz it buries the lines that matter during a live run
+    # (press SEATED, GP ARMED, safety warnings). The tracked-rotation header
+    # above and the Tracking delta below stay unconditional -- those ARE the
+    # tracking signal, not raw sensor spam.
+    if verbose:
+        if obj_obs is not None:
+            p = obj_obs.pose_in_pelvis[:3, 3]
+            rpy = _rpy_deg(obj_obs.pose_in_pelvis[:3, :3])
+            print(f"  Object marker:  pos=[{p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f}]  "
+                  f"rpy=[{rpy[0]:+.1f}°, {rpy[1]:+.1f}°, {rpy[2]:+.1f}°]")
+        else:
+            print("  Object marker:  (no observation this step)")
 
-    if tgt_obs is not None:
-        p = tgt_obs.pose_in_pelvis[:3, 3]
-        rpy = _rpy_deg(tgt_obs.pose_in_pelvis[:3, :3])
-        print(f"  Target marker:  pos=[{p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f}]  "
-              f"rpy=[{rpy[0]:+.1f}°, {rpy[1]:+.1f}°, {rpy[2]:+.1f}°]")
-    else:
-        print("  Target marker:  (no observation this step)")
+        if tgt_obs is not None:
+            p = tgt_obs.pose_in_pelvis[:3, 3]
+            rpy = _rpy_deg(tgt_obs.pose_in_pelvis[:3, :3])
+            print(f"  Target marker:  pos=[{p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f}]  "
+                  f"rpy=[{rpy[0]:+.1f}°, {rpy[1]:+.1f}°, {rpy[2]:+.1f}°]")
+        else:
+            print("  Target marker:  (no observation this step)")
 
     if obj_obs is not None and tgt_obs is not None:
         R_obj = obj_obs.pose_in_pelvis[:3, :3]
@@ -236,11 +258,13 @@ def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=No
     # optical-frame reading, d435-mount frame, or final pelvis frame) is
     # responsible for a real-world calibration discrepancy (e.g. a marker
     # appearing at a different height in Rerun than its physical position).
+    # Printed only under verbose (--verbose); off by default since it is a
+    # calibration-debugging aid, not routine run output.
     # Only available when source wraps a real MarkerTracker with
     # get_diagnostic_pose (not SineSource, and not MockMarkerTracker, which
     # has no transform chain to report -- --source mock/sine simply won't
     # print this section).
-    tracker = getattr(source, 'tracker', None)
+    tracker = getattr(source, 'tracker', None) if verbose else None
     get_diagnostic_pose = getattr(tracker, 'get_diagnostic_pose', None)
     if get_diagnostic_pose is not None:
         obj_id = getattr(source, 'obj_id', None)
@@ -263,7 +287,6 @@ def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=No
     if _HAS_RERUN and preview is not None:
         box_center = getattr(source, 'box_center', None)
         if box_center is not None:
-            _R = Rx(theta)
             rr.log("markers/applied_shift", rr.Arrows3D(
                 origins=[box_center, box_center, box_center],
                 vectors=[_R[:, 0] * _AXIS_LEN,
@@ -293,7 +316,8 @@ def _log_marker_info(source, theta, elapsed, preview, L_target=None, R_target=No
 def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                           preview=None, cam_for_preview=None, recorder=None,
                           wrench_source=None, test_start_pose=None,
-                          log_joint_path=None, release_watcher=None):
+                          pause_after_test_pose=False,
+                          log_joint_path=None, release_watcher=None, verbose=False):
     """Run the three-phase pose-tracking controller via the SDK transport.
 
     Args:
@@ -373,21 +397,40 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     ctrl_r = GraspController(grip_cfg) if use_hands else None
 
     # Palm-force press loop: outer Cartesian loop driving a scalar press depth s
-    # that shrinks the hand-target separation in compute_hand_targets. Reader is
-    # a pure DDS consumer (dry_run -> 0 N, so this whole path no-ops headlessly).
+    # that shrinks the hand-target separation in compute_hand_targets.
+    # force_source selects the sensing input -- palm_sensor (PalmForceReader,
+    # a pure DDS consumer, dry_run -> 0N) or wrist_wrench (WristWrenchForceReader,
+    # derived from measured joint torque -- see controllers/palm_force.py for
+    # why: no hardware wrist F/T sensor exists on this robot/SDK). Both expose
+    # the same target_force()/guard_force()/capture_baseline()/update()/close()
+    # interface, so nothing downstream branches on which one is active.
     reader = None
     press_ctrl = None
     watchdog = None
     force_ctrl = None
+    seat_detector = None
+    palm_press_hold_mode = palm_press_cfg.get("hold_mode", "seat")
+
+    # GP feedforward arming (see trajectory/sources.py's PredictiveSource).
+    # Read here with the other config; consumed at the top of Phase 2.
+    _gp_cfg = cfg.get("trajectory", {}).get("gp_predict", {})
+    _gp_arm_after_seat = _gp_cfg.get("arm_after_seat", True)
+    _gp_arm_timeout = _gp_cfg.get("arm_timeout_s", None)
     if palm_press_enabled:
-        reader = PalmForceReader(
-            ["left", "right"],
-            dry_run=bool(getattr(robot, "dry_run", False)),
-            counts_per_newton=palm_press_cfg.get("counts_per_newton", 1.0),
-            baseline_frames=palm_press_cfg.get("baseline_frames", 20),
-            noise_threshold=palm_press_cfg.get("noise_threshold", 0.0),
-            signal=palm_press_cfg.get("signal", "min"),
-        )
+        force_source = palm_press_cfg.get("force_source", "palm_sensor")
+        if force_source == "wrist_wrench":
+            reader = WristWrenchForceReader(
+                robot, ik, signal=palm_press_cfg.get("signal", "mean"),
+            )
+        else:
+            reader = PalmForceReader(
+                ["left", "right"],
+                dry_run=bool(getattr(robot, "dry_run", False)),
+                counts_per_newton=palm_press_cfg.get("counts_per_newton", 1.0),
+                baseline_frames=palm_press_cfg.get("baseline_frames", 20),
+                noise_threshold=palm_press_cfg.get("noise_threshold", 0.0),
+                signal=palm_press_cfg.get("signal", "mean"),
+            )
         # Position-mode press loop (the default / fallback). Always constructed so
         # the position path works and its force_target is available for logging.
         press_ctrl = PalmPressController(
@@ -396,6 +439,12 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
             force_min=palm_press_cfg.get("force_min", 0.0),
             force_target=palm_press_cfg.get("force_target", 0.0),
             force_max=palm_press_cfg.get("force_max", 0.0),
+            # Step-and-settle: advance the press in bounded increments with a
+            # pause between them, so each increment is judged against a force
+            # reading that reflects the previous one rather than stale data.
+            # None (config default) keeps the original continuous law.
+            step_increment=palm_press_cfg.get("step_increment", None),
+            settle_time=palm_press_cfg.get("settle_time", 0.0),
         )
         # Jacobian-mode force controller (Road 1): output is a press-force
         # magnitude F_cmd turned into torque feedforward tau = J^T W. Only built
@@ -411,13 +460,43 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         # Contact-loss safety guard: freeze the press (never keep squeezing a
         # dropped/slipped head) once the grip is real and force then falls away.
         # No-op in dry-run (reader = 0 N never arms it). Shared by both modes.
+        # Gated by palm_press.watchdog_enabled so the guard can be turned off
+        # WITHOUT disabling the whole palm-press loop (palm_press.enabled would
+        # kill the press itself too). watchdog_latch=False (the config default)
+        # makes a confirmed loss recoverable rather than ending the run's press.
         # See palm_force.py.
-        watchdog = PalmContactWatchdog(
-            touch_threshold=palm_press_cfg.get("touch_threshold", 0.5),
-            loss_floor=palm_press_cfg.get("loss_floor", 0.2),
-            loss_frames=palm_press_cfg.get("loss_frames", 3),
-        )
-        print(f"[SDKController] Palm-press grip: mode={palm_press_mode}"
+        if palm_press_cfg.get("watchdog_enabled", True):
+            watchdog = PalmContactWatchdog(
+                touch_threshold=palm_press_cfg.get("touch_threshold", 0.5),
+                loss_floor=palm_press_cfg.get("loss_floor", 0.2),
+                loss_frames=palm_press_cfg.get("loss_frames", 3),
+                latch=palm_press_cfg.get("watchdog_latch", False),
+            )
+        else:
+            print("[SDKController] Palm contact-loss watchdog DISABLED "
+                  "(palm_press.watchdog_enabled=false) -- the press will not be "
+                  "frozen if contact is lost.")
+        # Seat-and-freeze: the press loop's job is to ESTABLISH the grip, not to
+        # keep regulating force while Phase 2 is trying to track. Because the
+        # press depth s feeds compute_hand_targets directly, continuous
+        # regulation fights the tracker on the press axis (with noise, under
+        # force_source: wrist_wrench). Once seated, s is held fixed and tracking
+        # owns the hand targets. hold_mode: continuous restores the old
+        # always-regulating behavior for hardware A/B. See palm_force.py.
+        if palm_press_hold_mode == "seat":
+            seat_detector = PressSeatDetector(
+                force_target=press_ctrl.force_target,
+                tolerance=palm_press_cfg.get("seat_tolerance", 0.5),
+                frames=palm_press_cfg.get("seat_frames", 5),
+                # Both hands must individually be loaded before the grip can
+                # seat -- the aggregate signal alone cannot distinguish a
+                # balanced press from one hand doing all the work.
+                per_hand_min=palm_press_cfg.get("seat_per_hand_min", None),
+            )
+        print(f"[SDKController] Palm-press grip: mode={palm_press_mode}, "
+              f"hold_mode={palm_press_hold_mode}"
+              + (f" (tol={seat_detector.tolerance:.2f}N x{seat_detector.frames} frames)"
+                 if seat_detector is not None else "")
               + (f", seat={seat_squeeze * 1000:.1f}mm, F_des={press_ctrl.force_target:.2f}N, "
                  f"tau_press_max={tau_press_max:.1f}Nm" if palm_press_jacobian else ""))
 
@@ -430,6 +509,12 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         L_test_target, R_test_target = test_start_pose
         _drive_to_test_pose(robot, ik, control_dt, interpolation_time,
                             gravity_comp_enabled, L_test_target, R_test_target)
+        if pause_after_test_pose:
+            # The SDK's 250 Hz publisher thread keeps re-publishing the last
+            # set_joint_targets() call, so the arm holds here for free.
+            print("[SDKController] Holding test start pose. "
+                  "Press Enter to continue into tracking (Ctrl-C to abort)...")
+            input()
 
     # ---------------------------------------------------------------
     # Source startup — detect object marker or initialise sine timer
@@ -519,7 +604,12 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     # free function) so it can read the grip objects/config already
     # constructed above without a long parameter list.
     # ---------------------------------------------------------------
-    _contact_lost_warned = {"flag": False}
+    # Edge-triggered contact-loss logging: prints on each loss->regain
+    # transition rather than once per run, so the log shows the real history
+    # when the watchdog is non-latching (palm_press.watchdog_latch=false).
+    _contact_state = {"tripped": False}
+    # Same dict-in-closure pattern for the one-shot "press seated" announcement.
+    _seat_state = {"seated": False}
 
     def _grip_and_hold_tick(tick_box_center, theta, tick_current_q):
         """One tick: palm-press or finger-force regulation, then IK + arm
@@ -530,28 +620,79 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         F_cmd = 0.0
         F_palm = F_guard = 0.0
         if palm_press_enabled:
+            # Refresh this tick's reading. No-op for PalmForceReader (fed by
+            # its own background DDS callback); required for
+            # WristWrenchForceReader, which has no background thread and
+            # needs this tick's theta/grasp_frame_R to compute anything.
+            reader.update(theta, grasp_frame_R)
             F_palm  = reader.target_force()
             F_guard = reader.guard_force()
+            # Per-hand readings, kept alongside the aggregate: the combined
+            # signal alone cannot tell a balanced grip from a lopsided one
+            # (left +6N / right 0N averages to the same value as +3/+3), and
+            # the seat gate below must reject the lopsided case. Both reader
+            # types expose force(side), so this needs no internals.
+            F_left  = reader.force("left")
+            F_right = reader.force("right")
             # Contact-loss safety guard (see palm_force.py). Update first;
             # a trip FREEZES the press (position: hold last depth; jacobian:
             # zero the wrench) and holds pose stiffly via kp -- it does NOT
-            # retreat or end the run.
-            watchdog.update(F_palm)
-            frozen = watchdog.press_frozen
-            if frozen and watchdog.tripped and not _contact_lost_warned["flag"]:
-                print("[SDKController] [SAFETY] palm contact lost — press "
-                      "frozen, holding pose stiffly (head may have dropped/slipped).")
-                _contact_lost_warned["flag"] = True
+            # retreat or end the run. None when palm_press.watchdog_enabled
+            # is false, in which case the press is never frozen at all.
+            frozen = False
+            if watchdog is not None:
+                watchdog.update(F_palm)
+                frozen = watchdog.press_frozen
+                if watchdog.tripped and not _contact_state["tripped"]:
+                    print("[SDKController] [SAFETY] palm contact lost — press "
+                          "frozen, holding pose stiffly (head may have dropped/"
+                          "slipped). Tracking CONTINUES; Ctrl-C to stop.")
+                    _contact_state["tripped"] = True
+                elif _contact_state["tripped"] and not watchdog.tripped:
+                    print("[SDKController] [SAFETY] palm contact regained — "
+                          "press resuming.")
+                    _contact_state["tripped"] = False
+            # Seat-and-freeze, checked AHEAD of the watchdog freeze branch: a
+            # seated press is held regardless of watchdog state, and stays held
+            # even if contact is later lost. Losing contact must flag loudly
+            # (the [SAFETY] prints above) but must NOT hand the hand targets
+            # back to the force loop mid-tracking. None in hold_mode:
+            # continuous, where the press regulates for the whole run as before.
+            if seat_detector is not None:
+                seat_detector.update(F_palm, per_hand=(F_left, F_right))
+                if seat_detector.seated and not _seat_state["seated"]:
+                    _seat_state["seated"] = True
+                    if palm_press_jacobian:
+                        print(f"[SDKController] Palm press SEATED at "
+                              f"F_cmd={force_ctrl.F_cmd:.2f}N (F={F_palm:.2f}N, "
+                              f"L={F_left:.2f}N R={F_right:.2f}N, "
+                              f"target={force_ctrl.force_target:.2f}N) — commanded "
+                              f"press force now HELD; tracking owns the hand targets.")
+                    else:
+                        print(f"[SDKController] Palm press SEATED at "
+                              f"s={press_ctrl.s * 1000:.1f}mm (F={F_palm:.2f}N, "
+                              f"L={F_left:.2f}N R={F_right:.2f}N, "
+                              f"target={press_ctrl.force_target:.2f}N) — press depth "
+                              f"now HELD; tracking owns the hand targets.")
+
+            seated = seat_detector is not None and seat_detector.seated
             if palm_press_jacobian:
-                F_cmd = 0.0 if frozen else force_ctrl.step(F_palm)
-            elif frozen:
-                squeeze = press_ctrl.s        # position mode: hold last depth
+                # Seated: hold the converged commanded wrench (the force-mode
+                # equivalent of a frozen depth) instead of re-stepping the loop.
+                if frozen:
+                    F_cmd = 0.0
+                else:
+                    F_cmd = force_ctrl.F_cmd if seated else force_ctrl.step(F_palm)
+            elif seated or frozen:
+                # press_ctrl.s already holds the converged (or last) depth.
+                squeeze = press_ctrl.s
             else:
                 squeeze = press_ctrl.step(F_palm, F_guard)
 
         L_target, R_target = compute_hand_targets(
             tick_box_center, box_half_width, theta, squeeze=squeeze, grasp_frame_R=grasp_frame_R,
         )
+        L_target, R_target = apply_palm_tilt(L_target, R_target, tilt_L_deg, tilt_R_deg)
 
         current_dq = np.zeros(14)
         sol_q, sol_tauff = ik.solve_ik(L_target, R_target, tick_current_q, current_dq)
@@ -563,7 +704,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         tau_ff = sol_tauff.copy() if gravity_comp_enabled else np.zeros(14)
         tau_press_peak = 0.0
         if palm_press_jacobian:
-            W_L, W_R = compute_press_wrenches(theta, F_cmd)
+            W_L, W_R = compute_press_wrenches(theta, F_cmd, grasp_frame_R=grasp_frame_R)
             J_L, J_R = ik.ee_jacobians(sol_q)
             tau_press = J_L.T @ W_L + J_R.T @ W_R
             tau_press = np.clip(tau_press, -tau_press_max, tau_press_max)
@@ -586,6 +727,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
         diag = {
             "squeeze": squeeze, "F_palm": F_palm, "F_guard": F_guard,
             "F_cmd": F_cmd, "tau_press_peak": tau_press_peak,
+            "seated": _seat_state["seated"],
             "L_target": L_target, "R_target": R_target, "sol_tauff": sol_tauff,
         }
         return sol_q, diag
@@ -605,6 +747,8 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
     approach_cfg    = cfg.get("grasp_approach", {})
     pregrasp_offset = approach_cfg.get("pregrasp_offset", 0.04)
     close_time      = approach_cfg.get("close_time", 1.5)
+    tilt_L_deg      = approach_cfg.get("palm_tilt_deg_left", [0.0, 0.0, 0.0])
+    tilt_R_deg      = approach_cfg.get("palm_tilt_deg_right", [0.0, 0.0, 0.0])
 
     steps_interp = int(interpolation_time / control_dt)
     steps_close  = close_phase_steps(
@@ -621,6 +765,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
 
     L_pre, R_pre = compute_hand_targets(box_center, box_half_width, 0.0,
                                         squeeze=-pregrasp_offset, grasp_frame_R=grasp_frame_R)
+    L_pre, R_pre = apply_palm_tilt(L_pre, R_pre, tilt_L_deg, tilt_R_deg)
     if _HAS_RERUN and preview is not None:
         # Lets a human directly compare "where is Phase 1a/1b's IK/RRT goal"
         # against the head obstacle sphere (log_head_sphere, logged above)
@@ -676,6 +821,24 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
             if _HAS_RERUN and preview is not None:
                 log_hand_goal_targets_actual(L_goal_actual, R_goal_actual)
 
+            # Logged BEFORE the plan call, not after: plan() raises
+            # StartInCollisionError/GoalInCollisionError from its own
+            # preconditions, so the "plan" record below (which carries the
+            # same q_start/q_goal) never executes on an abort -- exactly the
+            # run you most need the inputs for. This record is the only
+            # capture of the planner's inputs on that path.
+            RUN_LOG.log("phase1a", "plan_inputs",
+                        q_start=current_q.tolist(), q_goal=goal_q.tolist(),
+                        sphere_center=np.asarray(sphere_center).tolist(),
+                        sphere_stack_axis=np.asarray(sphere_stack_axis).tolist(),
+                        head_radius=float(head_radius),
+                        head_margin_m=ca_cfg.get("head_margin_m"),
+                        head_stack_count=ca_cfg.get("head_stack_count"),
+                        head_stack_spacing_m=ca_cfg.get("head_stack_spacing_m"),
+                        floor_z_m=ca_cfg.get("floor_z_m"),
+                        floor_margin_m=ca_cfg.get("floor_margin_m"),
+                        box_center=np.asarray(box_center).tolist(),
+                        goal_pos_err=float(goal_pos_err), goal_rot_err=float(goal_rot_err))
             waypoints = plan_collision_free_approach(
                 ik, current_q, goal_q, sphere_center, head_radius, cfg,
                 axis=sphere_stack_axis,
@@ -769,6 +932,7 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
             L_target, R_target = compute_hand_targets(
                 box_center, box_half_width, 0.0, squeeze=squeeze, grasp_frame_R=grasp_frame_R,
             )
+            L_target, R_target = apply_palm_tilt(L_target, R_target, tilt_L_deg, tilt_R_deg)
             current_dq = np.zeros(14)
             sol_q, sol_tauff = ik.solve_ik(L_target, R_target, current_q, current_dq)
             robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
@@ -792,6 +956,10 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
               "(skipping Phase 2, returning to default).")
     except RRTPlanningError as exc:
         _phase1_interrupted = True
+        RUN_LOG.log("phase1a", "rrt_abort",
+                    error_type=type(exc).__name__, error=str(exc),
+                    q_at_abort=current_q.tolist(),
+                    goal_q=goal_q.tolist() if "goal_q" in locals() else None)
         print(f"\n[SDKController] SAFETY ABORT: {exc!r} — not falling back to "
               "straight-line motion near the head. Exiting Phase 1 "
               "(skipping Phase 2, returning to default).")
@@ -840,6 +1008,14 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
             _last_log_t = t_start - 1.0   # fire on first step
             _obj_lost_warned = False
             _wrench_ref_captured = False
+            # GP feedforward arming (no-op unless the source is a
+            # PredictiveSource -- sine/mock and plain marker runs have no
+            # arm()). The GP anchors on the marker pose at the instant arm()
+            # is called, and its training clips were all anchored at the START
+            # of a motion segment, so anchoring must wait until the grip is
+            # established and the human is about to move -- NOT at
+            # source.startup(), which runs before Phase 1a.
+            _gp_arm = getattr(source, "arm", None) if _gp_arm_after_seat else None
             if recorder is not None:
                 recorder.start()
             try:
@@ -850,7 +1026,9 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
 
                     box_center, theta = source.step()
                     if getattr(source, 'object_lost', False) and not _obj_lost_warned:
-                        print("[SDKController] WARNING: object marker lost — box may have fallen! (SDK-6: stop here)")
+                        print("[SDKController] WARNING: object marker lost — box may have "
+                              "fallen! Holding last known position; tracking CONTINUES "
+                              "(Ctrl-C to stop).")
                         _obj_lost_warned = True
 
                     obj_obs = getattr(source, 'last_obj_obs', None)
@@ -890,6 +1068,39 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                         _diag["L_target"], _diag["R_target"], _diag["sol_tauff"],
                     )
 
+                    # Arm the GP feedforward once the grip is established.
+                    #
+                    # This runs in the SAME tick seating is detected, so the
+                    # GP's anchor (gp.reset(), which captures the marker pose)
+                    # is taken at the seat instant -- not a tick later. What
+                    # is offset by one tick is only when the lead first
+                    # REACHES the IK: source.step() ran earlier in this same
+                    # iteration and _grip_and_hold_tick has already consumed
+                    # this tick's box_center/theta. That offset is structural
+                    # to the tick order (moving this check earlier would read
+                    # the PREVIOUS tick's seat state, i.e. arm later;
+                    # re-stepping the source would double-step the tracker,
+                    # which MarkerSource documents against). It is also moot:
+                    # the GP needs two accepted samples at its own ~4.4Hz
+                    # before twist() returns anything, so ~0.5s of warmup
+                    # follows arming regardless and swallows the ~125ms.
+                    #
+                    # Seating is the physical signal that the hands are loaded
+                    # on the object and the human is about to start moving the
+                    # torso -- the motion-segment start the GP's training
+                    # clips were all anchored at.
+                    if _gp_arm is not None:
+                        _timed_out = (_gp_arm_timeout is not None
+                                      and elapsed >= _gp_arm_timeout)
+                        if _seat_state["seated"] or _timed_out:
+                            if _gp_arm():
+                                _why = ("press seated" if _seat_state["seated"]
+                                        else f"arm_timeout_s={_gp_arm_timeout}s elapsed "
+                                             f"without the press seating")
+                                print(f"[SDKController] GP feedforward ARMED ({_why}) "
+                                      f"— anchored on the target marker's current pose; "
+                                      f"start moving the torso now.")
+
                     if cam_for_preview is not None:
                         cam_for_preview.capture()
                     time.sleep(control_dt)
@@ -897,15 +1108,41 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                     if time.monotonic() - _last_log_t >= 1.0:
                         _last_log_t = time.monotonic()
                         _log_marker_info(source, theta, elapsed, preview,
-                                          L_target=L_target, R_target=R_target)
+                                          L_target=L_target, R_target=R_target,
+                                          verbose=verbose)
+                        # Reachability observability ONLY -- no gating/abort, same
+                        # spirit as Phase 1a's own goal_pos_err/goal_rot_err check
+                        # above. Now that theta can be a genuine 3-DoF rotation
+                        # (docs/six_dof_tracking_fix.md), a commanded orientation
+                        # may simply be unreachable under the shoulder-roll self-
+                        # collision bounds or the wrist limits, with solve_ik()
+                        # silently converging to a poor solution -- this surfaces
+                        # that gap so trajectory.tracked_rotation.max_angle_deg can
+                        # be tuned against real data instead of guessed.
+                        L_act, R_act = ik.fk(current_q)
+                        _rot_err = max(
+                            float(np.linalg.norm(pin.log3(L_act.rotation @ L_target[:3, :3].T))),
+                            float(np.linalg.norm(pin.log3(R_act.rotation @ R_target[:3, :3].T))),
+                        )
+                        _rot_err_deg = math.degrees(_rot_err)
+                        _warn = "  [WARNING: possibly unreachable -- see trajectory.tracked_rotation.max_angle_deg]" if _rot_err_deg > 10.0 else ""
+                        print(f"  IK orientation residual: {_rot_err_deg:.1f}°  "
+                              f"ipopt_exhaustion_count={ik.ipopt_exhaustion_count}{_warn}")
                         if palm_press_enabled:
                             _wd = ""
-                            if watchdog.tripped:
-                                _wd = "  [CONTACT LOST — FROZEN]"
+                            if watchdog is None:
+                                _wd = "  [watchdog off]"
+                            elif watchdog.tripped:
+                                _wd = "  [CONTACT LOST — press frozen, tracking continues]"
                             elif watchdog.press_frozen:
                                 _wd = "  [contact dip — press held]"
                             elif not watchdog.armed:
                                 _wd = "  [pre-contact]"
+                            # Seat state: is the press still converging, or is
+                            # the depth now held with tracking owning the targets?
+                            if seat_detector is not None:
+                                _wd = ("  [SEATED — depth held]" if _diag["seated"]
+                                       else "  [seating…]") + _wd
                             if palm_press_jacobian:
                                 print(f"  Palm force[jacobian]: F_cmd={F_cmd:.2f}N  "
                                       f"F_meas={F_palm:.2f}N  (setpoint={force_ctrl.force_target:.2f}N)  "
@@ -980,9 +1217,10 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                                       f"(target={force_ctrl.force_target:.2f}N)  "
                                       f"(SPACE to release)")
                             else:
+                                _seated = "  [SEATED]" if _diag["seated"] else ""
                                 print(f"  holding {held_s:.0f}s  s={_diag['squeeze'] * 1000:.1f}mm  "
                                       f"F_target={_diag['F_palm']:.2f}N  F_guard={_diag['F_guard']:.2f}N  "
-                                      f"(setpoint={press_ctrl.force_target:.2f}N)  (SPACE to release)")
+                                      f"(setpoint={press_ctrl.force_target:.2f}N){_seated}  (SPACE to release)")
                         else:
                             print(f"  holding {held_s:.0f}s  (SPACE to release)")
             except KeyboardInterrupt:
@@ -1005,6 +1243,8 @@ def run_pose_tracking_sdk(robot, ik, cfg, source, duration=None,
                     press_ctrl.reset()
                     if force_ctrl is not None:
                         force_ctrl.reset()
+                    if seat_detector is not None:
+                        seat_detector.reset()
                 _lerp_hand_pose(robot, control_dt, ctrl_l.close_pose, ctrl_l.open_pose, _HAND_RELEASE_TIME)
                 print("[SDKController] Hands released.")
             except KeyboardInterrupt:

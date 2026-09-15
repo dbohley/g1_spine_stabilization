@@ -2421,3 +2421,184 @@ solve`), `tests/test_sdk_transport.py`
 (`test_phase1a_resets_ik_smoothing_after_execute_joint_path`, a spy-based
 integration test). 287 tests pass total.
 
+## True 6-DoF rotation tracking (the "4dof not 6dof" bug)
+
+A prior investigation had flagged that `--tracking 6dof` looked like it was
+really only 4-DoF: full 3-DoF position tracking, but the target marker's
+rotation collapsing into a single scalar, losing pitch and yaw. Investigated
+from first principles (direct code read + numeric verification in the
+project env, not assumed) and **confirmed real, plus a second, independent
+bug found alongside it while designing the fix.** Full writeup, design
+rationale, and the implementation plan this session executed against:
+`docs/six_dof_tracking_fix.md`.
+
+**Bug 1 — single-axis collapse.** `MarkerSource._theta_from_target_rotation`
+(`trajectory/sources.py`) computed the FULL relative rotation of the target
+marker (`R_delta = target_start_rot.T @ R_current` — every axis present and
+correct) and then destroyed it on the very next line:
+`float(np.arctan2(R_delta[2,1], R_delta[2,2]))` — a roll-about-X scalar.
+`compute_hand_targets` (`trajectory/targets.py`) then re-expanded that
+scalar as `Rx(theta)`, constraining every downstream hand rotation to the
+1-parameter X subgroup. Verified numerically: a pure yaw of the target
+produced `theta=0.0` (zero hand response at all); a pitch of 2.0 rad
+combined with a roll of 0.2 rad produced `theta=-2.9416 = 0.2 - pi` — a
+180-degree flip. This affected BOTH `--tracking` modes identically (`6dof`
+only ever changed the *position* branch), so `orient-only` — the default,
+and the mode named in the live-bringup workflow — was really 0 translation
++ 1 rotation DoF, not 3.
+
+**Bug 2 — wrong frame (found designing the fix, not in the original
+report).** The old code took the target's rotation delta in its OWN BODY
+frame (`R_target_start.T @ R_current`) and applied its extracted roll as a
+PELVIS-frame `Rx(theta)`. `compute_hand_targets` composes the tracked
+rotation as `R @ grasp_frame_R @ R_BASE`, left-multiplying onto
+`grasp_frame_R` — the object marker's own ABSOLUTE PELVIS-frame orientation
+— so `R` needs to be a pelvis-frame delta (`R_current @ target_start_rot.T`)
+for that composition to mean anything. This bug was invisible before because
+single-axis (pure-X) rotations commute with their own transpose, so the two
+forms were numerically identical for every case the old code could ever
+produce — a bug that could only have been found once the single-axis
+collapse itself was being removed.
+
+**Fix, implemented this session** (see `docs/six_dof_tracking_fix.md` for
+the full design, including the two math corrections found and fixed along
+the way — see below):
+
+- `utils/transforms.py`: new `as_rotation`/`is_scalar_theta`/
+  `rotation_angle`/`clamp_rotation` helpers. `theta` is now accepted as
+  EITHER a scalar (the original `Rx(theta)` representation, still used by
+  `SineSource` and the `theta=0.0` fixed-approach-phase call sites) or a
+  full `(3,3)` pelvis-frame rotation matrix, normalized at each public
+  boundary (`compute_hand_targets`, `press_axis`, `RunRecorder.record`).
+- `MarkerSource._rotation_from_target` (renamed from
+  `_theta_from_target_rotation`) now returns the full, WORLD-frame delta
+  `R_current @ target_start_rot.T` — fixing both bugs in one change. Both
+  `orient-only` and `6dof` are now genuinely full-rotation-tracking (3-DoF
+  orientation, and 6-DoF respectively).
+- `RateLimitedSource`/`NoiseFilteredSource` gained a matrix branch alongside
+  their original scalar branch (kept as a SEPARATE code path, not routed
+  through the same math) — the "a rotation matrix's rotvec reduces to the
+  same arithmetic as the raw scalar" shortcut is only true for
+  `|theta| <= pi`; several existing tests deliberately use larger values
+  as stress inputs, and briefly broke one of my own new tests before I
+  caught it (a `Rx(10.0)` round-trips through `as_rotvec()` to `-2.566`,
+  not `10.0`, since a rotation matrix can only ever encode angle mod
+  `2*pi` — the minimal/shortest-path representation). The matrix branch
+  clamps/smooths geodesically (rotvec-based), verified to reduce exactly to
+  the original scalar arithmetic for in-range pure-X input.
+- New `RotationClampSource` wrapper (`trajectory/sources.py`) — a safety
+  POSITION bound (total angle + per-axis enable) wired OUTERMOST, after the
+  rate limiter, since `RateLimitedSource`'s first step after `startup()` is
+  deliberately unclamped by design and Phase 1/1.5 (RRT reach + hand-close)
+  can accumulate several real seconds of target motion with zero `step()`
+  calls before that first tick. Config: new
+  `trajectory.tracked_rotation` block in `configs/default.yaml`
+  (`enabled_axes: [true,true,true]`, `max_angle_deg: 20.0` — **UNMEASURED**,
+  no reachability study against the shoulder-roll self-collision bounds or
+  wrist limits exists yet; raise only after a dry-run sweep, see below).
+- `sdk_pose_tracking.py`: `_log_marker_info` now prints full roll/pitch/yaw
+  + total angle instead of a single `theta_Rx` degree value; added a new
+  ~1Hz IK-orientation-residual + `ipopt_exhaustion_count` print in Phase 2
+  (reusing the same `ik.fk()` + `pin.log3` pattern Phase 1a's own
+  reachability check already used) — pure observability, the missing
+  feedback loop for tuning `max_angle_deg` against real data instead of
+  guessing, since `solve_ik()` never signals when a target is unreachable.
+- `scripts/run_pose_tracking_preview.py`: `_AnimatedMockTracker` gained a
+  new `axes`/`--mock-rotation-axes X Y Z` per-axis amplitude weight (default
+  `1 0 0`, byte-identical to the original pure-roll motion) with a
+  120-degree phase offset between axes so a nonzero weight on more than one
+  axis genuinely varies the rotation axis over time, not just its scale.
+  **This closes a real dry-run testability gap**: the old hardcoded pure-`Rx`
+  mock could never have exercised pitch or yaw, so `--source mock` — the
+  documented pre-flight gate — would never have caught this bug even after
+  a "successful" run.
+- `data_recording/recorder.py`: `SCHEMA_VERSION` 2 → 3. `MarkerSample`
+  gained `tracked_rotvec` (populated for both scalar and matrix `theta`);
+  `theta` itself is `None` whenever the source's rotation was a `(3,3)`
+  matrix that step, DELIBERATELY not back-filled from the rotvec's own X
+  component (that would silently resurrect the exact lossy representation
+  this whole fix removes).
+
+**New regression tests** (direct proof of both bugs, not just "the numbers
+changed"): `tests/test_marker_source.py`'s
+`test_target_yaw_is_tracked_not_discarded` (pure yaw is now tracked, not
+silently ignored) and `test_rotation_delta_is_world_frame_not_body_frame`
+(a non-commuting start rotation distinguishes the two frame conventions and
+pins the correct one) — both fail on `main` before this fix. Plus focused
+coverage for the new matrix branches in the two wrapper sources, the new
+`RotationClampSource` (including the specific safety property that it
+catches a huge rotation `RateLimitedSource`'s unclamped-first-step would
+otherwise pass through), `as_rotation`/`clamp_rotation` in
+`utils/transforms.py`, and the recorder's scalar-vs-matrix `theta`/
+`tracked_rotvec` split.
+
+**Not yet verified live** — human-only per Hard Rules. This is also the
+first change to make the DEFAULT `orient-only` mode command genuine 3-DoF
+orientation instead of 1-DoF roll, which is a bigger behavioral jump than
+it might look like: a live human-run dry-run sweep with
+`--mock-rotation-axes 1 1 1` (watching the new IK-residual print and
+`ipopt_exhaustion_count` for signs the commanded orientation is
+unreachable) is the recommended step BEFORE a live `--source marker` run,
+to find a sane real value for `trajectory.tracked_rotation.max_angle_deg`
+rather than trusting the placeholder `20.0`.
+
+## Mid-tracking guards: warn, don't halt
+
+The user reported that during live tests, tracking appeared to stop/freeze on
+"lost contact" or "lost sight of a marker", and that the triggers seemed to
+fire unnecessarily. Requirement: flags should still print, but nothing should
+stop the work — the operator ends the run with Ctrl-C.
+
+**Most of the suspected culprits were already warn-only**, which is worth
+recording because it means the perceived "stop" was largely something else:
+
+- `object_lost` (marker gone >2s) — print only. Its message text read
+  `(SDK-6: stop here)`, which looks like an abort directive but was literally
+  just inside a print string. No `break`, no state change. **This wording was
+  almost certainly the source of the impression that it halts** — corrected.
+- `target_stale_seconds` — computed, but had **no production consumer at all**.
+- `MarkerSource.step()` on an absent marker — holds last-known pose, prints at
+  0.5s/3.0s, no abort.
+- `execute_joint_path`'s arrival gate — explicitly warn-and-proceed.
+- IPOPT exhaustion — warns, uses the non-converged value, continues.
+
+**The one real mid-run degradation was `PalmContactWatchdog`**, and it was
+**latched**: `tripped = True` was never cleared (`reset()` is only called in
+Phase 3 teardown, never mid-run), so one confirmed loss froze the press for the
+rest of the session even if contact fully returned. That matters more than the
+thresholds suggest because `palm_press.force_source` is now `wrist_wrench` — a
+torque-derived estimate, noisier than the palm tactile sensor the UNMEASURED
+`touch_threshold: 0.5` / `loss_floor: 0.2` placeholders were written for.
+
+**Changes:**
+
+1. `PalmContactWatchdog` gained `latch: bool = True` (class default preserves
+   the original behavior; config selects `false`). Non-latching clears `tripped`
+   the moment force recovers above `loss_floor`. New config keys
+   `palm_press.watchdog_enabled` (turn the guard off WITHOUT disabling the press
+   loop — no such key existed) and `palm_press.watchdog_latch: false`;
+   `loss_frames` raised `3` → `10`. The `[SAFETY]` message is now edge-triggered
+   with a matching "contact regained" on recovery, instead of once-per-run.
+2. `trajectory.tracked_rotation.max_angle_deg` raised `20.0` → `45.0`. A silent
+   clamp makes the arm look like it stopped following; 20° is tight for real
+   head motion. `RotationClampSource`'s warning is now rate-limited (~2s) and
+   reports requested-vs-clamped angle, instead of printing once and never again.
+3. `RateLimitedSource`/`NoiseFilteredSource` no longer `raise TypeError` on a
+   theta type flip — that ran inside the Phase 2 hot loop, which catches only
+   `KeyboardInterrupt`, so it would have killed a live run. They now warn and
+   re-seed/reset. Two tests updated to assert the non-fatal behavior.
+
+**Deliberately left as-is** (user's call): the `RRTPlanningError` hard abort
+(the one guard against driving into a real head — disable per-run via
+`collision_avoidance.enabled` if it misfires), the startup target-marker
+timeout skipping Phase 2 into the SPACE-to-release hold, and
+`control.rotation_duration: 10.0` for `--source sine`/`--source mock`
+(`--source marker` already runs until Ctrl-C).
+
+**Verified** headlessly (the Rerun-spawn sandbox limitation blocks the real
+preview script): a `MarkerSource` run with BOTH markers vanishing 6 polls in
+printed every expected warning — target-stale at 0.5s, object-stale at 2.0s,
+and the corrected `object marker lost … tracking CONTINUES` line — and still
+ran Phase 2 to completion and into Phase 3. Live `--source marker` verification
+stays human-run per Hard Rules.
+

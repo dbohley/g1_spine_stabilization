@@ -128,3 +128,35 @@ def test_never_arms_in_dry_run_zero_force_is_noop():
     assert not w.armed
     assert not w.tripped
     assert not w.press_frozen
+
+
+def test_latch_false_clears_trip_when_force_recovers():
+    """latch=False (the live config default): a confirmed loss still freezes the
+    press, but recovers as soon as force returns above loss_floor -- so a
+    spurious trip costs one dip, not the rest of the run. Prevents the guard
+    from silently halting the press for a whole live session on sensor noise."""
+    w = _make(loss_frames=3, latch=False)
+    w.update(5.0)                      # arm
+    for _ in range(3):
+        w.update(0.0)                  # 3 consecutive below-floor -> confirmed loss
+    assert w.tripped
+    assert w.press_frozen
+
+    w.update(5.0)                      # contact back above loss_floor
+    assert not w.tripped
+    assert not w.press_frozen
+    assert w.armed                     # still gripped; arming is not undone
+
+
+def test_latch_true_keeps_original_permanent_trip():
+    """latch=True (class default) preserves the original behavior exactly:
+    once tripped, recovery does not clear it."""
+    w = _make(loss_frames=3, latch=True)
+    w.update(5.0)
+    for _ in range(3):
+        w.update(0.0)
+    assert w.tripped
+
+    w.update(5.0)
+    assert w.tripped                   # still latched
+    assert w.press_frozen

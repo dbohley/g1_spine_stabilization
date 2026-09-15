@@ -164,9 +164,24 @@ def test_recorder_handles_none_observations():
     assert sample.object_angular_velocity is None
     assert sample.target_angular_velocity is None
     assert sample.theta == 0.3
+    np.testing.assert_allclose(sample.tracked_rotvec, [0.3, 0.0, 0.0])
     assert sample.load_cell_wrench_raw is None
     assert sample.load_cell_wrench_grav_comp is None
     assert len(rec) == 1
+
+
+def test_recorder_matrix_theta_leaves_theta_none_and_fills_tracked_rotvec():
+    """A (3,3)-rotation theta (MarkerSource's current representation -- see
+    docs/six_dof_tracking_fix.md) must NOT be back-filled into the scalar
+    `theta` field (that would silently resurrect the lossy single-axis
+    representation this schema exists to move away from); it populates
+    tracked_rotvec instead."""
+    from g1_spine_stabilization.utils.transforms import Rx
+    rec = RunRecorder(origin="robot", source_label="marker", output_path="unused.pkl")
+    R = Rx(0.4)
+    sample = rec.record(t=0.0, object_obs=None, target_obs=None, theta=R)
+    assert sample.theta is None
+    np.testing.assert_allclose(sample.tracked_rotvec, [0.4, 0.0, 0.0], atol=1e-9)
 
 
 def test_recorder_stores_both_wrench_fields():
@@ -179,8 +194,8 @@ def test_recorder_stores_both_wrench_fields():
     np.testing.assert_allclose(sample.load_cell_wrench_grav_comp, comp)
 
 
-def test_recorder_schema_version_is_2():
-    assert RunRecorder.SCHEMA_VERSION == 2
+def test_recorder_schema_version_is_3():
+    assert RunRecorder.SCHEMA_VERSION == 3
 
 
 def test_recorder_angle_diff_only_when_both_markers_present():

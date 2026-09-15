@@ -12,6 +12,10 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from g1_spine_stabilization.utils.transforms import (
+    is_scalar_theta, as_rotation, clamp_rotation, rotation_angle,
+)
+
 
 def sine_trajectory(t, amplitude, freq):
     """Sine wave rotation trajectory.
@@ -52,16 +56,24 @@ class SineSource:
 class MarkerSource:
     """Drives (box_center, theta) from live AprilTag marker observations.
 
+    theta is now a FULL (3,3) pelvis-frame rotation matrix (previously a
+    single roll-about-X scalar -- a confirmed bug that silently discarded
+    the target marker's pitch and yaw; see docs/six_dof_tracking_fix.md).
+    It is the target's rotation CHANGE since tracking began, expressed in
+    the PELVIS/world frame (not the target marker's own body frame -- see
+    _rotation_from_target's docstring for why that distinction matters).
+
     Two tracking modes:
       "orient-only" — box_center is captured from the object marker once at
-          startup and held fixed; theta tracks the target marker's rotation
-          RELATIVE TO the target's own starting orientation (not the target's
-          absolute orientation -- see below).
+          startup and held fixed; theta tracks the target marker's full
+          rotation RELATIVE TO the target's own starting orientation (not
+          the target's absolute orientation -- see below). Genuinely 3-DoF
+          orientation tracking.
       "6dof"        — box_center tracks the object's own starting position,
           offset by however far the target marker has moved from ITS OWN
           starting position (a relative/delta displacement, not the target's
           absolute position); theta is the same relative-rotation tracking
-          as orient-only.
+          as orient-only. Genuinely 6-DoF (3 translation + 3 rotation).
 
     Both modes track the target's DISPLACEMENT from where it was when
     tracking began, not its absolute pose. This matters because the object
@@ -159,7 +171,7 @@ class MarkerSource:
         self._target_start_rot = None  # target's rotation when tracking began (Phase B)
         self._box_center = None        # live returned value; == object_start_pos in orient-only mode
         self._target_found = False     # set True by startup() Phase B; see target_found property
-        self._last_theta = 0.0
+        self._last_rotation = np.eye(3)
         self._last_obj_obs = None
         self._last_tgt_obs = None
         # Stale-target tracking
@@ -171,10 +183,25 @@ class MarkerSource:
         self._object_warned_2s = False
         self._object_warned_5s = False
 
-    def _theta_from_target_rotation(self, R_current: np.ndarray) -> float:
-        """Target's roll relative to its own starting orientation (not absolute)."""
-        R_delta = self._target_start_rot.T @ R_current
-        return float(np.arctan2(R_delta[2, 1], R_delta[2, 2]))
+    def _rotation_from_target(self, R_current: np.ndarray) -> np.ndarray:
+        """Target's FULL rotation relative to its own starting orientation
+        (not absolute), in the PELVIS/world frame.
+
+        R_current = ΔR_world @ R_target_start, so ΔR_world = R_current @
+        R_target_start.T -- the WORLD-frame delta, NOT the body-frame delta
+        (R_target_start.T @ R_current, expressed in the target's own
+        starting axes). This matters because compute_hand_targets composes
+        the returned rotation as `R @ grasp_frame_R @ R_BASE`, left-
+        multiplying it onto grasp_frame_R -- the object marker's own
+        ABSOLUTE pelvis-frame orientation. Left-multiplying an absolute
+        pelvis-frame orientation only type-checks if this is itself a
+        pelvis-frame delta. (The two forms coincide only when the rotation
+        is a pure single-axis rotation, since single-axis rotations commute
+        with their own transpose -- which is why a previous single-axis-only
+        version of this method could use the wrong (body-frame) form without
+        it ever being caught by a test. See docs/six_dof_tracking_fix.md.)
+        """
+        return R_current @ self._target_start_rot.T
 
     def _box_center_from_target_position(self, pos_current: np.ndarray) -> np.ndarray:
         """Object's own start position, shifted by the target's displacement from its own start."""
@@ -199,7 +226,7 @@ class MarkerSource:
 
         Phase A: waits for the object marker → records the object's own start position.
         Phase B: waits for the target marker → records its start pose (position + rotation)
-                 as the reference for relative tracking; _last_theta starts at 0.0.
+                 as the reference for relative tracking; _last_rotation starts at identity.
         Phase C: counts down self._countdown seconds while continuously
                  refreshing readings; skipped when countdown=0.0.
 
@@ -251,7 +278,7 @@ class MarkerSource:
             if tgt_obs is not None:
                 self._target_start_pos = tgt_obs.pose_in_pelvis[:3, 3].copy()
                 self._target_start_rot = tgt_obs.pose_in_pelvis[:3, :3].copy()
-                self._last_theta = 0.0  # no displacement yet -- this IS the target's start
+                self._last_rotation = np.eye(3)  # no displacement yet -- this IS the target's start
                 self._target_found = True
                 print(f"[MarkerSource] Target marker detected (start reference recorded)")
                 found_tgt = True
@@ -272,7 +299,7 @@ class MarkerSource:
             # from whenever the second marker was first detected.
             _obj_obs, tgt_obs, _current = self._step_tracker()
             if tgt_obs is not None:
-                self._last_theta = self._theta_from_target_rotation(tgt_obs.pose_in_pelvis[:3, :3])
+                self._last_rotation = self._rotation_from_target(tgt_obs.pose_in_pelvis[:3, :3])
                 if self._mode == "6dof":
                     self._box_center = self._box_center_from_target_position(tgt_obs.pose_in_pelvis[:3, 3])
             print("[MarkerSource] Go!")
@@ -289,7 +316,7 @@ class MarkerSource:
                 # Refresh target readings during countdown
                 _obj_obs, tgt_obs, _current = self._step_tracker()
                 if tgt_obs is not None:
-                    self._last_theta = self._theta_from_target_rotation(tgt_obs.pose_in_pelvis[:3, :3])
+                    self._last_rotation = self._rotation_from_target(tgt_obs.pose_in_pelvis[:3, :3])
                     if self._mode == "6dof":
                         self._box_center = self._box_center_from_target_position(tgt_obs.pose_in_pelvis[:3, 3])
                 time.sleep(0.05)
@@ -307,7 +334,9 @@ class MarkerSource:
 
         Returns:
             box_center: (3,) ndarray in pelvis frame
-            theta:      float, target's rotation relative to its own start (radians)
+            theta:      (3,3) ndarray, target's FULL rotation relative to its
+                        own start, in the pelvis frame (see
+                        _rotation_from_target's docstring)
         """
         if self._box_center is None:
             raise RuntimeError("Call startup() before step()")
@@ -317,7 +346,7 @@ class MarkerSource:
         # --- Target marker ---
         self._last_tgt_obs = tgt_obs
         if tgt_obs is not None:
-            self._last_theta = self._theta_from_target_rotation(tgt_obs.pose_in_pelvis[:3, :3])
+            self._last_rotation = self._rotation_from_target(tgt_obs.pose_in_pelvis[:3, :3])
             if self._mode == "6dof":
                 self._box_center = self._box_center_from_target_position(tgt_obs.pose_in_pelvis[:3, 3])
             self._target_stale_frames = 0
@@ -349,7 +378,7 @@ class MarkerSource:
                 print(f"[MarkerSource] WARNING: object marker not seen for {lost_s:.1f}s — holding position")
                 self._object_warned_5s = True
 
-        return self._box_center.copy(), self._last_theta
+        return self._box_center.copy(), self._last_rotation.copy()
 
     @property
     def box_center(self):
@@ -457,6 +486,22 @@ class RateLimitedSource:
     so it wraps either uniformly. Unknown attributes (e.g. MarkerSource's
     last_obj_obs/object_lost/target_stale_seconds) are proxied to the
     wrapped source via __getattr__.
+
+    theta MAY be either a scalar (a roll-about-X float, the original
+    representation) or a (3,3) rotation matrix (MarkerSource's current, full
+    3-DoF representation -- see docs/six_dof_tracking_fix.md). The scalar
+    path below is UNCHANGED from before -- deliberately a separate code path
+    rather than routed through the matrix math, since the matrix rotvec
+    round-trip only reduces to the exact same arithmetic for |theta| <= pi,
+    and existing tests deliberately exercise larger values. For a (3,3)
+    input, the same clamp is applied geodesically: the rotation from the
+    last output to this step's target is decomposed into an axis-angle
+    (rotvec), the angle is capped at max_theta_rate*dt (direction
+    preserved), and the result is re-composed. max_theta_rate then bounds
+    the TOTAL angular speed (rotvec norm) rather than only the X component --
+    the same number, generalized, strictly tighter per-axis than before.
+    A source that returns one type on one call and the other type on a
+    later call (without an intervening startup()) raises TypeError.
     """
 
     def __init__(self, inner, max_theta_rate, max_pos_rate, clock=time.monotonic,
@@ -468,22 +513,52 @@ class RateLimitedSource:
         self._max_dt = float(max_dt)                   # s
         self._last_t = None
         self._last_box_center = None
-        self._last_theta = None
+        self._last_theta = None       # scalar branch state
+        self._last_rotation = None    # matrix branch state
+        self._is_scalar = None        # which branch is active (None = unseeded)
 
     def startup(self, *args, **kwargs):
         box_center = self._inner.startup(*args, **kwargs)
         self._last_t = None  # next step() is always unclamped (fresh seed)
+        self._is_scalar = None
         return box_center
 
     def step(self) -> tuple:
         box_center, theta = self._inner.step()
         box_center = np.asarray(box_center, dtype=float)
-        theta = float(theta)
+        scalar = is_scalar_theta(theta)
         now = self._clock()
 
         if self._last_t is None:
+            self._is_scalar = scalar
+            if scalar:
+                theta = float(theta)
+                self._last_theta = theta
+            else:
+                theta = np.asarray(theta, dtype=float).copy()
+                self._last_rotation = theta.copy()
             self._last_box_center = box_center.copy()
-            self._last_theta = theta
+            self._last_t = now
+            return box_center.copy(), theta
+
+        if scalar != self._is_scalar:
+            # Re-seed rather than raise: this runs inside the Phase 2 hot loop,
+            # which only catches KeyboardInterrupt, so raising here would kill
+            # a live tracking run outright. A type flip is a programming error,
+            # not a safety condition -- warn loudly and carry on from the new
+            # type (this tick is unclamped, exactly like a fresh startup seed).
+            print(f"[RateLimitedSource] WARNING: inner source's theta type changed "
+                  f"mid-run (was {'scalar' if self._is_scalar else 'a (3,3) rotation'}, "
+                  f"now {'scalar' if scalar else 'a (3,3) rotation'}) -- re-seeding "
+                  f"and continuing unclamped for this step.")
+            self._is_scalar = scalar
+            if scalar:
+                theta = float(theta)
+                self._last_theta = theta
+            else:
+                theta = np.asarray(theta, dtype=float).copy()
+                self._last_rotation = theta.copy()
+            self._last_box_center = box_center.copy()
             self._last_t = now
             return box_center.copy(), theta
 
@@ -491,11 +566,24 @@ class RateLimitedSource:
         dt = min(dt, self._max_dt)
         self._last_t = now
 
-        dtheta = theta - self._last_theta
-        max_dtheta = self._max_theta_rate * dt
-        if abs(dtheta) > max_dtheta:
-            dtheta = math.copysign(max_dtheta, dtheta)
-        self._last_theta = self._last_theta + dtheta
+        if scalar:
+            theta = float(theta)
+            dtheta = theta - self._last_theta
+            max_dtheta = self._max_theta_rate * dt
+            if abs(dtheta) > max_dtheta:
+                dtheta = math.copysign(max_dtheta, dtheta)
+            self._last_theta = self._last_theta + dtheta
+            out_theta = self._last_theta
+        else:
+            R_target = np.asarray(theta, dtype=float)
+            dR = self._last_rotation.T @ R_target
+            v = Rotation.from_matrix(dR).as_rotvec()
+            angle = np.linalg.norm(v)
+            max_angle = self._max_theta_rate * dt
+            if angle > max_angle and angle > 0.0:
+                v = v * (max_angle / angle)
+            self._last_rotation = self._last_rotation @ Rotation.from_rotvec(v).as_matrix()
+            out_theta = self._last_rotation.copy()
 
         delta = box_center - self._last_box_center
         dist = np.linalg.norm(delta)
@@ -504,10 +592,25 @@ class RateLimitedSource:
             delta = delta * (max_dist / dist)
         self._last_box_center = self._last_box_center + delta
 
-        return self._last_box_center.copy(), self._last_theta
+        return self._last_box_center.copy(), out_theta
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+def _anchored_median_rotation(hist):
+    """Elementwise median of a short list of (3,3) rotations, computed
+    SAFELY near a +/-pi wrap by anchoring on the history's first rotation
+    and taking rotvecs of small deltas RELATIVE to that anchor (rather than
+    taking an elementwise median of the rotations' own raw, possibly-large
+    rotvecs, which is wrap-unsafe). Exact for the in-range pure-X case:
+    median(theta_i - theta_0) + theta_0 == median(theta_i)."""
+    R_anchor = hist[0]
+    deltas = np.stack(
+        [Rotation.from_matrix(R_anchor.T @ R).as_rotvec() for R in hist], axis=0
+    )
+    med_delta = np.median(deltas, axis=0)
+    return R_anchor @ Rotation.from_rotvec(med_delta).as_matrix()
 
 
 class NoiseFilteredSource:
@@ -533,6 +636,18 @@ class NoiseFilteredSource:
 
     Duck-types .startup()/.step(); proxies unknown attributes to the wrapped
     source via __getattr__, matching RateLimitedSource's pattern.
+
+    theta MAY be either a scalar or a (3,3) rotation matrix (see
+    RateLimitedSource's docstring and docs/six_dof_tracking_fix.md); the
+    scalar path is UNCHANGED from before. For a (3,3) input, both stages are
+    done geodesically rather than elementwise on raw rotvecs, to avoid a
+    wrap-around hazard near +/-pi that elementwise rotvec math doesn't
+    handle correctly: the median anchors the history's first rotation and
+    takes an elementwise median of small SMALL rotvecs relative to that
+    anchor (exact for the in-range pure-X case); the EMA blends geodesically
+    (R_ema <- R_ema @ Exp(alpha * Log(R_ema.T @ R_med))), which also reduces
+    to the exact scalar EMA formula for pure-X input. A source that returns
+    one type on one call and the other on a later call raises TypeError.
     """
 
     def __init__(self, inner, median_window=5, ema_alpha=0.3):
@@ -547,17 +662,33 @@ class NoiseFilteredSource:
         self._theta_hist = []
         self._ema_box = None
         self._ema_theta = None
+        self._is_scalar = None  # which branch is active (None = unseeded)
 
     def startup(self, *args, **kwargs):
         box_center = self._inner.startup(*args, **kwargs)
         self._box_hist, self._theta_hist = [], []
         self._ema_box, self._ema_theta = None, None
+        self._is_scalar = None
         return box_center
 
     def step(self) -> tuple:
         box_center, theta = self._inner.step()
         box_center = np.asarray(box_center, dtype=float)
-        theta = float(theta)
+        scalar = is_scalar_theta(theta)
+        if self._is_scalar is None:
+            self._is_scalar = scalar
+        elif scalar != self._is_scalar:
+            # Reset history and carry on rather than raising -- see the matching
+            # comment in RateLimitedSource.step() for why an exception here
+            # would kill a live Phase 2 run.
+            print(f"[NoiseFilteredSource] WARNING: inner source's theta type changed "
+                  f"mid-run (was {'scalar' if self._is_scalar else 'a (3,3) rotation'}, "
+                  f"now {'scalar' if scalar else 'a (3,3) rotation'}) -- clearing the "
+                  f"filter history and continuing.")
+            self._is_scalar = scalar
+            self._box_hist, self._theta_hist = [], []
+            self._ema_box, self._ema_theta = None, None
+        theta = float(theta) if scalar else np.asarray(theta, dtype=float).copy()
 
         self._box_hist.append(box_center.copy())
         self._theta_hist.append(theta)
@@ -569,15 +700,240 @@ class NoiseFilteredSource:
             med_box, med_theta = box_center, theta
         else:
             med_box = np.median(np.stack(self._box_hist, axis=0), axis=0)
-            med_theta = float(np.median(self._theta_hist))
+            if scalar:
+                med_theta = float(np.median(self._theta_hist))
+            else:
+                med_theta = _anchored_median_rotation(self._theta_hist)
 
         if self._ema_box is None:
-            self._ema_box, self._ema_theta = med_box.copy(), med_theta
+            self._ema_box = med_box.copy()
+            self._ema_theta = med_theta if scalar else med_theta.copy()
         else:
             self._ema_box = self._ema_alpha * med_box + (1.0 - self._ema_alpha) * self._ema_box
-            self._ema_theta = self._ema_alpha * med_theta + (1.0 - self._ema_alpha) * self._ema_theta
+            if scalar:
+                self._ema_theta = self._ema_alpha * med_theta + (1.0 - self._ema_alpha) * self._ema_theta
+            else:
+                v = Rotation.from_matrix(self._ema_theta.T @ med_theta).as_rotvec()
+                self._ema_theta = self._ema_theta @ Rotation.from_rotvec(self._ema_alpha * v).as_matrix()
 
-        return self._ema_box.copy(), self._ema_theta
+        return self._ema_box.copy(), (self._ema_theta if scalar else self._ema_theta.copy())
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class RotationClampSource:
+    """Safety clamp on the tracked rotation from a wrapped source -- caps its
+    TOTAL angle and/or restricts it to a subset of axes. See
+    utils.transforms.clamp_rotation (this class is a thin .step() wrapper
+    around it) and docs/six_dof_tracking_fix.md.
+
+    Unlike RateLimitedSource (a RATE bound -- how fast the commanded value
+    may change per tick), this is a POSITION bound -- how far the commanded
+    value may ever be from identity, regardless of how it got there. Both
+    matter together: RateLimitedSource's first step after startup() is
+    deliberately UNCLAMPED (a fresh seed), so a large real target rotation
+    accumulated during Phase 1/1.5 (several real seconds with no step()
+    calls) would otherwise pass straight through on the very first Phase-2
+    tick. Wire this OUTERMOST (after RateLimitedSource) so it has the last
+    word on every tick, including that first one.
+
+    Always converts its input to a (3,3) matrix via as_rotation and returns
+    a (3,3) matrix (never a bare scalar) -- compute_hand_targets/press_axis
+    accept either, so there's no reason for this wrapper (which sits right
+    at the safety boundary) to re-derive a lossy scalar.
+
+    max_angle=None and enabled_axes=None (both defaults) is an exact
+    identity passthrough -- disabled by construction, matching this
+    codebase's "new wrapper reproduces old behavior when unconfigured"
+    convention.
+
+    Duck-types .startup()/.step(); proxies unknown attributes to the wrapped
+    source via __getattr__, matching RateLimitedSource/NoiseFilteredSource.
+    """
+
+    def __init__(self, inner, max_angle=None, enabled_axes=None,
+                 warn_interval_s=2.0, clock=time.monotonic):
+        self._inner = inner
+        self._max_angle = None if max_angle is None else float(max_angle)
+        self._enabled_axes = enabled_axes
+        self._warn_interval_s = float(warn_interval_s)
+        self._clock = clock
+        self._last_warn_t = None
+
+    def startup(self, *args, **kwargs):
+        return self._inner.startup(*args, **kwargs)
+
+    def step(self) -> tuple:
+        box_center, theta = self._inner.step()
+        R_in = as_rotation(theta)
+        R_out = clamp_rotation(R_in, max_angle=self._max_angle, enabled_axes=self._enabled_axes)
+        if not np.allclose(R_in, R_out, atol=1e-9):
+            # Rate-limited rather than once-per-run: a single early message
+            # leaves no way to tell the clamp is STILL engaging later in the
+            # run, which makes a clamped arm look like a frozen one.
+            now = self._clock()
+            if self._last_warn_t is None or (now - self._last_warn_t) >= self._warn_interval_s:
+                self._last_warn_t = now
+                print(f"[RotationClampSource] Tracked rotation clamped: "
+                      f"requested {math.degrees(rotation_angle(R_in)):.1f}° -> "
+                      f"{math.degrees(rotation_angle(R_out)):.1f}° "
+                      f"(trajectory.tracked_rotation limits). Tracking continues.")
+        return box_center, R_out
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class PredictiveSource:
+    """Adds the torso GP's predicted lead to a wrapped marker source.
+
+    Cancels tracking LAG, not static frame error. The controller's Phase-2
+    loop runs at ~6-10Hz and each command lands one tick late against a
+    moving target; the GP (gp_predict/export) predicts where the target
+    marker is heading, so the commanded pose leads the measured one by
+    roughly that tick.
+
+    This is CONTROLLER_MATH.md's SS1-4 "feedback + GP feedforward" form:
+    the wrapped source keeps producing the measured (box_center, theta) and
+    this class adds `twist * dt` on top. Nothing about the servo changes.
+
+    Frames -- the trap worth reading twice. TorsoGP.twist() returns
+    [v, omega] in the target marker's OWN BODY frame at the current step,
+    not the pelvis frame:
+      * linear  is rotated into pelvis   (R_meas @ v_body)
+      * angular is right-multiplied      (R @ Exp(w_body * dt))
+    Left-multiplying the angular part would apply a body-frame rotation as
+    though it were a pelvis-frame one -- the exact bug class that made
+    tracking silently single-axis before docs/six_dof_tracking_fix.md.
+
+    The GP refreshes at its own rate (step_dt ~228ms, ~4.4Hz) while this
+    steps at the controller's rate; twist() is a VELOCITY, so the held
+    value is simply re-integrated over each tick's measured dt. No
+    interpolation between predictions is needed (or wanted -- bracketing
+    two predictions would reintroduce a tick of lag).
+
+    Deliberately wired INSIDE RateLimitedSource/RotationClampSource so a
+    prediction can never escape the existing safety envelope.
+
+    Falls back to a zero lead (i.e. exactly the wrapped source's own output)
+    whenever the GP has no prediction yet -- the export's rule #4: freeze,
+    never constant-twist extrapolate.
+    """
+
+    def __init__(self, inner, gp, lead_scale=1.0, max_lead_dt=0.5,
+                 require_arm=True):
+        self._inner = inner
+        self._gp = gp
+        self._lead_scale = float(lead_scale)
+        self._max_lead_dt = float(max_lead_dt)
+        # require_arm=True (default): the lead stays off until arm() is
+        # called, so the controller controls WHEN the GP anchors. False
+        # anchors at startup() -- only sensible for a source with no
+        # approach/grasp phase in front of it (e.g. a bare replay harness).
+        self._require_arm = bool(require_arm)
+        self._armed = False
+        self._twist = None
+        self._last_t = None
+        self.n_accepted = 0      # GP refreshes (diagnostics)
+        self.n_steps = 0         # ticks seen
+
+    def startup(self, *args, **kwargs):
+        box_center = self._inner.startup(*args, **kwargs)
+        self._twist = None
+        self._last_t = None
+        self.n_accepted = 0
+        self.n_steps = 0
+        # NOT anchored here. startup() runs before Phase 1a -- long before the
+        # hands have even reached the head -- so anchoring now would violate
+        # the export's rule #1 (anchor at the START of a motion segment) by
+        # several seconds of approach, grasp and press. The controller calls
+        # arm() at the right instant instead; until then step() passes the
+        # wrapped source through untouched.
+        self._armed = not self._require_arm
+        if self._armed:
+            self._gp.reset()
+        return box_center
+
+    def arm(self):
+        """Anchor the GP now and start applying the lead.
+
+        Called by the controller once the grip is established (after the palm
+        press seats), which is when the human actually begins moving the
+        torso. Idempotent -- a second call is ignored, so it is safe to call
+        from inside a per-tick loop.
+        """
+        if self._armed:
+            return False
+        self._armed = True
+        self._gp.reset()
+        self._twist = None
+        self._last_t = None
+        return True
+
+    @property
+    def armed(self) -> bool:
+        return self._armed
+
+    def step(self) -> tuple:
+        box_center, theta = self._inner.step()
+        box_center = np.asarray(box_center, dtype=float)
+        self.n_steps += 1
+
+        if not self._armed:
+            # Pass-through until the controller arms us. Deliberately does NOT
+            # feed gp.update() either: samples taken during the approach would
+            # become the anchor's velocity history, which is exactly the stale
+            # pre-motion state rule #1 says to avoid.
+            return box_center, theta
+
+        obs = getattr(self._inner, "last_tgt_obs", None)
+        if obs is None:
+            return box_center, theta
+
+        now = time.monotonic()
+        p = obs.pose_in_pelvis[:3, 3]
+        R_meas = obs.pose_in_pelvis[:3, :3]
+        if self._gp.update(now, p, R_meas):
+            tw = self._gp.twist()
+            if tw is not None:
+                self._twist = tw[0]
+                self.n_accepted += 1
+
+        if self._twist is None:            # no prediction yet -> freeze
+            self._last_t = now
+            return box_center, theta
+
+        dt = 0.0 if self._last_t is None else (now - self._last_t)
+        self._last_t = now
+        # Cap dt for the same reason RateLimitedSource caps its own: a long
+        # gap with no step() calls (Phase 1a/1b/1.5) would otherwise
+        # integrate the held twist into an enormous one-tick lead.
+        dt = min(max(dt, 0.0), self._max_lead_dt) * self._lead_scale
+        if dt <= 0.0:
+            return box_center, theta
+
+        v_body, w_body = self._twist[:3], self._twist[3:]
+
+        # Position lead only makes sense when box_center actually tracks the
+        # target's displacement (6dof). orient-only holds it fixed by
+        # design, so leading it there would add translation the mode
+        # deliberately excludes.
+        if getattr(self._inner, "_mode", None) == "6dof":
+            box_center = box_center + (R_meas @ v_body) * dt
+
+        if is_scalar_theta(theta):
+            # Scalar theta is a roll about pelvis X; take the matching
+            # component of the predicted angular velocity in the pelvis frame.
+            theta = float(theta) + float((R_meas @ w_body)[0]) * dt
+        else:
+            R_theta = as_rotation(theta)
+            lead = Rotation.from_rotvec(w_body * dt).as_matrix()
+            # theta is a PELVIS-frame delta while w_body is body-frame, so
+            # the lead is conjugated into the pelvis frame before composing.
+            theta = R_theta @ (R_meas @ lead @ R_meas.T)
+
+        return box_center, theta
 
     def __getattr__(self, name):
         return getattr(self._inner, name)

@@ -34,6 +34,7 @@ import rerun as rr
 from g1_inspire_sdk import HAND_SOFT_LOWER_LIMITS
 from g1_spine_stabilization.trajectory.targets import (
     compute_hand_targets,
+    apply_palm_tilt,
     L_EE_DEFAULT,
     R_EE_DEFAULT,
     R_L_BASE,
@@ -173,6 +174,8 @@ def run_grasp_phases(
         approach_cfg    = cfg.get("grasp_approach", {})
         pregrasp_offset = approach_cfg.get("pregrasp_offset", 0.04)
         close_time      = approach_cfg.get("close_time", 1.5)
+        tilt_L_deg      = approach_cfg.get("palm_tilt_deg_left", [0.0, 0.0, 0.0])
+        tilt_R_deg      = approach_cfg.get("palm_tilt_deg_right", [0.0, 0.0, 0.0])
         collision_avoidance_enabled = cfg.get("collision_avoidance", {}).get("enabled", True)
 
         # No MarkerSource/marker orientation here (grasp_demo has no camera) --
@@ -207,6 +210,7 @@ def run_grasp_phases(
         # approach is a different, already-bounded problem (see
         # kinematics/rrt_planner.py module docstring).
         L_pre, R_pre = compute_hand_targets(box_center, box_half_width, 0.0, squeeze=-pregrasp_offset)
+        L_pre, R_pre = apply_palm_tilt(L_pre, R_pre, tilt_L_deg, tilt_R_deg)
         if preview_enabled:
             # Lets a human directly compare "where is Phase 0a/0b's IK/RRT
             # goal" against the head obstacle sphere (log_head_sphere,
@@ -286,6 +290,7 @@ def run_grasp_phases(
             L_target, R_target = compute_hand_targets(
                 box_center, box_half_width, 0.0, squeeze=squeeze,
             )
+            L_target, R_target = apply_palm_tilt(L_target, R_target, tilt_L_deg, tilt_R_deg)
             sol_q, sol_tauff = ik.solve_ik(L_target, R_target, current_q, np.zeros(14))
             robot.arm.set_joint_targets(sol_q, sol_tauff if gravity_comp_enabled else None)
             current_q = sol_q

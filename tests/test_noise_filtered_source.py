@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from g1_spine_stabilization.trajectory.sources import NoiseFilteredSource, RateLimitedSource
+from g1_spine_stabilization.utils.transforms import Rx
 
 
 class _FakeSource:
@@ -115,6 +116,38 @@ def test_getattr_proxies_to_inner():
     inner = _Inner([[0.0, 0.0, 0.0]], [0.0])
     wrapped = NoiseFilteredSource(inner, median_window=3, ema_alpha=0.5)
     assert wrapped.object_lost is True
+
+
+def test_matrix_theta_median_and_ema_match_equivalent_scalar_signal():
+    """A (3,3)-rotation signal (as MarkerSource now returns) must produce the
+    same median+EMA result as the equivalent Rx(theta) scalar signal, for a
+    pure-X (in-range) sequence -- the exactness claim behind the matrix
+    branch's geodesic median/EMA implementation."""
+    thetas = [0.10, 0.12, 0.50, 0.11, 0.09, 0.10, 0.11]  # one outlier at index 2
+    rotations = [Rx(t) for t in thetas]
+
+    inner_scalar = _FakeSource([[0.0, 0.0, 0.0]] * len(thetas), thetas)
+    inner_matrix = _FakeSource([[0.0, 0.0, 0.0]] * len(rotations), rotations)
+    wrapped_scalar = NoiseFilteredSource(inner_scalar, median_window=3, ema_alpha=0.3)
+    wrapped_matrix = NoiseFilteredSource(inner_matrix, median_window=3, ema_alpha=0.3)
+    wrapped_scalar.startup()
+    wrapped_matrix.startup()
+
+    for _ in thetas:
+        _, out_scalar = wrapped_scalar.step()
+        _, out_matrix = wrapped_matrix.step()
+        np.testing.assert_allclose(out_matrix, Rx(out_scalar), atol=1e-9)
+
+
+def test_mixed_scalar_and_matrix_theta_warns_and_resets_instead_of_raising():
+    """Same rationale as RateLimitedSource's: raising inside the Phase 2 hot
+    loop would kill a live run. History is cleared and filtering continues."""
+    inner = _FakeSource([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], [0.0, np.eye(3)])
+    wrapped = NoiseFilteredSource(inner, median_window=3, ema_alpha=0.5)
+    wrapped.startup()
+    wrapped.step()
+    _, theta2 = wrapped.step()   # must not raise
+    np.testing.assert_allclose(theta2, np.eye(3), atol=1e-12)
 
 
 def test_composes_correctly_inside_rate_limited_source():

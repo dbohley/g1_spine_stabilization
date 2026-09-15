@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from g1_spine_stabilization.trajectory.sources import RateLimitedSource
+from g1_spine_stabilization.utils.transforms import Rx
 
 
 class _FakeClock:
@@ -162,6 +163,46 @@ def test_max_dt_default_does_not_affect_normal_fast_polling():
     wrapped.step()
     _, theta2 = wrapped.step()
     assert theta2 == pytest.approx(0.1)  # unaffected by the (much larger) default ceiling
+
+
+def test_matrix_theta_clamped_to_same_magnitude_as_equivalent_scalar():
+    """A (3,3)-rotation jump must clamp to the same result as the equivalent
+    Rx(theta) scalar jump, for a pure-X, IN-RANGE (|theta|<=pi) signal --
+    proving the matrix branch's geodesic clamp reduces to the scalar
+    arithmetic in the range where the two representations agree (a raw
+    scalar and its rotation matrix stop agreeing past +/-pi, where the
+    matrix can only encode the angle mod 2*pi -- see the class docstring)."""
+    inner_scalar = _FakeSource(
+        [[0.35, 0.0, 0.2], [0.35, 0.0, 0.2]], [0.0, 2.0],
+    )
+    inner_matrix = _FakeSource(
+        [[0.35, 0.0, 0.2], [0.35, 0.0, 0.2]], [np.eye(3), Rx(2.0)],
+    )
+    wrapped_scalar = RateLimitedSource(inner_scalar, max_theta_rate=1.0, max_pos_rate=1.0,
+                                       clock=_FakeClock([0.0, 0.1]))
+    wrapped_matrix = RateLimitedSource(inner_matrix, max_theta_rate=1.0, max_pos_rate=1.0,
+                                       clock=_FakeClock([0.0, 0.1]))
+    wrapped_scalar.startup()
+    wrapped_matrix.startup()
+    wrapped_scalar.step()
+    wrapped_matrix.step()
+    _, theta2 = wrapped_scalar.step()
+    _, R2 = wrapped_matrix.step()
+    assert theta2 == pytest.approx(0.1)  # clamped to max_theta_rate * dt
+    np.testing.assert_allclose(R2, Rx(0.1), atol=1e-9)
+
+
+def test_mixed_scalar_and_matrix_theta_warns_and_reseeds_instead_of_raising():
+    """A theta type flip must NOT raise: this runs inside the Phase 2 hot loop,
+    which only catches KeyboardInterrupt, so an exception here would kill a
+    live tracking run. It re-seeds from the new type and continues."""
+    inner = _FakeSource([[0.35, 0.0, 0.2], [0.35, 0.0, 0.2]], [0.0, np.eye(3)])
+    wrapped = RateLimitedSource(inner, max_theta_rate=1.0, max_pos_rate=1.0,
+                                clock=_FakeClock([0.0, 0.1]))
+    wrapped.startup()
+    wrapped.step()
+    _, theta2 = wrapped.step()   # must not raise
+    np.testing.assert_allclose(theta2, np.eye(3), atol=1e-12)
 
 
 def test_getattr_proxies_unknown_attributes_to_inner():

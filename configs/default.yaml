@@ -56,6 +56,76 @@ trajectory:
     # Single-pole EMA factor in (0, 1], applied after the median stage.
     # Lower = more smoothing/lag.
     ema_alpha: 0.3
+  tracked_rotation:
+    # The tracked target rotation (theta, fed to compute_hand_targets) is now
+    # a full 3-DoF pelvis-frame rotation -- it used to be a single roll-
+    # about-X scalar that silently discarded the target marker's pitch and
+    # yaw (a confirmed bug -- see docs/six_dof_tracking_fix.md). Applies to
+    # BOTH --tracking orient-only (now genuine 3-DoF orientation tracking)
+    # and 6dof (now genuine 6-DoF).
+    enabled: true
+    # Per-axis [X, Y, Z] enable, applied as a rotvec-component mask in the
+    # PELVIS frame (see utils/transforms.py's clamp_rotation). [true, false,
+    # false] reproduces the pre-fix single-axis behavior (without its
+    # >90-degree pitch-aliasing bug).
+    enabled_axes: [true, true, true]
+    # Hard ceiling on the total tracked rotation angle (rotvec norm),
+    # degrees. UNMEASURED: no reachability study of commanded yaw/pitch
+    # against the shoulder-roll self-collision bounds (ik_solver.py's
+    # L_SHOULDER_ROLL_MIN/R_SHOULDER_ROLL_MAX -- Hard Rules, do not touch)
+    # or the wrist limits exists yet. Raised 20 -> 45 because 20 deg is tight
+    # for real head/torso motion and the clamp silently makes the arm appear
+    # to "stop following" past it -- a symptom that reads as a freeze but is
+    # just this cap. The IK-orientation-residual print in Phase 2 (and
+    # ipopt_exhaustion_count alongside it) is how to tell whether the arm can
+    # actually reach a commanded angle; lower this again if that residual
+    # grows at large angles. See docs/six_dof_tracking_fix.md.
+    max_angle_deg: 45.0
+
+  gp_predict:
+    # Torso-GP feedforward: adds the predicted lead of the TARGET marker to
+    # the tracked (box_center, theta), cancelling the ~1-tick tracking lag
+    # of the ~6-10Hz Phase-2 loop. Model + runtime live in gp_predict/export
+    # (numpy+scipy only). See that folder's CONTROLLER_MATH.md SS1-4 -- this
+    # is the "feedback + GP feedforward" form, the only scheme validated
+    # there. No CBF, no long horizons: only twist() (h=1) is used.
+    #
+    # OFF by default: the model is trained on OUR pelvis_marker recordings
+    # (marker id 2) and predicts that marker's motion, but it has not been
+    # validated on this rig in closed loop. Turn on deliberately.
+    #
+    # Applied ONLY to --source marker, and wired INSIDE rate_limit/
+    # tracked_rotation so a prediction can never bypass those safety bounds.
+    # Default OFF -- turn on per-run with --gp-predict (or set true here).
+    enabled: false
+    model_dir: "gp_predict/export/models_robot"
+    # Scales the lead. 1.0 = the GP's own predicted velocity integrated over
+    # the measured tick dt. <1 is a conservative first live test; >1 is not
+    # recommended (the export warns that aiming past the effective latency
+    # is worse than no prediction at all).
+    lead_scale: 1.0
+    # s: caps the per-tick dt used to integrate the held twist, same
+    # rationale as rate_limit.max_dt_s -- a long gap with no step() calls
+    # must not turn into one enormous lead.
+    max_lead_dt_s: 0.5
+    # Anchor the GP only AFTER the palm press seats (the grip is
+    # established and the human is about to start moving the torso),
+    # rather than at source startup -- which runs before Phase 1a, several
+    # seconds of approach/grasp/press too early. The export's rule #1: the
+    # model was trained on clips anchored at the START of a motion segment,
+    # so anchoring during approach feeds it a state its training never
+    # covered. Until armed, PredictiveSource is a pure pass-through.
+    #
+    # With this true, Phase 2 prints a prompt once the press seats and waits
+    # for any keypress (non-blocking -- the press/watchdog loop keeps
+    # running) before the lead engages. Press it as you begin moving.
+    # false = anchor at startup (old behavior; not recommended live).
+    arm_after_seat: true
+    # s: if the press never seats (palm_press disabled, hold_mode:
+    # continuous, contact lost, or the force target is never reached), arm
+    # anyway this many seconds into Phase 2 so the GP is not silently
+    # disabled for the whole run. null = never auto-arm (keypress only).
+    arm_timeout_s: 20.0
 
 box:
   size: [0.10, 0.16, 0.2]  # size[1] (head width, Y) measured against the testing head;
@@ -88,11 +158,14 @@ frames:
 
 perception:
   marker_dict: "DICT_APRILTAG_36h11"   # cv2.aruco constant name
-  marker_size: 0.045                    # meters (4.5 cm square) -- corrected from an
-                                         # incorrect 0.04 after physical measurement;
-                                         # the old value scaled all recovered marker
-                                         # distances by ~11% and was a major hidden
-                                         # contributor to earlier calibration error
+  marker_size: 0.060                    # meters (6.0 cm square) -- physically
+                                         # measured against the printed tag in use.
+                                         # This scales every recovered marker
+                                         # distance linearly, so it must match the
+                                         # BLACK SQUARE's real edge length (not the
+                                         # white quiet-zone border). Earlier values
+                                         # of 0.04 and 0.045 belonged to smaller
+                                         # tags used before.
   object_marker_id: 0
   target_marker_id: 2
   # Camera stream request (used by every RealSenseSource call site). The
@@ -316,6 +389,31 @@ grasp_approach:
                           #    approach even with Phase 1a/0a's own (correctly
                           #    capped) RRT* reach already fixed.
 
+  # Small per-hand LOCAL/body-frame orientation tilt, applied on top of every
+  # commanded palm orientation (Phase 1a/1b/2/hold, and grasp_sequence.py's
+  # mirrored Phase 0a/0b) via trajectory/targets.py's apply_palm_tilt(). Added
+  # after a live test showed the palm-press loop saturate at squeeze_max with
+  # near-zero measured force -- FK against the real URDF confirmed the thumb
+  # tip sits 25-35mm past L_ee_link/R_ee_link along the press axis (more than
+  # the entire squeeze_max=0.02m budget), so the thumb plausibly contacts the
+  # object before the palm sensor does. This tilt is a live-tunable mitigation,
+  # not a predicted fix -- try small values and watch/feel what happens.
+  # [roll, pitch, yaw] in DEGREES, about the hand's OWN local axes:
+  #   roll  = local X = inter-palm press/squeeze axis (same real-world sense
+  #           both hands)
+  #   pitch = local Y = forward/reach axis (same real-world sense both hands)
+  #   yaw   = local Z = up/down (FLIPS real-world sign between hands: +Z left,
+  #           -Z right -- see CLAUDE.md Frame conventions)
+  # A real-world-symmetric tilt therefore needs OPPOSITE signs between hands
+  # for roll/yaw but the SAME sign for pitch -- these two are independent, not
+  # auto-mirrored, since that asymmetry is easy to get backwards while tuning.
+  # All zero (default) is an exact no-op -- today's exact behavior.
+  # Complementary lever: grip_force.grasp_pose's thumb_flex (currently 0.0 --
+  # thumb fully straight/unflexed, i.e. maximally protruding) directly reduces
+  # thumb protrusion past the palm plane, independent of wrist orientation.
+  palm_tilt_deg_left:  [0.0, 15.0, 0.0]
+  palm_tilt_deg_right: [0.0, -15.0, 0.0]
+
 collision_avoidance:
   # Joint-space RRT* planner (kinematics/rrt_planner.py) that replaces the
   # straight-line interpolation for the GROSS REACH to the pre-grasp standoff
@@ -486,7 +584,7 @@ collision_avoidance:
                                 # or cap-derived) as a proxy for arrival. null (default)
                                 # = no check, current behavior. UNMEASURED: start
                                 # conservative (e.g. 0.05 rad) and tune live.
-  arrival_timeout_s: 5.0       # s: max time to wait for convergence before printing a
+  arrival_timeout_s: 10.0       # s: max time to wait for convergence before printing a
                                 # warning and proceeding anyway (no hard abort). Raised
                                 # from 2.0 -- real hardware settling after a multi-
                                 # waypoint RRT* reach can plausibly take longer than a
@@ -578,13 +676,56 @@ palm_press:
 
   # --- Press-loop dynamics ---
   kappa: 0.0005          # integral gain (m/N per step): s += kappa*(F_des - F)
-  squeeze_max: 0.02      # max press depth s (m); MUST be < box_half_width (=0.08)
+  squeeze_max: 0.06      # max press depth s (m); MUST be < box_half_width (=0.08)
+
+  # --- Step-and-settle cadence ---
+  # The press depth s is realised through the IK servo and the arm's own
+  # dynamics, and (under force_source: wrist_wrench) sensed through a torque
+  # estimate that LAGS real contact. The original continuous law advanced s
+  # every tick, so at the real ~6-10Hz loop rate it commanded new inward
+  # motion before the previous motion had shown up in the reading -- it kept
+  # closing because it had not yet SEEN the contact it already created, and
+  # so overshot. With step_increment set, s advances by at most that many
+  # metres and then HOLDS for settle_time seconds before advancing again:
+  # move in a little, wait, read the force, move in again.
+  #   step_increment: null restores the original continuous behavior.
+  # The crush guard is exempt from the hold -- retreating from an over-pressed
+  # palm never waits on a timer.
+  # UNMEASURED starting values: 2mm per advance, ~0.4s to settle. Raise
+  # settle_time if force readings still lag the motion; lower step_increment
+  # if the approach lands too hard.
+  step_increment: 0.002  # m: max inward advance per step (null = continuous)
+  settle_time: 0.4       # s: hold after each inward advance before the next
 
   # --- Signal conditioning ---
   baseline_frames: 20    # no-contact frames averaged at Phase 1.5 to zero the palm
   noise_threshold: 10    # counts above baseline to count a cell as "active" (diagnostic)
-  signal: min            # combine the two palms for the target loop: min | mean
-                         # (min guarantees BOTH palms reach the setpoint)
+  # combine the two hands for the target-tracking loop: min | mean. mean
+  # (default) drives the PAIR'S AVERAGE toward force_target -- changed from
+  # min after a live finding where min kept driving whichever hand read
+  # weaker toward the target while the other ran up toward force_max (75%
+  # of the crush-guard ceiling) with no corresponding benefit, instead of
+  # the two settling near the target together. min still guarantees BOTH
+  # hands individually reach the setpoint, but is unreachable if the two
+  # hands have real per-hand asymmetry (contact geometry, calibration) --
+  # set back to min if that stronger guarantee is actually wanted.
+  # guard_force() (the crush-guard check) is ALWAYS max of the two hands,
+  # regardless of this setting -- unrelated safety concept, unaffected.
+  signal: mean
+
+  # --- Force signal source ---
+  # palm_sensor (default) -- the central-palm tactile array via PalmForceReader.
+  # wrist_wrench -- NOT a hardware sensor (none exists on this robot/SDK --
+  #   confirmed: the DDS LowState_/MotorState_ messages carry only a per-motor
+  #   tau_est scalar, no wrench field). Instead estimates per-hand force from
+  #   measured joint torque: tau_ext = tau_measured - gravity_torque(q), then
+  #   pinv(J^T) @ tau_ext projected onto the inter-palm press axis. See
+  #   controllers/palm_force.py's WristWrenchForceReader and
+  #   docs/palm_force_control.md for the sign-convention derivation and the
+  #   caution that force_max/touch_threshold/loss_floor tuned against the
+  #   palm sensor are NOT guaranteed to mean the same real-world force here.
+  #palm_sensor // wrist_wrench
+  force_source: wrist_wrench
 
   # --- Contact-loss safety watchdog (SDK-6 head-drop guard) ---
   # Armed once the grip is real (min-palm force crosses touch_threshold, i.e. BOTH
@@ -597,7 +738,64 @@ palm_press:
   # tune with real data after counts_per_newton calibration.
   touch_threshold: 0.5   # N: min-palm force that counts as "gripped" (arms the watchdog)
   loss_floor: 0.2        # N: min-palm force below which contact is "lost" (<= touch_threshold)
-  loss_frames: 3         # consecutive below-floor frames to latch the trip (~0.3-0.5s at 6-10Hz)
+  # Consecutive below-floor frames before a loss is CONFIRMED (~1-1.7s at the real
+  # 6-10Hz loop rate). Raised 3 -> 10 because force_source is currently
+  # wrist_wrench -- a torque-derived estimate that is noisier and more
+  # model-dependent than the palm tactile sensor these thresholds were written
+  # for (see palm_force.py's WristWrenchForceReader CAUTION). A brief noise dip
+  # below 0.2N should not read as a dropped head. This is the main knob to raise
+  # further if the guard still fires spuriously on real hardware.
+  loss_frames: 10
+  # Turn the contact-loss guard off entirely WITHOUT disabling the palm-press
+  # loop itself (palm_press.enabled: false would kill the press too). With this
+  # false, a lost grip never freezes the press -- only do that deliberately.
+  watchdog_enabled: true
+  # false (default): a confirmed loss freezes the press but CLEARS as soon as
+  # force recovers above loss_floor, so a spurious trip costs one dip rather
+  # than the rest of the run. true restores the original latched behavior
+  # (frozen until the process exits -- nothing calls reset() mid-run).
+  # The guard still prints [SAFETY] on every loss and regain either way;
+  # tracking itself never stops for this, only the inward press does.
+  watchdog_latch: false
+
+  # --- Seat-and-freeze: when the press STOPS regulating ---
+  # The press loop's job is to ESTABLISH the grip, not to keep regulating force
+  # for the whole run. The press depth s is NOT a private side channel -- it is
+  # fed straight into compute_hand_targets(squeeze=s), i.e. into the very same
+  # IK hand targets Phase 2's tracking is trying to hit. Regulating force every
+  # tick therefore FIGHTS the tracker on the press axis (and with force_source:
+  # wrist_wrench it fights using noise, since that estimate is torque-derived).
+  #   seat (DEFAULT) -- run the press loop until the measured force converges,
+  #     then HOLD that depth for the rest of the run and let tracking own the
+  #     hand targets. Freezing s does NOT freeze the hands: s keeps flowing
+  #     through compute_hand_targets with the live theta/box_center, so the
+  #     grip geometry still rotates with the tracked object.
+  #   continuous -- the original always-regulating behavior, kept for hardware
+  #     A/B comparison without a code revert.
+  # Once seated there is NO un-seating, even if contact is later lost: the
+  # watchdog above still prints [SAFETY] loudly, but control of the hand targets
+  # is never handed back to the force loop mid-tracking.
+  hold_mode: seat
+  # N: |F - force_target| band that counts as converged. UNMEASURED PLACEHOLDER.
+  # Same caution as loss_frames above -- this is tuned against whatever
+  # force_source is active, and wrist_wrench's Newtons are noisier and more
+  # model-dependent than the palm sensor's. Too tight and the press never seats
+  # (it keeps regulating, i.e. the old behavior); too loose and it seats early
+  # at a weaker grip than requested.
+  seat_tolerance: 0.5
+  # Consecutive in-band ticks required to declare the press seated. Deliberately
+  # NOT 1: at the real ~6-10Hz Phase 2 loop rate this is ~0.5-0.8s of sustained
+  # in-band force, so a single wrist_wrench noise spike costs a counter reset
+  # rather than permanently seating the grip too shallow.
+  seat_frames: 5
+  # N: minimum force EACH hand must individually read before the press may
+  # seat. The combined signal alone cannot tell a balanced grip from a
+  # lopsided one -- with signal: mean, left +6N / right 0N averages to the
+  # same value as a balanced +3/+3, and seating there would freeze a
+  # one-sided grip as the hold position. This gate rejects that case.
+  # null disables the check (aggregate-only seating, the old behavior).
+  # UNMEASURED: start near half the target force and tune live.
+  seat_per_hand_min: 1.0
 
   # --- Force-control mode (Road 1: Jacobian feedforward) ---
   # mode selects how the palm grip force is produced:

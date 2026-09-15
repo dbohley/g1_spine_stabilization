@@ -260,3 +260,34 @@ class CollisionChecker:
                 geom_idx = pair.first if pair.second in self._obstacle_geom_ids else pair.second
                 return self.gmodel.geometryObjects[geom_idx].name
         return None
+
+    def first_colliding_pair(self, q, pair_ids) -> "tuple[str, str] | None":
+        """(arm_geometry_name, obstacle_geometry_name) for the first colliding
+        pair, or None if q is collision-free against pair_ids.
+
+        Companion to first_colliding_geometry, which names only the ARM side.
+        That is not enough to diagnose an abort: every obstacle -- the primary
+        head sphere, each stacked sphere, AND the floor half-space -- is
+        registered here as "head_padded_{i}"/"head_true_{i}", so a message
+        built from the arm name alone cannot say WHICH obstacle was hit. The
+        obstacle index maps to the order obstacles were passed to __init__
+        (see rrt_planner.plan_collision_free_approach: spheres first, floor
+        last when configured)."""
+        self.gdata.deactivateAllCollisionPairs()
+        for k in pair_ids:
+            self.gdata.activateCollisionPair(k)
+        pin.computeCollisions(
+            self.model, self.data,
+            self.gmodel, self.gdata, np.asarray(q, dtype=float),
+            True,
+        )
+        for k in pair_ids:
+            if self.gdata.collisionResults[k].isCollision():
+                pair = self.gmodel.collisionPairs[k]
+                if pair.second in self._obstacle_geom_ids:
+                    arm_idx, obs_idx = pair.first, pair.second
+                else:
+                    arm_idx, obs_idx = pair.second, pair.first
+                return (self.gmodel.geometryObjects[arm_idx].name,
+                        self.gmodel.geometryObjects[obs_idx].name)
+        return None

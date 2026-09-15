@@ -125,22 +125,37 @@ class RRTStarPlanner:
             self.edge_check_resolution_rad,
         )
 
+    def _culprit_suffix(self, q, pair_ids) -> str:
+        """" (link: <arm geom> vs <obstacle geom>)" for the first colliding
+        pair, or "" if nothing collides / the checker predates
+        first_colliding_pair. Names BOTH sides deliberately: the obstacle list
+        holds the head sphere, any stacked spheres, and the floor half-space,
+        all registered as "head_padded_{i}"/"head_true_{i}", so reporting only
+        the arm link (as this did originally) leaves the reader unable to tell
+        which obstacle actually fired."""
+        pair_fn = getattr(self.checker, "first_colliding_pair", None)
+        if pair_fn is not None:
+            culprit = pair_fn(q, pair_ids)
+            if culprit:
+                return f" (link: {culprit[0]} vs {culprit[1]})"
+            return ""
+        culprit = self.checker.first_colliding_geometry(q, pair_ids)
+        return f" (link: {culprit})" if culprit else ""
+
     def plan(self, q_start: np.ndarray, q_goal: np.ndarray) -> np.ndarray:
         """Returns (N,14) waypoints; path[0]==q_start, path[-1]==q_goal exactly."""
         q_start = np.asarray(q_start, dtype=float)
         q_goal = np.asarray(q_goal, dtype=float)
 
         if not self.checker.is_valid_transit(q_start):
-            culprit = self.checker.first_colliding_geometry(q_start, self.checker._padded_pair_ids)
-            suffix = f" (link: {culprit})" if culprit else ""
             raise StartInCollisionError(
-                f"[RRTPlanner] q_start already intrudes on the padded head obstacle{suffix}."
+                "[RRTPlanner] q_start already intrudes on a padded obstacle"
+                f"{self._culprit_suffix(q_start, self.checker._padded_pair_ids)}."
             )
         if not self.checker.is_valid_contact(q_goal):
-            culprit = self.checker.first_colliding_geometry(q_goal, self.checker._true_pair_ids)
-            suffix = f" (link: {culprit})" if culprit else ""
             raise GoalInCollisionError(
-                f"[RRTPlanner] q_goal intrudes on the true head obstacle{suffix}."
+                "[RRTPlanner] q_goal intrudes on a true obstacle"
+                f"{self._culprit_suffix(q_goal, self.checker._true_pair_ids)}."
             )
 
         # Fast path: if the direct line is already clear, skip sampling.

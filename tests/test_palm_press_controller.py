@@ -8,7 +8,11 @@ clamping into [force_min, force_max], and reset.
 import numpy as np
 import pytest
 
-from g1_spine_stabilization.controllers.palm_force import PalmPressController, clamp_target_force
+from g1_spine_stabilization.controllers.palm_force import (
+    PalmPressController,
+    PressSeatDetector,
+    clamp_target_force,
+)
 
 
 def _make(**kw):
@@ -118,3 +122,51 @@ def test_clamp_target_force_at_exact_bounds_is_unchanged_no_warning():
     hi, warn_hi = clamp_target_force(8.0, force_min=0.7, force_max=8.0)
     assert lo == 0.7 and warn_lo is None
     assert hi == 8.0 and warn_hi is None
+
+
+# ----------------------------------------------------------------------
+# PressSeatDetector -- seat-and-freeze convergence detection
+# ----------------------------------------------------------------------
+
+def _seat(**kw):
+    defaults = dict(force_target=3.0, tolerance=0.5, frames=5)
+    defaults.update(kw)
+    return PressSeatDetector(**defaults)
+
+
+def test_seats_after_frames_consecutive_in_band_readings():
+    d = _seat(frames=5)
+    for _ in range(4):
+        d.update(3.1)
+        assert not d.seated       # in band, but not yet long enough
+    d.update(3.1)
+    assert d.seated
+
+
+def test_out_of_band_tick_resets_the_counter():
+    """The whole point of requiring CONSECUTIVE frames: one wrist_wrench noise
+    spike must not seat the grip early at too shallow a depth."""
+    d = _seat(frames=5)
+    for _ in range(4):
+        d.update(3.0)
+    d.update(0.2)                 # spike out of band
+    assert not d.seated
+    for _ in range(4):            # a fresh run of 4 is still not enough
+        d.update(3.0)
+        assert not d.seated
+    d.update(3.0)
+    assert d.seated
+
+
+def test_stays_seated_after_force_leaves_the_band():
+    """No un-seating: contact loss must flag via the watchdog, NOT hand the
+    hand targets back to the force loop mid-tracking."""
+    d = _seat(frames=2)
+    d.update(3.0)
+    d.update(3.0)
+    assert d.seated
+    for _ in range(20):
+        d.update(0.0)             # contact fully lost
+    assert d.seated
+    d.reset()                     # only an explicit reset (at release) clears it
+    assert not d.seated

@@ -71,6 +71,31 @@ One continuum on a single axis: **standoff `−offset` → grasp `0` → press `
 (Phase 2). Config: `grasp_approach.pregrasp_offset` (m, `< box_half_width`),
 `grasp_approach.close_time` (s). `pregrasp_offset: 0` disables the standoff.
 
+### Palm tilt (thumb-first-contact mitigation)
+
+A live test showed `s` saturate at `squeeze_max` while measured force stayed near zero for many
+seconds — FK against the real URDF (at the live `grip_force.grasp_pose`) confirmed the thumb tip
+sits 25mm (left) / 35mm (right) past `L_ee_link`/`R_ee_link` along the press axis, more than the
+entire `squeeze_max` (20mm) budget, so the thumb plausibly contacts the object before the palm
+sensor does — no collision checking runs during the live press loop to catch this.
+
+`grasp_approach.palm_tilt_deg_left`/`palm_tilt_deg_right` (`[roll, pitch, yaw]` degrees, default
+all-zero/no-op) apply a small **local/body-frame** rotation on top of every commanded palm
+orientation (`trajectory/targets.py`'s `apply_palm_tilt`, composed as the rightmost factor so it
+never disturbs `theta`/`squeeze`/`grasp_frame_R`), across Phase 1a/1b/2/hold and
+`grasp_sequence.py`'s mirrored Phase 0a/0b. Axes are the hand's own: roll = local X (the
+press/squeeze axis itself — unaffected by rolling about it), pitch = local Y (forward/reach axis,
+same real-world sense both hands), yaw = local Z (up/down, **flips real-world sign between
+hands** — see CLAUDE.md's Frame conventions). A real-world-symmetric tilt therefore needs
+**opposite** signs between hands for roll/yaw but the **same** sign for pitch; the two hands are
+independent config values on purpose rather than auto-mirrored, since that asymmetry is easy to
+get backwards while tuning by feel. This is a live-tunable mitigation, not a predicted fix — try
+small values and observe.
+
+Complementary lever: `grip_force.grasp_pose`'s `thumb_flex` (currently `0.0` — thumb fully
+straight/unflexed, i.e. maximally protruding) directly reduces thumb protrusion past the palm
+plane, independent of wrist orientation — worth trying alongside or instead of the tilt.
+
 ---
 
 ## 2. Signal and calibration
@@ -223,6 +248,54 @@ symmetric $s$; see §7 for the per-hand generalization).
 
 ---
 
+## 3.7 Alternative force source: wrist wrench (`palm_press.force_source`)
+
+Live testing found the palm tactile sensors themselves unreliable, and separately that
+`signal: min` (the old default, §2) kept driving whichever hand read weaker toward the target
+while the other ran up toward the crush-guard ceiling with no corresponding benefit. Two fixes:
+
+**`signal` default is now `mean`** (still `min | mean`, both readers below): drives the PAIR's
+average toward `force_target`, rather than forcing both hands individually to hit it (which is
+unreachable if the two hands have any real asymmetry). `guard_force()` (the crush guard) is
+**always max of the two hands regardless of `signal`** — an independent safety concept, unaffected.
+
+**`palm_press.force_source: palm_sensor | wrist_wrench`** (default `palm_sensor`, i.e. today's
+`PalmForceReader`). `wrist_wrench` is **not a hardware sensor** — confirmed by direct inspection
+that no wrist F/T sensor exists on this robot or in the vendored SDK (`unitree_hg`'s
+`LowState_`/`MotorState_` carry only a per-motor `tau_est` scalar, no wrench field; the SDK's own
+"wrist force" terminology already means this same derived quantity). It's `WristWrenchForceReader`
+(`controllers/palm_force.py`): `tau_ext = tau_measured - gravity_torque(q)`, then
+`W_ext ≈ pinv(J(q)^T) @ tau_ext` per arm (`G1HandIK.ee_jacobians`/`gravity_torque`, the exact same
+Jacobians §3.5 already uses the other direction), projected onto `press_axis(theta, grasp_frame_R)`
+— the same axis `compute_press_wrenches` commands a press along (which itself gained an optional
+`grasp_frame_R` param alongside this work: it previously hardcoded pelvis-Y even when
+`compute_hand_targets` was already using the object's own measured axis, a stale-axis gap now fixed).
+
+Sign convention — **two independent considerations**: (1) `compute_press_wrenches` defines `W` as
+the wrench the palm exerts ON the object — left `-F·u`, right `+F·u`. By Newton's third law the
+object's reaction ON the hand is the negative of that — `+F·u` on the left hand, `-F·u` on the
+right — so a genuine symmetric press produces *opposite* raw signs between hands.
+`WristWrenchForceReader` dots the left hand's raw wrench with `+u` and the right's with `-u`,
+turning those opposite raw signs into a matching positive reading for both — mirroring
+`PalmForceReader.force()`'s always-non-negative convention. This part was derived from the math
+and is unit-tested, but a synthetic-Jacobian test can't validate (2): **whether `tau_est` itself
+agrees in sign with Pinocchio's `gravity_torque(q)` on real hardware.** First live test showed it
+doesn't — both hands read increasingly *negative* together as real squeeze/contact genuinely
+increased (both moving the same way ruled out a per-hand (1)-type mixup, which would show one
+hand flip relative to the other instead). Fixed by negating in `_estimate`
+(`tau_ext = gravity_torque(q) - tau`, not the other order). See
+`tests/test_palm_force_reader.py`'s sign-convention regression tests, and re-confirm live after
+any hardware/SDK change that could touch how `tau_est` is reported.
+
+**Caution, not hidden:** torque-derived force is inherently noisier and more model-dependent than
+a dedicated sensor — gravity-model error, Jacobian conditioning near singularities, joint
+friction/`tau_est` bias all feed into it. `force_max`/`touch_threshold`/`loss_floor` tuned against
+the palm sensor's Newton values are **not guaranteed to mean the same real-world force here**, even
+though both report "Newtons" — re-validate these live against the new source rather than assuming
+equivalence.
+
+---
+
 ## 4. Access path
 
 - **Readout / calibration tool** (`scripts/read_palm_force.py`, robot not
@@ -256,6 +329,9 @@ palm_press:
   baseline_frames: 20      # no-contact frames averaged at Phase 1.5
   noise_threshold: 10      # counts above baseline to call a cell "active" (diagnostic)
   signal: min              # combine two palms for the target loop: min | mean
+  hold_mode: seat          # seat | continuous -- when the press STOPS regulating (§7.7)
+  seat_tolerance: 0.5      # N: |F - force_target| band counting as converged; PLACEHOLDER
+  seat_frames: 5           # consecutive in-band ticks to declare the press seated
 ```
 
 `force_target: 0.0` means the press never engages, so it is **safe to leave
@@ -334,6 +410,93 @@ supported way to try a specific grip force live without hand-editing YAML:
 python scripts/run_pose_tracking_preview.py --source marker --tracking orient-only \
     --target-force 3.0 --no-dry-run
 ```
+
+## 7.6 Contact-loss watchdog: freezes the press, never the run
+
+`PalmContactWatchdog` arms once force crosses `touch_threshold`, then confirms a
+loss after `loss_frames` consecutive frames below `loss_floor`. On a confirmed
+loss it **freezes the press** — position mode holds the last depth, jacobian mode
+zeroes the commanded wrench — and the arm holds pose stiffly via the unchanged
+`kp` servo.
+
+**It does not stop tracking.** Phase 2 keeps running, the IK keeps solving, and
+`set_joint_targets` is still called every tick; only the inward press stops
+advancing. Ending the run is the operator's call (Ctrl-C).
+
+Three knobs, all under `palm_press`:
+
+| Key | Default | Effect |
+|---|---|---|
+| `watchdog_enabled` | `true` | `false` disables the guard **without** disabling the press loop (`palm_press.enabled: false` would kill both) |
+| `watchdog_latch` | `false` | `false`: a confirmed loss clears as soon as force recovers above `loss_floor`. `true`: the original behavior — frozen until the process exits, since nothing calls `reset()` mid-run |
+| `loss_frames` | `10` | Consecutive below-floor frames before a loss is confirmed (~1–1.7 s at the real 6–10 Hz loop rate) |
+
+`watchdog_latch: false` and the raised `loss_frames` both exist because
+`force_source` is currently `wrist_wrench` — a torque-derived estimate that is
+noisier and more model-dependent than the palm tactile sensor these thresholds
+were originally written for (see §3.7's CAUTION). A momentary dip below 0.2 N is
+far more likely to be sensor noise than a dropped head, and under the old latched
+guard that noise would freeze the press for the entire remaining session.
+
+The `[SAFETY] palm contact lost` / `palm contact regained` messages are
+edge-triggered, so the log shows the real loss/recovery history rather than one
+stale line. If the guard still fires spuriously on hardware, raise `loss_frames`
+further before reaching for `watchdog_enabled: false`.
+
+## 7.7 Seat-and-freeze: the press stops regulating once the grip is established
+
+**The press loop's job is to establish the grip, not to regulate force for the
+whole run.** Under the original always-regulating behavior, `press_ctrl.step()`
+ran on every Phase 2 tick, so the press depth `s` kept moving in response to
+force error while the arm was simultaneously trying to track the target marker.
+
+That is not a benign background loop. `s` is **not** a private side channel of
+the force controller — §3.5 shows it feeding straight into
+`compute_hand_targets(..., squeeze=s, ...)`, i.e. into the very same IK hand
+targets the tracking controller is trying to hit. A force loop rewriting those
+targets every tick fights the tracker on the press axis, and the force loop
+wins. With `force_source: wrist_wrench` (§3.7) it is fighting the tracker using
+*noise*, since that estimate is torque-derived rather than a direct measurement.
+
+`palm_press.hold_mode` selects the behavior:
+
+- **`seat` (default)** — run the press loop until the measured force converges,
+  then hold that depth for the rest of the run. Tracking owns the hand targets
+  from then on.
+- **`continuous`** — the original always-regulating behavior, kept so the two
+  can be A/B compared on hardware without a code revert.
+
+**What "frozen" means.** Freezing `s` does *not* freeze the hands. `s` keeps
+flowing through `compute_hand_targets` with the live `theta` / `box_center`, so
+the grip geometry still rotates with the tracked object exactly as before. Only
+the force-driven *adjustment* of the palm separation stops. This is a frozen
+scalar, not a frozen joint configuration.
+
+**The seat criterion** (`PressSeatDetector`, `controllers/palm_force.py`) is
+`|F − force_target| <= seat_tolerance` for `seat_frames` **consecutive** ticks —
+deliberately not "force first crossed the target". A single `wrist_wrench` noise
+spike would otherwise seat the grip early at too shallow a depth, and there is no
+un-seating. At the real ~6-10 Hz Phase 2 loop rate the default `seat_frames: 5`
+is ~0.5-0.8 s of sustained in-band force, so a spike costs a counter reset rather
+than a bad grip.
+
+**No un-seating, by design.** Once seated the depth is held even if contact is
+later lost. The watchdog (§7.6) still prints `[SAFETY]` loudly on every loss and
+regain, but control of the hand targets is never handed back to the force loop
+mid-tracking — the same "warn, don't halt" principle §7.6 follows. Only an
+explicit `reset()` at hand release clears it, before a re-grasp.
+
+One consequence worth stating plainly: the crush guard lives inside
+`press_ctrl.step()`, so it stops running once seated. That is correct — a fixed
+depth cannot crush further than it already has — and the watchdog's per-tick
+`[SAFETY]` prints remain the live contact diagnostic.
+
+In jacobian mode the analogous quantity is frozen: the commanded press force
+`F_cmd` is held at its converged value rather than re-stepped, which is the
+force-domain equivalent of a frozen depth.
+
+The ~1 Hz status line shows `[seating…]` or `[SEATED — depth held]` so the
+operator can see at a glance which regime the press is in.
 
 ## 8. Safety / Hard Rules
 

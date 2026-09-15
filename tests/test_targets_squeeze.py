@@ -7,11 +7,13 @@ compatibility at squeeze=0, and clamping when squeeze exceeds the half-width.
 """
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from g1_spine_stabilization.trajectory.targets import (
     BOX_CENTER_DEFAULT,
     BOX_HALF_WIDTH_DEFAULT,
     compute_hand_targets,
+    apply_palm_tilt,
 )
 
 
@@ -180,3 +182,58 @@ def test_grasp_frame_r_rotates_position_and_orientation_together():
     # Orientation must be re-based through G too (at theta=0, R == identity).
     np.testing.assert_allclose(L[:3, :3], G @ R_L_BASE, atol=1e-12)
     np.testing.assert_allclose(R[:3, :3], G @ R_R_BASE, atol=1e-12)
+
+
+# ---------------------------------------------------------------------
+# apply_palm_tilt -- local-frame palm orientation offset
+# ---------------------------------------------------------------------
+
+def test_apply_palm_tilt_zero_is_exact_noop():
+    """All-zero tilts (the default) must reproduce the input byte-for-byte --
+    today's exact behavior for every existing caller that doesn't pass tilts."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    L0, R0 = compute_hand_targets(box_center, 0.11, 0.3, squeeze=0.02)
+    L1, R1 = apply_palm_tilt(L0, R0)
+    np.testing.assert_array_equal(L0, L1)
+    np.testing.assert_array_equal(R0, R1)
+
+
+def test_apply_palm_tilt_rotates_only_the_given_hand():
+    """A tilt on one hand must not touch the other hand's rotation, and must
+    never touch either hand's position."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    L0, R0 = compute_hand_targets(box_center, 0.11, 0.0)
+    L1, R1 = apply_palm_tilt(L0, R0, tilt_left_deg=(5.0, 0.0, 0.0))
+    np.testing.assert_array_equal(L0[:3, 3], L1[:3, 3])
+    np.testing.assert_array_equal(R0[:3, 3], R1[:3, 3])
+    np.testing.assert_array_equal(R0[:3, :3], R1[:3, :3])
+    assert not np.allclose(L0[:3, :3], L1[:3, :3])
+
+
+def test_apply_palm_tilt_composes_as_local_frame_right_multiply():
+    """The tilt must compose as R_original @ tilt_matrix for each hand
+    (a body-frame rotation appended as the rightmost factor), even on top of
+    an already-nonzero theta/squeeze -- the property that makes this safe to
+    bolt on without touching compute_hand_targets itself."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    L0, R0 = compute_hand_targets(box_center, 0.11, 0.4, squeeze=0.01)
+    tilt_left = (3.0, -2.0, 7.0)
+    tilt_right = (-4.0, 1.5, 0.0)
+    L1, R1 = apply_palm_tilt(L0, R0, tilt_left_deg=tilt_left, tilt_right_deg=tilt_right)
+    L_tilt_mat = Rotation.from_euler("XYZ", tilt_left, degrees=True).as_matrix()
+    R_tilt_mat = Rotation.from_euler("XYZ", tilt_right, degrees=True).as_matrix()
+    np.testing.assert_allclose(L1[:3, :3], L0[:3, :3] @ L_tilt_mat, atol=1e-12)
+    np.testing.assert_allclose(R1[:3, :3], R0[:3, :3] @ R_tilt_mat, atol=1e-12)
+
+
+def test_apply_palm_tilt_roll_preserves_local_x_axis():
+    """Rolling about the hand's own local X (the inter-palm press/squeeze
+    axis, column 0) must leave that same axis direction unchanged -- it IS
+    the rotation axis, so the press direction is never disturbed by a roll
+    tilt regardless of magnitude or sign."""
+    box_center = np.array([0.35, 0.0, 0.10])
+    L0, R0 = compute_hand_targets(box_center, 0.11, 0.0)
+    L1, R1 = apply_palm_tilt(L0, R0, tilt_left_deg=(15.0, 0.0, 0.0),
+                             tilt_right_deg=(-15.0, 0.0, 0.0))
+    np.testing.assert_allclose(L1[:3, 0], L0[:3, 0], atol=1e-9)
+    np.testing.assert_allclose(R1[:3, 0], R0[:3, 0], atol=1e-9)

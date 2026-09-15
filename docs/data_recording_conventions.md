@@ -12,7 +12,7 @@ Both scripts import the same `RunRecorder`/`MarkerSample` from `g1_spine_stabili
 
 ```python
 {
-    "schema_version": 2,
+    "schema_version": 3,
     "origin": "robot" | "human",
     "source_label": "sine" | "mock" | "marker" | "realsense",   # robot: trajectory source; human: camera source
     "tracking_mode": "orient-only" | "6dof" | None,
@@ -23,7 +23,7 @@ Both scripts import the same `RunRecorder`/`MarkerSample` from `g1_spine_stabili
 }
 ```
 
-**Per-sample fields (`MarkerSample`):** `t` (elapsed seconds since recording started), `wall_time` (absolute `time.time()` epoch — use this, not `t`, to correlate two different recordings against the real clock), `object_pose`/`target_pose` (4x4 SE3, pelvis frame, raw per-frame marker detections — `None` if that marker wasn't seen this sample), `object_obs_timestamp`/`target_obs_timestamp`, `object_reprojection_error`/`target_reprojection_error`, `angle_diff_rpy` (see §3), `object_angular_velocity`/`target_angular_velocity` (see §4), `theta` (robot-only, always `None` from the human script), `load_cell_wrench_raw`/`load_cell_wrench_grav_comp` (ATI F/T sensor wrench — see §6).
+**Per-sample fields (`MarkerSample`):** `t` (elapsed seconds since recording started), `wall_time` (absolute `time.time()` epoch — use this, not `t`, to correlate two different recordings against the real clock), `object_pose`/`target_pose` (4x4 SE3, pelvis frame, raw per-frame marker detections — `None` if that marker wasn't seen this sample), `object_obs_timestamp`/`target_obs_timestamp`, `object_reprojection_error`/`target_reprojection_error`, `angle_diff_rpy` (see §3), `object_angular_velocity`/`target_angular_velocity` (see §4), `theta` (robot-only, always `None` from the human script; **also `None` on the robot side whenever the tracking source's rotation this step was a full (3,3) matrix rather than a scalar** — see the `tracked_rotvec` entry below and `docs/six_dof_tracking_fix.md`), `tracked_rotvec` (robot-only, `(3,)` rad pelvis frame — the rotvec of whatever rotation was fed to `compute_hand_targets` this step, populated for BOTH the scalar and matrix representations, so it's the field to read regardless of which one a given run used; `theta` is kept only for the scalar case, for backward compatibility), `load_cell_wrench_raw`/`load_cell_wrench_grav_comp` (ATI F/T sensor wrench — see §6).
 
 **Schema versions:** v1 had a single reserved `load_cell_wrench` (always `None`). v2 (current) splits it into `load_cell_wrench_raw` + `load_cell_wrench_grav_comp` when the F/T sensor was wired up — see §6.
 
@@ -44,7 +44,7 @@ This is the standard biomechanics convention for describing a distal/moving segm
 
 **This is not just a sign flip.** `angle_diff_rpy(A, B)` and `angle_diff_rpy(B, A)` are not simply negatives of each other for non-trivial rotations — `R.T`'s Euler decomposition differs from `-euler(R)` elementwise except to first order for small angles, because the underlying intrinsic-XYZ sequence is order-dependent (roll is applied first, then pitch about the *already-rolled* Y axis, then yaw about the *twice-rotated* Z axis). Which marker is "reference" is a real, consequential modeling choice, not cosmetic.
 
-**This is a different computation from `MarkerSource._theta_from_target_rotation`** (`trajectory/sources.py`), which is used only to drive `compute_hand_targets`/the live IK during Phase 2. That function computes a single-axis rotation of the target relative to *its own starting pose at the beginning of the run* (`R_delta = target_start_rot.T @ R_current`, then `atan2` of one matrix entry — a roll-about-X angle only). `angle_diff_rpy` is a full 3-axis instantaneous comparison of *object vs. target right now*, with no notion of a "starting pose." Don't read one as validating or contradicting the other — they answer different questions and are recorded as different fields (`theta` vs. `angle_diff_rpy`).
+**This is a different computation from `MarkerSource._rotation_from_target`** (`trajectory/sources.py`), which is used only to drive `compute_hand_targets`/the live IK during Phase 2. That function computes the target's *full* rotation relative to *its own starting pose at the beginning of the run*, in the pelvis/world frame (`R_current @ target_start_rot.T`). `angle_diff_rpy` is a full 3-axis instantaneous comparison of *object vs. target right now*, with no notion of a "starting pose." Don't read one as validating or contradicting the other — they answer different questions and are recorded as different fields (`theta`/`tracked_rotvec` vs. `angle_diff_rpy`). (Before the fix in `docs/six_dof_tracking_fix.md`, `_rotation_from_target`'s predecessor computed only a single-axis roll-about-X scalar via `atan2` of one matrix entry — a confirmed bug that silently discarded the target's pitch/yaw, and used the wrong, body-frame form of the delta besides. Neither issue ever affected `angle_diff_rpy`, which was always a separate, full-rotation computation.)
 
 ## 4. Two different frames, on purpose: `angle_diff_rpy` vs. angular velocity
 

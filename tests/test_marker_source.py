@@ -12,6 +12,7 @@ import pytest
 from g1_spine_stabilization.perception.tracker import MockMarkerTracker
 from g1_spine_stabilization.perception.types import MarkerObservation
 from g1_spine_stabilization.trajectory.sources import MarkerSource, SineSource
+from g1_spine_stabilization.utils.transforms import Rx
 
 
 OBJ_ID = 0
@@ -106,10 +107,9 @@ def test_orient_only_theta_tracks_relative_rotation_not_absolute():
     source.startup()
     _, theta = source.step()
     expected_delta = step_theta - start_theta
-    assert abs(theta - expected_delta) < 1e-6, (
-        f"Expected theta delta {expected_delta}, got {theta}"
-    )
-    assert abs(theta - step_theta) > 1e-3, (
+    np.testing.assert_allclose(theta, Rx(expected_delta), atol=1e-6,
+                               err_msg=f"Expected theta delta {expected_delta}, got {theta}")
+    assert not np.allclose(theta, Rx(step_theta), atol=1e-3), (
         "theta should not equal the target's absolute rotation"
     )
 
@@ -163,6 +163,89 @@ def test_6dof_box_center_tracks_target_displacement_not_absolute_position():
     np.testing.assert_allclose(bc, expected, atol=1e-6)
     assert not np.allclose(bc, tgt_step_pos, atol=1e-3), (
         "box_center should not equal the target's raw absolute position"
+    )
+
+
+def _make_obs_R(marker_id, pos, R):
+    """Like _make_obs, but takes an arbitrary rotation matrix instead of a
+    pure Rx(theta) -- for exercising pitch/yaw, which _make_obs cannot
+    produce at all."""
+    pose = np.eye(4)
+    pose[:3, :3] = R
+    pose[:3, 3] = pos
+    return MarkerObservation(
+        marker_id=marker_id, pose_in_pelvis=pose, timestamp=0.0, reprojection_error=0.0,
+    )
+
+
+class _SequenceTrackerR:
+    """Like _SequenceTracker, but each frame's target rotation is an
+    arbitrary (3,3) matrix rather than an Rx(theta) scalar."""
+    def __init__(self, frames):
+        self._frames = frames  # list of (obj_pos, tgt_pos, tgt_R)
+        self._i = 0
+        self._latest = {}
+
+    def step(self):
+        obj_pos, tgt_pos, tgt_R = self._frames[min(self._i, len(self._frames) - 1)]
+        self._i += 1
+        obj_obs = _make_obs(OBJ_ID, obj_pos)
+        tgt_obs = _make_obs_R(TGT_ID, tgt_pos, tgt_R)
+        self._latest[OBJ_ID] = obj_obs
+        self._latest[TGT_ID] = tgt_obs
+        return [obj_obs, tgt_obs]
+
+    def get_latest(self, mid):
+        return self._latest.get(mid)
+
+
+def test_target_yaw_is_tracked_not_discarded():
+    """Regression test for the confirmed 6dof/orient-only bug: a pure YAW of
+    the target marker used to collapse to theta=0.0 (no hand response at
+    all), since the old single-axis extraction only ever read a roll-about-X
+    component. theta is now a full rotation, so a pure yaw must be tracked."""
+    from scipy.spatial.transform import Rotation as _R
+    R_yaw = _R.from_euler('z', 0.5).as_matrix()
+    frames = [
+        (BOX_CENTER, BOX_CENTER, np.eye(3)),  # Phase A
+        (BOX_CENTER, BOX_CENTER, np.eye(3)),  # Phase B: identity start reference
+        (BOX_CENTER, BOX_CENTER, R_yaw),      # step(): target has yawed
+    ]
+    tracker = _SequenceTrackerR(frames)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0)
+    source.startup()
+    _, theta = source.step()
+    np.testing.assert_allclose(theta, R_yaw, atol=1e-9,
+                               err_msg="pure yaw must be tracked, not collapsed to identity")
+
+
+def test_rotation_delta_is_world_frame_not_body_frame():
+    """Regression test for the second, independent confirmed bug: the target
+    delta must be R_t @ R_target_start.T (world/pelvis frame -- what
+    compute_hand_targets's grasp_frame_R composition requires), NOT
+    R_target_start.T @ R_t (the target's own body frame). A non-identity,
+    non-commuting start rotation is required to tell the two apart -- for a
+    pure-X start rotation they're numerically identical, which is why this
+    bug went uncaught before."""
+    from scipy.spatial.transform import Rotation as _R
+    R_start = _R.from_euler('xyz', [0.1, 0.3, -0.2]).as_matrix()  # non-trivial, multi-axis
+    R_step = _R.from_euler('xyz', [0.4, -0.1, 0.5]).as_matrix()
+    frames = [
+        (BOX_CENTER, BOX_CENTER, np.eye(3)),   # Phase A
+        (BOX_CENTER, BOX_CENTER, R_start),     # Phase B: start reference
+        (BOX_CENTER, BOX_CENTER, R_step),      # step(): target has rotated
+    ]
+    tracker = _SequenceTrackerR(frames)
+    source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only", countdown=0.0)
+    source.startup()
+    _, theta = source.step()
+
+    R_world = R_step @ R_start.T
+    R_body = R_start.T @ R_step
+    np.testing.assert_allclose(theta, R_world, atol=1e-9,
+                               err_msg="expected the WORLD-frame delta R_t @ R_start.T")
+    assert not np.allclose(theta, R_body, atol=1e-3), (
+        "got the target's own BODY-frame delta -- wrong frame for composing onto grasp_frame_R"
     )
 
 
@@ -331,9 +414,8 @@ def test_step_returns_last_known_on_empty_frame():
     # Both steps with no detection return the pre-seeded theta from startup
     _, first_theta = source.step()
     _, second_theta = source.step()
-    assert abs(second_theta - first_theta) < 1e-6, (
-        "step() should return last known theta when no new detection"
-    )
+    np.testing.assert_allclose(second_theta, first_theta, atol=1e-6,
+                               err_msg="step() should return last known theta when no new detection")
 
 
 class _StartupOnlyTracker:
@@ -399,14 +481,12 @@ def test_startup_preseeds_nonzero_theta_delta_and_it_persists_when_stale():
     source.startup()
     _, first_theta = source.step()
     expected_delta = moved_theta - start_theta
-    assert abs(first_theta - expected_delta) < 1e-6, (
-        f"Expected theta delta {expected_delta}, got {first_theta}"
-    )
+    np.testing.assert_allclose(first_theta, Rx(expected_delta), atol=1e-6,
+                               err_msg=f"Expected theta delta {expected_delta}, got {first_theta}")
     # tracker is now silent -- delta should be held, not reset
     _, second_theta = source.step()
-    assert abs(second_theta - first_theta) < 1e-6, (
-        "Nonzero theta delta should persist across stale/silent steps"
-    )
+    np.testing.assert_allclose(second_theta, first_theta, atol=1e-6,
+                               err_msg="Nonzero theta delta should persist across stale/silent steps")
 
 
 def test_wait_for_keypress_blocks_on_input_and_refreshes_theta():
@@ -431,9 +511,9 @@ def test_wait_for_keypress_blocks_on_input_and_refreshes_theta():
 
     _, theta = source.step()  # tracker now silent -- holds the post-keypress value
     expected_delta = post_keypress_theta - start_theta
-    assert abs(theta - expected_delta) < 1e-6, (
-        f"Expected theta delta {expected_delta} from the post-keypress refresh, got {theta}"
-    )
+    np.testing.assert_allclose(
+        theta, Rx(expected_delta), atol=1e-6,
+        err_msg=f"Expected theta delta {expected_delta} from the post-keypress refresh, got {theta}")
 
 
 def test_target_stale_seconds_increments():

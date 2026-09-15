@@ -14,8 +14,11 @@ Modes (--source):
 
 Tracking (--tracking, for marker/mock only):
   orient-only  (default) — box center fixed from object marker at startup;
-                           theta tracks target marker X-rotation.
-  6dof         — box center also tracks target marker translation.
+                           theta tracks the target marker's full 3-DoF
+                           rotation (genuine 3-DoF orientation tracking).
+  6dof         — box center also tracks target marker translation, so this
+                           is genuine 6-DoF (3 translation + 3 rotation).
+                           See docs/six_dof_tracking_fix.md.
 
 SAFETY NOTE: Defaults to dry_run=True (safe, no hardware). Pass --no-dry-run
 for live-robot mode — that is SDK-6 and must be run by a human with the robot
@@ -46,7 +49,8 @@ from g1_spine_stabilization.perception.tracker import MarkerTracker
 from g1_spine_stabilization.perception.types import MarkerObservation
 from g1_spine_stabilization.trajectory.targets import L_EE_DEFAULT
 from g1_spine_stabilization.trajectory.sources import (
-    SineSource, MarkerSource, RateLimitedSource, NoiseFilteredSource,
+    SineSource, MarkerSource, RateLimitedSource, NoiseFilteredSource, RotationClampSource,
+    PredictiveSource,
 )
 from g1_spine_stabilization.controllers.sdk_pose_tracking import run_pose_tracking_sdk
 from g1_spine_stabilization.controllers.palm_force import clamp_target_force
@@ -67,17 +71,30 @@ class _AnimatedMockTracker:
       TOP of the box (box_center + box_half_height, identity rotation) --
       mirrors the real physical setup so this mock exercises the same
       marker-on-top correction MarkerSource applies to a real reading.
-    - Target marker (id from config): rotates about X with a sine wave.
+    - Target marker (id from config): rotates with a per-axis-weighted sine
+      wave (see `axes`).
+
+    `axes` (default (1.0, 0.0, 0.0)) is a per-axis [X, Y, Z] amplitude
+    weight for the target's synthetic rotation, in the pelvis frame. The
+    default reproduces the ORIGINAL pure roll-about-X motion byte-for-byte
+    (Rx(amplitude*sin(w)) exactly) -- so every pre-existing mock run is
+    unchanged. Passing e.g. (1.0, 1.0, 1.0) exercises pitch and yaw with a
+    120-degree phase offset between axes (so the rotation axis genuinely
+    varies over time, rather than staying fixed and just scaled) -- this is
+    the only camera-free way to verify MarkerSource's full 3-DoF rotation
+    tracking (see docs/six_dof_tracking_fix.md); a co-phased scaled rotvec
+    would still only ever exercise a single, fixed rotation axis.
     """
 
     def __init__(self, object_marker_id, target_marker_id, box_center,
-                 amplitude=0.4, freq=0.2, box_half_height=0.0):
+                 amplitude=0.4, freq=0.2, box_half_height=0.0, axes=(1.0, 0.0, 0.0)):
         self._obj_id = object_marker_id
         self._tgt_id = target_marker_id
         self._box_center = np.asarray(box_center, dtype=float)
         self._box_half_height = box_half_height
         self._amplitude = amplitude
         self._freq = freq
+        self._axes = np.asarray(axes, dtype=float)
         self._latest: dict = {}
         self._t_start = time.monotonic()
 
@@ -97,10 +114,18 @@ class _AnimatedMockTracker:
             pose_in_optical=obj_pose,
         )
 
-        theta = self._amplitude * math.sin(2 * math.pi * self._freq * t)
-        ct, st = math.cos(theta), math.sin(theta)
+        w = 2 * math.pi * self._freq * t
+        # 120-degree phase offset per axis so the rotation axis itself
+        # varies over time when more than one axes[] weight is nonzero --
+        # with the default axes=(1,0,0) this reduces to exactly
+        # Rx(amplitude*sin(w)), byte-identical to the original motion.
+        rotvec = self._amplitude * self._axes * np.array([
+            math.sin(w),
+            math.sin(w + 2 * math.pi / 3),
+            math.sin(w + 4 * math.pi / 3),
+        ])
         tgt_pose = np.eye(4)
-        tgt_pose[:3, :3] = np.array([[1, 0, 0], [0, ct, -st], [0, st, ct]])
+        tgt_pose[:3, :3] = Rotation.from_rotvec(rotvec).as_matrix()
         tgt_pose[:3, 3] = self._box_center
         obs_tgt = MarkerObservation(
             marker_id=self._tgt_id,
@@ -175,6 +200,16 @@ def main():
         "--tracking", choices=["orient-only", "6dof"], default="orient-only",
         help="Tracking mode for marker/mock sources (default: orient-only)",
     )
+    parser.add_argument(
+        "--mock-rotation-axes", type=float, nargs=3, default=[1.0, 0.0, 0.0],
+        metavar=("X", "Y", "Z"),
+        help="--source mock only: per-axis [X, Y, Z] amplitude weight for the "
+             "synthetic target rotation (pelvis frame). Default '1 0 0' is the "
+             "original pure roll-about-X motion. '1 1 1' exercises pitch and "
+             "yaw with a time-varying rotation axis -- the only camera-free "
+             "way to verify the full 3-DoF rotation tracking fix (see "
+             "docs/six_dof_tracking_fix.md).",
+    )
     parser.add_argument("--config", default=None, help="Path to YAML config")
     parser.add_argument(
         "--detect", action="store_true",
@@ -224,6 +259,35 @@ def main():
              "configured palm_press.force_target unchanged.",
     )
     parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Print the per-marker transform-chain diagnostic (optical -> "
+             "d435 mount -> pelvis positions) in Phase 2's ~1Hz status block. "
+             "A calibration-debugging aid -- off by default, since it adds "
+             "six lines per second to the run output.",
+    )
+    parser.add_argument(
+        "--gp-predict", dest="gp_predict", action="store_true", default=None,
+        help="Enable the torso-GP feedforward for this run (overrides "
+             "trajectory.gp_predict.enabled). Adds the GP's predicted lead of "
+             "the TARGET marker to the tracked pose, cancelling the ~1-tick "
+             "lag of the ~6-10Hz loop. --source marker only; wrapped INSIDE "
+             "the rate limiter and rotation clamp so a prediction can never "
+             "bypass those bounds. The GP anchors after the palm press seats "
+             "(trajectory.gp_predict.arm_after_seat).",
+    )
+    parser.add_argument(
+        "--no-gp-predict", dest="gp_predict", action="store_false",
+        help="Disable the torso-GP feedforward for this run.",
+    )
+    parser.add_argument(
+        "--gp-lead-scale", type=float, default=None, metavar="S",
+        help="Override trajectory.gp_predict.lead_scale for this run. 1.0 = "
+             "the GP's own predicted velocity integrated over the measured "
+             "tick dt; <1 is a conservative first live test. Values >1 are "
+             "not recommended (aiming past the effective latency is worse "
+             "than no prediction at all).",
+    )
+    parser.add_argument(
         "--wait-for-keypress", action="store_true",
         help="--source marker only: after both markers are detected, wait for "
              "Enter instead of the fixed 3s countdown before Phase 1 begins. "
@@ -241,6 +305,12 @@ def main():
              "there (never physically pushed/backdriven). May be given alone "
              "(right hand holds its current pose) or together with "
              "--test-start-right. Default: none (skip).",
+    )
+    parser.add_argument(
+        "--pause-after-test-pose", action="store_true", default=False,
+        help="After driving to --test-start-left/--test-start-right, hold that "
+             "pose and wait for Enter before starting any tracking. Lets you "
+             "inspect/adjust the arm at the typed pose. Default: off.",
     )
     parser.add_argument(
         "--test-start-right", type=float, nargs=6, default=None,
@@ -285,6 +355,16 @@ def main():
     perception = cfg["perception"]
     obj_id = perception["object_marker_id"]
     tgt_id = perception["target_marker_id"]
+
+    gp_cfg_override = cfg.setdefault("trajectory", {}).setdefault("gp_predict", {})
+    if args.gp_predict is not None:
+        gp_cfg_override["enabled"] = args.gp_predict
+    if args.gp_lead_scale is not None:
+        gp_cfg_override["lead_scale"] = args.gp_lead_scale
+    if gp_cfg_override.get("enabled", False) and args.source != "marker":
+        print(f"[preview] NOTE: GP feedforward requested but --source is "
+              f"'{args.source}'; it applies to --source marker only and will "
+              f"be skipped this run.")
 
     if args.target_force is not None:
         palm_press_cfg = cfg.setdefault("palm_press", {})
@@ -388,6 +468,7 @@ def main():
             amplitude=cfg["trajectory"]["sine"]["amplitude"],
             freq=cfg["trajectory"]["sine"]["frequency"],
             box_half_height=box_half_height,
+            axes=args.mock_rotation_axes,
         )
         source = MarkerSource(mock_tracker, obj_id, tgt_id, mode=args.tracking, countdown=0.0,
                               box_half_height=box_half_height,
@@ -486,6 +567,38 @@ def main():
             print(f"[preview] Noise filter enabled: median_window={median_window}, "
                   f"ema_alpha={ema_alpha:.2f}")
 
+        # ---------------------------------------------------------------
+        # Torso-GP feedforward (marker mode only). Wrapped INSIDE the rate
+        # limiter and rotation clamp below, so a prediction can never escape
+        # those safety bounds. See configs/default.yaml:
+        # trajectory.gp_predict and gp_predict/export/CONTROLLER_MATH.md.
+        # ---------------------------------------------------------------
+        gp_cfg = cfg.get("trajectory", {}).get("gp_predict", {})
+        if gp_cfg.get("enabled", False):
+            gp_export = os.path.join(_PROJECT_ROOT, "gp_predict", "export")
+            if gp_export not in sys.path:
+                sys.path.insert(0, gp_export)
+            from torso_gp_predictor import TorsoGP
+            model_dir = gp_cfg.get("model_dir", "gp_predict/export/models_robot")
+            if not os.path.isabs(model_dir):
+                model_dir = os.path.join(_PROJECT_ROOT, model_dir)
+            gp = TorsoGP(model_dir)
+            if tgt_id != 2:
+                print(f"[preview] WARNING: trajectory.gp_predict is ON but the target "
+                      f"marker is id={tgt_id}; the GP was trained on marker id=2 "
+                      f"motion. Predictions on a different marker are unvalidated.")
+            source = PredictiveSource(
+                source, gp,
+                lead_scale=gp_cfg.get("lead_scale", 1.0),
+                max_lead_dt=gp_cfg.get("max_lead_dt_s", 0.5),
+                # The controller arms this after the palm press seats -- see
+                # sdk_pose_tracking.py Phase 2. Until then it is a pass-through.
+                require_arm=gp_cfg.get("arm_after_seat", True),
+            )
+            print(f"[preview] GP feedforward ENABLED: {os.path.basename(model_dir)}, "
+                  f"horizons={[round(h * gp.step_dt, 2) for h in gp.hset]}s, "
+                  f"lead_scale={gp_cfg.get('lead_scale', 1.0)}")
+
     # -------------------------------------------------------------------
     # Rate-limit the trajectory source (uniform across sine/mock/marker).
     # See configs/default.yaml: trajectory.rate_limit.
@@ -503,6 +616,24 @@ def main():
         )
         print(f"[preview] Rate limiter enabled: {max_theta_rate_deg_s:.1f} deg/s, "
               f"{max_pos_rate_m_s:.2f} m/s (max_dt={max_dt_s:.2f}s)")
+
+    # -------------------------------------------------------------------
+    # Safety clamp on the tracked rotation (outermost -- see
+    # RotationClampSource's docstring for why it must be last). See
+    # configs/default.yaml: trajectory.tracked_rotation,
+    # docs/six_dof_tracking_fix.md.
+    # -------------------------------------------------------------------
+    tracked_rotation_cfg = cfg.get("trajectory", {}).get("tracked_rotation", {})
+    if tracked_rotation_cfg.get("enabled", True):
+        max_angle_deg = tracked_rotation_cfg.get("max_angle_deg", None)
+        enabled_axes = tracked_rotation_cfg.get("enabled_axes", None)
+        source = RotationClampSource(
+            source,
+            max_angle=(None if max_angle_deg is None else math.radians(max_angle_deg)),
+            enabled_axes=enabled_axes,
+        )
+        print(f"[preview] Rotation clamp enabled: max_angle={max_angle_deg}deg, "
+              f"enabled_axes={enabled_axes}")
 
     # -------------------------------------------------------------------
     # Optional data recording (--record). See g1_spine_stabilization/
@@ -602,7 +733,9 @@ def main():
                               preview=preview, cam_for_preview=cam_for_preview,
                               recorder=recorder, wrench_source=wrench_source,
                               test_start_pose=test_start_pose,
-                              log_joint_path=args.log_joint_path)
+                              pause_after_test_pose=args.pause_after_test_pose,
+                              log_joint_path=args.log_joint_path,
+                              verbose=args.verbose)
     finally:
         robot.shutdown()
         if wrench_source is not None:

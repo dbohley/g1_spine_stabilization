@@ -56,6 +56,21 @@ class SpacebarWatcher:
         data = os.read(self._fd, 64)
         return _contains_space(data)
 
+    def any_pressed(self) -> bool:
+        """Non-blocking: True the instant ANY key has been read.
+
+        Companion to pressed(), for a second in-loop prompt that must not
+        collide with space-to-release (overloading space for two different
+        meanings in one run is ambiguous). Same no-TTY degradation: always
+        False, so the caller falls back to whatever its timeout does.
+        """
+        if not self._is_tty:
+            return False
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+        if not ready:
+            return False
+        return len(os.read(self._fd, 64)) > 0
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self._is_tty and self._old_settings is not None:
             import termios

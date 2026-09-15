@@ -38,6 +38,14 @@ Usage:
     #   keep the palm untouched for the baseline, then rest the known mass flat
     #   on the central palm pad (face-up, spread like the real object) at the
     #   prompt. Repeat with --side right.
+
+    # Multi-point calibration (recommended): type a series of known weights
+    # (kg), one per prompt, pressing Enter after each; blank line to finish
+    # (need >= 2 points). Fits counts_per_newton via least squares AND
+    # reports each point's own ratio + R^2/intercept, so you can see whether
+    # summed-counts-proportional-to-force actually holds across the range,
+    # not just trust it from a single point:
+    python scripts/read_palm_force.py --no-dry-run --side left --calibrate-series
 """
 
 from __future__ import annotations
@@ -51,6 +59,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from g1_spine_stabilization.controllers.palm_force import fit_calibration_series
 
 # --- Hardware constants (mirror g1_inspire_sdk/inspire_hand.py + data_sheet) ---
 PALM_REGISTER = 4900          # holding-register start for palm_touch
@@ -174,6 +184,77 @@ def capture_baseline(readers: dict, n_frames: int, rate: float) -> dict:
     return baseline
 
 
+def run_calibration_series(reader: PalmForceReader, baseline: np.ndarray, side: str,
+                            *, n_frames: int, rate: float, noise_threshold: float,
+                            dry_run: bool) -> None:
+    """Interactive multi-point calibration for ONE hand: repeatedly prompts for
+    a known weight (kg), captures n_frames of baseline-subtracted summed
+    counts under that load, and (once >= 2 points exist) fits
+    counts_per_newton via least squares (fit_calibration_series). Blank
+    input or Ctrl-C ends collection early with whatever points exist.
+    """
+    print(f"[PalmForce] Multi-point calibration for {side.upper()} hand.")
+    print("[PalmForce] For each point: type the known weight in kg and press "
+          "Enter (blank line to finish; need >= 2 points to fit a line).")
+    period = 1.0 / rate
+    forces_n: list[float] = []
+    counts_totals: list[float] = []
+    point = 1
+    while True:
+        try:
+            raw = input(f"Point {point} weight (kg): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n[PalmForce] Stopping calibration series.")
+            break
+        if raw == "":
+            break
+        try:
+            weight_kg = float(raw)
+            if weight_kg <= 0.0:
+                raise ValueError
+        except ValueError:
+            print(f"[PalmForce]   '{raw}' is not a positive number -- try again.")
+            continue
+
+        force_n = weight_kg * STANDARD_GRAVITY
+        if not dry_run:
+            input(f"[PalmForce] Rest {weight_kg:.3f} kg ({force_n:.3f} N) flat on the "
+                  f"palm pad, spread like the real object, then press Enter to capture...")
+        total = 0.0
+        for _ in range(n_frames):
+            r = reduce_palm(reader.read(), baseline, noise_threshold)
+            total += r["total"]
+            time.sleep(period)
+        mean_total = total / max(n_frames, 1)
+        forces_n.append(force_n)
+        counts_totals.append(mean_total)
+        print(f"[PalmForce]   point {point}: {weight_kg:.3f} kg = {force_n:.3f} N -> "
+              f"mean_total={mean_total:.1f} counts  (this point alone: "
+              f"counts_per_newton={mean_total / force_n:.2f})")
+        point += 1
+
+    if len(forces_n) == 0:
+        print("[PalmForce] No points collected -- nothing to fit.")
+        return
+    if len(forces_n) == 1:
+        print(f"[PalmForce] Only 1 point collected -- can't fit a line (need >= 2). "
+              f"Single-point ratio: counts_per_newton={counts_totals[0] / forces_n[0]:.2f}")
+        return
+
+    fit = fit_calibration_series(forces_n, counts_totals)
+    print(f"[PalmForce] {side}: fit over {len(forces_n)} points -> "
+          f"counts_per_newton={fit['slope']:.2f}  intercept={fit['intercept']:.1f}  "
+          f"R^2={fit['r2']:.4f}")
+    print("[PalmForce]   per-point ratios: "
+          + ", ".join(f"{r:.1f}" for r in fit["per_point_ratio"]))
+    if fit["r2"] < 0.98 or abs(fit["intercept"]) > 0.15 * max(counts_totals):
+        print("[PalmForce]   NOTE: low R^2 or a large intercept means summed-counts-"
+              "proportional-to-force may not hold well at these loads/spread -- see "
+              "docs/palm_force_control.md §2 (\"Force, not pressure\").")
+    print(f"[PalmForce] Put counts_per_newton={fit['slope']:.2f} into configs/default.yaml "
+          f"palm_press.counts_per_newton for the {side} hand.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read Inspire palm tactile sensor")
     parser.add_argument("--side", choices=["both", "left", "right"], default="both",
@@ -202,6 +283,14 @@ def main() -> None:
                         help="Same as --calibrate but the known load is given as a MASS in kg "
                              "(converted to force via g=9.80665). E.g. --calibrate-kg 0.5 -> 4.90 N. "
                              "Mutually exclusive with --calibrate.")
+    parser.add_argument("--calibrate-series", action="store_true", default=False,
+                        help="Multi-point calibration: interactively prompts for a series of "
+                             "known weights (kg), one per Enter press (blank line to finish, "
+                             "need >= 2 points), and fits counts_per_newton via least squares "
+                             "-- also reports each point's own ratio + R^2/intercept so you can "
+                             "see whether the linear (no-area-division) model actually holds "
+                             "across the range. Requires a single --side (left or right). "
+                             "Mutually exclusive with --calibrate/--calibrate-kg.")
     parser.add_argument("--rate", type=float, default=10.0,
                         help="Read rate in Hz (default: 10)")
     parser.add_argument("--duration", type=float, default=None,
@@ -213,9 +302,15 @@ def main() -> None:
     args = parser.parse_args()
 
     # Resolve the known calibration load in Newtons from either --calibrate (N)
-    # or --calibrate-kg (mass * g). Mutually exclusive.
+    # or --calibrate-kg (mass * g). Mutually exclusive with each other AND
+    # with --calibrate-series (single-point vs. multi-point modes).
     if args.calibrate is not None and args.calibrate_kg is not None:
         parser.error("pass only one of --calibrate / --calibrate-kg")
+    if args.calibrate_series and (args.calibrate is not None or args.calibrate_kg is not None):
+        parser.error("--calibrate-series is mutually exclusive with --calibrate/--calibrate-kg")
+    if args.calibrate_series and args.side == "both":
+        parser.error("--calibrate-series requires a single --side (left or right) -- "
+                      "calibrate one hand at a time")
     force_n = None
     if args.calibrate is not None:
         if args.calibrate <= 0.0:
@@ -225,7 +320,7 @@ def main() -> None:
         if args.calibrate_kg <= 0.0:
             parser.error("--calibrate-kg KG must be positive")
         force_n = args.calibrate_kg * STANDARD_GRAVITY
-    calibrating = force_n is not None
+    calibrating = force_n is not None or args.calibrate_series
 
     sides = ["left", "right"] if args.side == "both" else [args.side]
     ips = {"left": args.left_ip, "right": args.right_ip}
@@ -258,6 +353,17 @@ def main() -> None:
 
     # --- Calibration mode: average total counts under a known load, print scale ---
     if calibrating:
+        if args.calibrate_series:
+            side = sides[0]
+            run_calibration_series(
+                readers[side], baseline[side], side,
+                n_frames=args.baseline_frames, rate=args.rate,
+                noise_threshold=args.noise_threshold, dry_run=args.dry_run,
+            )
+            for reader in readers.values():
+                reader.close()
+            return
+
         load_desc = f"{force_n:.3f} N"
         if args.calibrate_kg is not None:
             load_desc = f"{args.calibrate_kg:.3f} kg = {force_n:.3f} N"

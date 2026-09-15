@@ -1,11 +1,11 @@
 """Shared trial-data recorder for robot and human pose-tracking runs.
 
-Depends only on numpy/scipy/pickle/stdlib -- no robot, no IK, no
-g1_inspire_sdk import -- so it can be imported unmodified by both
-controllers/sdk_pose_tracking.py (robot Phase 2) and
-scripts/record_human_trial.py (perception-only, no robot). Importing the
-SAME module from both call sites is what guarantees the two produce
-identical pickle schemas, rather than relying on two independently
+Depends only on numpy/scipy/pickle/stdlib (plus utils/transforms.py, itself
+numpy/scipy-only) -- no robot, no IK, no g1_inspire_sdk import -- so it can
+be imported unmodified by both controllers/sdk_pose_tracking.py (robot
+Phase 2) and scripts/record_human_trial.py (perception-only, no robot).
+Importing the SAME module from both call sites is what guarantees the two
+produce identical pickle schemas, rather than relying on two independently
 maintained implementations staying in sync.
 
 Full reference (schema, filename convention, camera/calibration invariance
@@ -34,11 +34,14 @@ already plays the "stable reference" role by definition in each:
     torso's own axes, matching standard neck-kinematics reporting.
 
 This is a DIFFERENT, INDEPENDENT computation from trajectory/sources.py's
-MarkerSource._theta_from_target_rotation -- that function computes a
-single-axis rotation of the target relative to ITS OWN STARTING POSE
-(used only to drive compute_hand_targets/the IK during live tracking), not
-a multi-axis instantaneous object-vs-target comparison. Don't conflate the
-two just because both involve "target" and "rotation."
+MarkerSource._rotation_from_target -- that function computes a full (3,3)
+rotation of the target relative to ITS OWN STARTING POSE (used only to
+drive compute_hand_targets/the IK during live tracking), not a multi-axis
+INSTANTANEOUS object-vs-target comparison. Don't conflate the two just
+because both involve "target" and "rotation." (Prior to the fix in
+docs/six_dof_tracking_fix.md, _rotation_from_target's predecessor computed
+only a single-axis roll-about-X scalar -- a confirmed bug, unrelated to
+this function, which was never affected by it.)
 
 object_angular_velocity/target_angular_velocity (below) are DELIBERATELY
 in a DIFFERENT frame from angle_diff_rpy: they're computed directly from
@@ -68,6 +71,8 @@ from typing import Optional
 
 import numpy as np
 from scipy.spatial.transform import Rotation
+
+from g1_spine_stabilization.utils.transforms import is_scalar_theta
 
 
 _PROJECT_ROOT = os.path.abspath(
@@ -157,7 +162,17 @@ class MarkerSample:
     # module's docstring and docs/data_recording_conventions.md.
     object_angular_velocity: Optional[np.ndarray] = None
     target_angular_velocity: Optional[np.ndarray] = None
-    theta: Optional[float] = None                      # robot-side only: theta fed to compute_hand_targets this step
+    theta: Optional[float] = None                      # robot-side only: theta fed to compute_hand_targets this step;
+                                                         # None whenever the source's theta was a (3,3) rotation this
+                                                         # step (see tracked_rotvec below) rather than a scalar -- NOT
+                                                         # populated from the rotvec's own X component, since that
+                                                         # would silently resurrect the lossy single-axis
+                                                         # representation this field's own sibling exists to replace.
+    tracked_rotvec: Optional[np.ndarray] = None         # (3,) rad, pelvis frame -- Rotation.as_rotvec() of the FULL
+                                                         # rotation fed to compute_hand_targets this step (scalar
+                                                         # thetas are also recorded here as [theta, 0, 0], so this
+                                                         # field is populated whenever theta is, for either
+                                                         # representation). See docs/six_dof_tracking_fix.md.
     # ATI Axia80 F/T sensor wrench, (6,) [Fx,Fy,Fz,Mx,My,Mz] in N / N*m,
     # expressed in the SENSOR frame. Both None when the sensor is disabled or
     # unreachable (recording degrades gracefully, never crashes).
@@ -210,7 +225,9 @@ class RunRecorder:
     human-trial script (scripts/record_human_trial.py) -- so a downstream
     comparison analysis can load either file interchangeably.
     """
-    SCHEMA_VERSION = 2   # v2: load_cell_wrench split into _raw + _grav_comp (F/T sensor wired)
+    SCHEMA_VERSION = 3   # v2: load_cell_wrench split into _raw + _grav_comp (F/T sensor wired)
+                         # v3: theta may be None for a (3,3)-rotation source; tracked_rotvec added
+                         #     (see docs/six_dof_tracking_fix.md)
 
     def __init__(
         self,
@@ -266,6 +283,15 @@ class RunRecorder:
         load_cell_wrench_raw/_grav_comp: optional (6,) F/T sensor wrenches
         (see sensors/force_torque.py). Passed through verbatim; None when no
         sensor is attached.
+
+        theta: the value fed to compute_hand_targets this step -- either a
+        scalar (roll about pelvis X) or a (3,3) rotation matrix (see
+        trajectory/sources.py, docs/six_dof_tracking_fix.md), or None. Split
+        into two fields on the sample: scalar -> sample.theta=float(theta),
+        sample.tracked_rotvec=[theta,0,0]; (3,3) -> sample.theta=None,
+        sample.tracked_rotvec=Rotation.as_rotvec() of it; None -> both None.
+        See MarkerSample's field comments for why sample.theta is never
+        back-filled from a (3,3) input's rotvec.
         """
         if t is None:
             if self._t0 is None:
@@ -312,6 +338,15 @@ class RunRecorder:
                 )
             self._prev_tgt = (R_tgt_opt.copy(), target_obs.timestamp)
 
+        sample_theta = None
+        tracked_rotvec = None
+        if theta is not None:
+            if is_scalar_theta(theta):
+                sample_theta = float(theta)
+                tracked_rotvec = np.array([sample_theta, 0.0, 0.0])
+            else:
+                tracked_rotvec = Rotation.from_matrix(np.asarray(theta, dtype=float)).as_rotvec()
+
         sample = MarkerSample(
             t=t,
             wall_time=wall_time,
@@ -324,7 +359,8 @@ class RunRecorder:
             angle_diff_rpy=angle_diff,
             object_angular_velocity=object_angular_velocity,
             target_angular_velocity=target_angular_velocity,
-            theta=theta,
+            theta=sample_theta,
+            tracked_rotvec=tracked_rotvec,
             load_cell_wrench_raw=(
                 None if load_cell_wrench_raw is None else np.asarray(load_cell_wrench_raw, float).copy()
             ),
