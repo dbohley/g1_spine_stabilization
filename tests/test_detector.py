@@ -25,6 +25,22 @@ def _synthesize_marker_frame(marker_id: int, dict_name: str, size_px: int,
     return frame
 
 
+def _synthesize_marker_frame_grayscale(marker_id: int, dict_name: str, size_px: int,
+                                       frame_shape=(480, 640)):
+    """Like _synthesize_marker_frame but returns a genuine single-channel
+    (H, W) frame -- exercises detector.py's `frame.ndim == 2` branch
+    directly, the path a raw infrared (y8) frame takes."""
+    dict_id = getattr(cv2.aruco, dict_name)
+    dictionary = cv2.aruco.getPredefinedDictionary(dict_id)
+    marker_img = cv2.aruco.generateImageMarker(dictionary, marker_id, size_px)
+
+    frame = np.full(frame_shape, 255, dtype=np.uint8)
+    cy, cx = frame_shape[0] // 2, frame_shape[1] // 2
+    half = size_px // 2
+    frame[cy - half : cy + half, cx - half : cx + half] = marker_img
+    return frame
+
+
 @pytest.fixture
 def detector():
     return AprilTagDetector("DICT_APRILTAG_36h11", marker_size_m=0.04)
@@ -66,6 +82,17 @@ def test_detector_returns_pose_with_positive_z(detector, intrinsics):
     frame = _synthesize_marker_frame(0, "DICT_APRILTAG_36h11", size_px=200)
     detections = detector.detect(frame, intrinsics)
     assert detections[0].pose_in_optical[2, 3] > 0.0
+
+
+def test_detector_finds_synthesized_marker_on_grayscale_frame(detector, intrinsics):
+    """A genuine (H, W) single-channel frame -- the shape a raw infrared
+    (y8) frame comes back as -- must detect identically to the 3-channel
+    path, with no conversion needed by the caller."""
+    frame = _synthesize_marker_frame_grayscale(0, "DICT_APRILTAG_36h11", size_px=200)
+    assert frame.ndim == 2
+    detections = detector.detect(frame, intrinsics)
+    assert len(detections) == 1
+    assert detections[0].marker_id == 0
 
 
 def test_detector_returns_empty_on_blank_frame(detector, intrinsics):

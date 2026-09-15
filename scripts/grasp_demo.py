@@ -76,6 +76,13 @@ def main() -> None:
         "--rate", type=float, default=50.0,
         help="Control rate Hz for hand interpolation phases (default: 50.0)",
     )
+    parser.add_argument(
+        "--log-joint-path", default=None, metavar="PATH",
+        help="Write a per-tick CSV log of every joint command sent during "
+             "Phase 0a's RRT*-planned approach (see "
+             "controllers/joint_path_execution.py's execute_joint_path "
+             "log_path docstring). Default: off.",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -127,6 +134,7 @@ def main() -> None:
             do_left=do_left, do_right=do_right,
             hold_time=args.hold_time, rate=args.rate,
             preview_enabled=args.preview, dry_run=args.dry_run,
+            log_joint_path=args.log_joint_path,
         )
     finally:
         robot.shutdown()

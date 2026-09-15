@@ -34,7 +34,12 @@ from g1_spine_stabilization.utils.config import load_config
 
 def run_realsense(config, dry_run=False):
     perception = config["perception"]
-    source = RealSenseSource(dry_run=dry_run)
+    cam_cfg = perception.get("camera", {})
+    source = RealSenseSource(
+        width=cam_cfg.get("width", 640), height=cam_cfg.get("height", 480),
+        fps=cam_cfg.get("fps", 30), stream=cam_cfg.get("stream", "color"),
+        emitter_enabled=cam_cfg.get("emitter_enabled", False), dry_run=dry_run,
+    )
     native = source.intrinsics_native
     intrinsics = CameraIntrinsics(
         fx=native["fx"], fy=native["fy"], cx=native["cx"], cy=native["cy"],
@@ -44,6 +49,10 @@ def run_realsense(config, dry_run=False):
         perception["marker_dict"], perception["marker_size"]
     )
     T_opt_to_d435 = optical_to_d435_from_config(perception["d435_link_to_optical"])
+    if source.ir_to_color_extrinsic is not None:
+        T_opt_to_d435 = T_opt_to_d435 @ source.ir_to_color_extrinsic
+        print("[visualize_markers] stream=infrared: composed d435_link_to_optical "
+              "with the camera's live IR-left->color extrinsic.")
     T_d435_to_pelvis = d435_to_pelvis_from_pinocchio()
 
     tracker = MarkerTracker(
@@ -59,6 +68,11 @@ def run_realsense(config, dry_run=False):
             frame, ts = read
             # Re-detect on the same frame for visualization
             raw = detector.detect(frame, intrinsics)
+            if frame.ndim == 2:
+                # Infrared frames are single-channel; re-inflate to BGR so the
+                # drawn axes/text overlays below stay colored instead of
+                # silently degrading to grayscale-only annotations.
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
             for det in raw:
                 # Recover rvec/tvec from the SE3 pose for drawFrameAxes
                 R = det.pose_in_optical[:3, :3]

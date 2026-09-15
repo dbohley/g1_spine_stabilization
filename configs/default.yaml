@@ -22,6 +22,19 @@ trajectory:
     # 6dof-mode only (box_center tracking). No measurement of real hand-held
     # marker motion speed exists yet -- starting placeholder, tune with real data.
     max_pos_rate_m_s: 0.3
+    # s: caps the wall-clock dt used in the rate-limit math itself (see
+    # trajectory/sources.py's RateLimitedSource docstring). Root-cause fix:
+    # dt is measured since the LAST step() call, but this codebase's
+    # controllers only start calling step() once Phase 2 (tracking) begins
+    # -- Phase 1a/1b/1.5 (RRT reach, straight-in close, hand-close) can
+    # combine to several real seconds with NO step() calls at all. Without
+    # this cap, that inflated dt scales the allowed per-step delta
+    # proportionally, so the limiter provides essentially NO protection on
+    # the very first step() call after such a gap -- exactly backwards from
+    # its purpose. 0.5s is generous relative to a normally-running Phase 2
+    # loop's real inter-step gaps (even the documented ~90-180ms IK solve
+    # cost) while still bounding the worst case after a multi-second gap.
+    max_dt_s: 0.5
   noise_filter:
     # Smooths real AprilTag solvePnP jitter BEFORE the rate limiter above.
     # Complementary, not a replacement: the rate limiter only clamps deltas
@@ -31,7 +44,7 @@ trajectory:
     # mock are noiseless by construction; a median+EMA filter is not a no-op
     # on a clean synthetic signal the way the rate limiter is, so applying it
     # there would only add avoidable lag/distortion for no benefit).
-    # UNMEASURED: no real AprilTag noise amplitude has been characterized on
+    # UNMEASURED: no real AprilTag noise amplitude has been 5.0 on
     # this rig yet -- docs/ik_weight_analysis.md's "~5-15mm" and CLAUDE.md's
     # "~2-5mm" marker-error guesses are informal, inconsistent, never-measured
     # placeholders (see docs/followups.md). Defaults below are reasoned
@@ -43,11 +56,101 @@ trajectory:
     # Single-pole EMA factor in (0, 1], applied after the median stage.
     # Lower = more smoothing/lag.
     ema_alpha: 0.3
+  tracked_rotation:
+    # The tracked target rotation (theta, fed to compute_hand_targets) is now
+    # a full 3-DoF pelvis-frame rotation -- it used to be a single roll-
+    # about-X scalar that silently discarded the target marker's pitch and
+    # yaw (a confirmed bug -- see docs/six_dof_tracking_fix.md). Applies to
+    # BOTH --tracking orient-only (now genuine 3-DoF orientation tracking)
+    # and 6dof (now genuine 6-DoF).
+    enabled: true
+    # Per-axis [X, Y, Z] enable, applied as a rotvec-component mask in the
+    # PELVIS frame (see utils/transforms.py's clamp_rotation). [true, false,
+    # false] reproduces the pre-fix single-axis behavior (without its
+    # >90-degree pitch-aliasing bug).
+    enabled_axes: [true, true, true]
+    # Hard ceiling on the total tracked rotation angle (rotvec norm),
+    # degrees. UNMEASURED: no reachability study of commanded yaw/pitch
+    # against the shoulder-roll self-collision bounds (ik_solver.py's
+    # L_SHOULDER_ROLL_MIN/R_SHOULDER_ROLL_MAX -- Hard Rules, do not touch)
+    # or the wrist limits exists yet. Raised 20 -> 45 because 20 deg is tight
+    # for real head/torso motion and the clamp silently makes the arm appear
+    # to "stop following" past it -- a symptom that reads as a freeze but is
+    # just this cap. The IK-orientation-residual print in Phase 2 (and
+    # ipopt_exhaustion_count alongside it) is how to tell whether the arm can
+    # actually reach a commanded angle; lower this again if that residual
+    # grows at large angles. See docs/six_dof_tracking_fix.md.
+    max_angle_deg: 45.0
+
+  gp_predict:
+    # Torso-GP feedforward: adds the predicted lead of the TARGET marker to
+    # the tracked (box_center, theta), cancelling the ~1-tick tracking lag
+    # of the ~6-10Hz Phase-2 loop. Model + runtime live in gp_predict/export
+    # (numpy+scipy only). See that folder's CONTROLLER_MATH.md SS1-4 -- this
+    # is the "feedback + GP feedforward" form, the only scheme validated
+    # there. No CBF, no long horizons: only twist() (h=1) is used.
+    #
+    # OFF by default: the model is trained on OUR pelvis_marker recordings
+    # (marker id 2) and predicts that marker's motion, but it has not been
+    # validated on this rig in closed loop. Turn on deliberately.
+    #
+    # Applied ONLY to --source marker, and wired INSIDE rate_limit/
+    # tracked_rotation so a prediction can never bypass those safety bounds.
+    # Default OFF -- turn on per-run with --gp-predict (or set true here).
+    enabled: false
+    model_dir: "gp_predict/export/models_robot"
+    # Scales the lead. 1.0 = the GP's own predicted velocity integrated over
+    # the measured tick dt. <1 is a conservative first live test; >1 is not
+    # recommended (the export warns that aiming past the effective latency
+    # is worse than no prediction at all).
+    lead_scale: 1.0
+    # s: caps the per-tick dt used to integrate the held twist, same
+    # rationale as rate_limit.max_dt_s -- a long gap with no step() calls
+    # must not turn into one enormous lead.
+    max_lead_dt_s: 0.5
+    # Anchor the GP only AFTER the palm press seats (the grip is
+    # established and the human is about to start moving the torso),
+    # rather than at source startup -- which runs before Phase 1a, several
+    # seconds of approach/grasp/press too early. The export's rule #1: the
+    # model was trained on clips anchored at the START of a motion segment,
+    # so anchoring during approach feeds it a state its training never
+    # covered. Until armed, PredictiveSource is a pure pass-through.
+    #
+    # With this true, Phase 2 prints a prompt once the press seats and waits
+    # for any keypress (non-blocking -- the press/watchdog loop keeps
+    # running) before the lead engages. Press it as you begin moving.
+    # false = anchor at startup (old behavior; not recommended live).
+    arm_after_seat: true
+    # s: if the press never seats (palm_press disabled, hold_mode:
+    # continuous, contact lost, or the force target is never reached), arm
+    # anyway this many seconds into Phase 2 so the GP is not silently
+    # disabled for the whole run. null = never auto-arm (keypress only).
+    arm_timeout_s: 20.0
 
 box:
-  size: [0.16, 0.16, 0.16]
+  size: [0.10, 0.16, 0.2]  # size[1] (head width, Y) measured against the testing head;
+                           # was 0.11, badly undersized for a real head -- see docs/followups.md
   color: [0.8, 0.3, 0.2]
   mass: 0.2
+  center_offset_m: [-0.05, 0.0, 0.0]  # additional [x,y,z] nudge to the actual GRASP
+                                    # target (box_center), in the object marker's own
+                                    # rotation frame (X/Y are the marker's in-plane
+                                    # axes, Z is its "out of surface" axis -- same
+                                    # convention as the size[2]/2 shift that recovers
+                                    # box_center from the marker's on-top mounting
+                                    # position). Added ON TOP of that shift, so
+                                    # [0,0,0] (default) reproduces today's behavior
+                                    # exactly. Mirrors collision_avoidance.
+                                    # head_center_offset_m, but for where the hands
+                                    # actually grasp -- NOT the same value or the
+                                    # same target: that one only nudges the
+                                    # (separate, invisible) RRT collision sphere.
+                                    # Use this one if the robot is grasping
+                                    # noticeably off from the marker along some
+                                    # axis (e.g. too far forward/back) and size[2]/2
+                                    # alone isn't the right knob to fix it (that
+                                    # scales the whole marker-to-center depth, not
+                                    # a single axis).
 
 frames:
   pelvis_world_x: -0.1934
@@ -55,13 +158,52 @@ frames:
 
 perception:
   marker_dict: "DICT_APRILTAG_36h11"   # cv2.aruco constant name
-  marker_size: 0.04                    # meters (4 cm square)
+  marker_size: 0.060                    # meters (6.0 cm square) -- physically
+                                         # measured against the printed tag in use.
+                                         # This scales every recovered marker
+                                         # distance linearly, so it must match the
+                                         # BLACK SQUARE's real edge length (not the
+                                         # white quiet-zone border). Earlier values
+                                         # of 0.04 and 0.045 belonged to smaller
+                                         # tags used before.
   object_marker_id: 0
   target_marker_id: 2
-  # Camera intrinsics — used when not auto-loading from a live RealSense.
-  # Defaults are placeholder D435 RGB values; will be overridden when using
-  # RealSenseSource (which queries the camera itself).
+  # Camera stream request (used by every RealSenseSource call site). The
+  # D435's color sensor is native 16:9 -- a 4:3 request like 640x480 uses a
+  # narrower center-crop of the sensor than a 16:9 request, which visibly
+  # reduces field of view versus a generic UVC viewer (e.g. `cheese`) that
+  # defaults to a 16:9 mode. 1280x720 is the highest resolution the D435
+  # supports for BOTH depth and color at once (the vendored SDK's
+  # RealSenseCamera requests one shared width/height/fps for both streams),
+  # so it's the widest FOV achievable without decoupling them.
   camera:
+    width: 1280
+    height: 720
+    fps: 30
+    # "color" (default) or "infrared". The D435i's IR/depth stereo module has
+    # a genuinely wider FOV (87x58 deg) than the color sensor (69x42 deg) --
+    # a fixed optical/hardware difference between two physically different
+    # sensors, not a resolution setting (confirmed against Intel's spec page
+    # and the fact that a `cheese` screenshot showing the IR projector's dot
+    # pattern -- which the color sensor's IR-cut filter always blocks -- was
+    # mistaken for a color-stream comparison). "infrared" bypasses the
+    # vendored g1_inspire_sdk's RealSenseCamera (no IR/emitter support there)
+    # and talks to pyrealsense2 directly; the correction for the IR-left
+    # sensor's different physical position vs. color (which
+    # perception.d435_link_to_optical below is calibrated for) is queried
+    # LIVE from the camera's own factory calibration every connect -- see
+    # RealSenseSource.ir_to_color_extrinsic -- so no second calibration value
+    # is needed here. Revert to "color" any time by changing this one line. infrared
+    stream: "infrared"
+    # infrared mode only: disables the D435's structured-light dot projector
+    # (rs.option.emitter_enabled), which otherwise overlays every IR frame
+    # and can degrade AprilTag corner contrast. Ignored in color mode.
+    emitter_enabled: false
+    # Below: a placeholder intrinsics/resolution fallback for a
+    # not-currently-wired-up non-RealSense source. No code path reads this
+    # today -- RealSenseSource always queries live intrinsics from the
+    # connected camera instead. Kept as-is; intentionally NOT synced to
+    # width/height above.
     intrinsics:
       fx: 615.0
       fy: 615.0
@@ -70,13 +212,48 @@ perception:
     distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
     resolution: [640, 480]
   # Transform from d435_link (URDF mount frame) to camera optical frame.
-  # Calibrated via scripts/calibrate_camera_extrinsics.py against marker
-  # ID=0 physically measured at pelvis-frame (0.40, 0.0, 0.0). TENTATIVE:
-  # being verified against a second marker before treating as final --
-  # see docs/followups.md.
+  # REVERTED (2026-08-30) to the original standard-convention default. Every
+  # value below it in PREVIOUS VALUES was a single, non-collinear-unverified
+  # point fit via scripts/calibrate_camera_extrinsics.py -- the multi-point
+  # (3-4 non-collinear points) verification the procedure actually calls for
+  # was never run for any of them. After the marker_size bug (0.04 vs the
+  # correct 0.045) was fixed, the freshly-recomputed correction landed close
+  # to this same original default -- evidence the camera mount itself was
+  # never far off, and that the original ~10cm/9deg discrepancy that started
+  # this whole investigation was mostly the marker_size bug, not a real
+  # mounting error. See docs/followups.md for the full history. This does
+  # NOT touch T_d435_to_pelvis (Pinocchio FK against the URDF, never
+  # calibrated, untouched by any of this). Only replace this default again
+  # once a real multi-point-verified calibration exists.
+  #
+  # PREVIOUS VALUES (commented, for easy rollback -- most recent first):
+  #   xyz: [-0.0500, -0.0919, 0.0154]    rpy: [-1.7103, 0.0446, -1.4039]  # tentative single-point fit, marker repositioned again, marker_size=0.045
+  #   xyz: [-0.0314, -0.0490, -0.0129]   rpy: [-1.5885, 0.0723, -1.4808]  # before marker was repositioned, marker_size=0.045
+  #   xyz: [-0.0860, -0.0002, -0.0384]   rpy: [-1.4118, 0.0076, -1.5896]  # before marker_size fix (was 0.04)
   d435_link_to_optical:
-    xyz: [-0.0860, -0.0002, -0.0384] #  xyz: [0.0, 0.0, 0.0] urdf non-calibrated
-    rpy: [-1.4118, 0.0076, -1.5896]  #  rpy: [-1.5708, 0.0, -1.5708] urdf non-calibrated
+    xyz: [0.0, 0.0, 0.0]
+    rpy: [-1.5708, 0.0, -1.5708]
+
+  # HOTFIX / EXPERIMENTAL (added 2026-08-23) -- NOT part of the real
+  # calibration above. A raw, fixed offset applied directly in the pelvis
+  # frame to every detected marker's position (X fwd, Y left, Z up), on top
+  # of everything else, purely to empirically test the effect of shifting
+  # perceived marker position +5cm toward the robot's left. Only wired into
+  # the live tracking path (run_pose_tracking_preview.py --source marker),
+  # deliberately NOT into calibrate_camera_extrinsics.py, so it can never
+  # silently contaminate a future real calibration fit. Revert by setting
+  # back to [0.0, 0.0, 0.0] (or deleting this key).
+  pelvis_offset_hotfix: [0.0, 0.0, 0.0]
+
+  pointcloud_enabled: true   # request a 3D point cloud from the D435 (marker
+                              # mode / real hardware only -- sine/mock/dry-run
+                              # camera paths always synthesize empty point
+                              # arrays regardless of this flag). Logged to
+                              # Rerun under camera/pointcloud, positioned by
+                              # the same T_cam_in_world already set via
+                              # preview.set_camera_intrinsics() above -- lets
+                              # you compare markers/the collision sphere
+                              # against real depth data live.
 
 gravity_comp:
   enabled: true  # Runtime Pinocchio inertia correction for 1.0 kg Inspire hands
@@ -105,11 +282,539 @@ shutdown:
   # tau=0). Used by grasp_demo.py (Phase R) and sdk_pose_tracking.py (Phase 3).
   settle_time: 0.4
 
+data_recording:
+  # Schema, filename convention, and (especially) the angle_diff_rpy
+  # reference-frame convention (target = reference/torso, object = moving/
+  # head -- NOT a symmetric difference) are documented in full at
+  # docs/data_recording_conventions.md. Read that before analyzing recorded
+  # data or adding a schema field.
+  #
+  # Governs BOTH scripts/run_pose_tracking_preview.py's --record flag and
+  # scripts/record_human_trial.py's --record flag: a single global on/off
+  # switch (e.g. to disable on a shared machine without editing every
+  # invocation). enabled=true does NOT start recording by itself -- --record
+  # is still opt-in per run on top of this; enabled=false makes --record a
+  # no-op with a printed warning, regardless of what's passed on the CLI.
+  enabled: true
+  # Default directory for auto-generated filenames (used when --record is
+  # passed with no PATH). Relative to the project root; auto-created on
+  # first save() if missing. Gitignored -- see .gitignore.
+  output_dir: "data/runs"
+  # Per-sample rate is NOT fixed here -- it's whatever rate the caller's own
+  # loop calls RunRecorder.record() at:
+  #   - robot run (sdk_pose_tracking.py Phase 2): ~6-10Hz actual (IK solve
+  #     cost dominates -- see control.dt's comment above), NOT the configured
+  #     50Hz.
+  #   - scripts/record_human_trial.py (perception-only, no IK): close to
+  #     camera FPS (no compute-heavy step between frames).
+  # Every sample carries its own t/wall_time plus each marker's own
+  # MarkerObservation.timestamp specifically so a downstream comparison
+  # resamples/interpolates rather than assuming a fixed rate.
+  # .pkl appended by the recorder. "{origin}" is "robot" or "human" (e.g.
+  # robot_run_..., human_run_...) so the two are distinguishable at a glance
+  # in data/runs/ without opening a file; the "_{tracking_mode}" segment is
+  # omitted when tracking_mode is None, e.g. --source sine.
+  filename_template: "{origin}_run_{timestamp}_{source}_{tracking_mode}"
+
+force_sensor:
+  # ATI Axia80-M20 6-axis F/T sensor (Ethernet, RDT-over-UDP). Read during
+  # --record runs by BOTH run_pose_tracking_preview.py and record_human_trial.py
+  # into the pickle's load_cell_wrench_raw / load_cell_wrench_grav_comp fields.
+  # Wiring: g1_spine_stabilization/sensors/force_torque.py. Networking setup for
+  # this machine + how to read cpf/cpt: docs/force_sensor_setup.md. Convention
+  # (frames, gravity comp): docs/data_recording_conventions.md.
+  enabled: true            # read the sensor when --record is active (--no-force-sensor overrides per run)
+  ip: "192.168.1.1"        # sensor IP (its static fallback on a direct point-to-point link)
+  port: 49152              # RDT UDP port
+  # Counts-per-force / counts-per-torque for THIS sensor (FT76858). PLACEHOLDER
+  # 1000000 -- read the real values from http://<ip>/config.htm (F/T
+  # Configurations page) or http://<ip>/netftcalapi.xml and set them here.
+  cpf: 1000000
+  cpt: 1000000
+  connect_timeout: 3.0     # s to wait for the first packet before warning + degrading to None
+  baseline_frames: 50      # at-rest frames averaged at startup for the gravity reference (~1s)
+  gravity_comp:
+    # Second wrench field. FORCE channels are cancelled orientation-aware (the
+    # startup gravity reading rotated by the target/torso marker as the torso
+    # tilts); TORQUE channels are tared (exact at the reference pose). Raw is
+    # always stored alongside regardless. See docs/data_recording_conventions.md.
+    enabled: true
+    # Fixed rotation from the target(torso)-marker frame to the sensor frame
+    # (rpy radians, fixed-axis). Default identity assumes the torso marker is
+    # mounted axis-aligned with the sensor -- calibrate if it isn't. PLACEHOLDER.
+    marker_to_sensor_rpy: [0.0, 0.0, 0.0]
+
 grip_force:
   enabled: true             # apply grip during grasp_demo.py AND pose tracking (sdk_pose_tracking.py)
-  tau_baseline: 0.25        # target grip force per finger (N); light hold
+  tau_baseline: 0.2        # target grip force per finger (N); light hold
   kappa: 0.05               # TransportGraspController coupling gain
-  delta_q_max: 1.0          # max additional closure beyond grasp pose (rad)
+  delta_q_max: .2          # max additional closure beyond grasp pose (rad)
   # Soft close — below SDK hard limits [1.47, 1.47, 1.47, 1.47, 1.2, 0.56].
   # Order: [index_mcp, middle_mcp, ring_mcp, little_mcp, thumb_rotate, thumb_flex]
-  grasp_pose: [0.9, 0.9, 0.9, 0.9, 0.7, 0.35]
+  grasp_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.0]
+
+# grip_force
+#   enabled: true             # apply grip during grasp_demo.py AND pose tracking (sdk_pose_tracking.py)
+#   tau_baseline: 0.25        # target grip force per finger (N); light hold
+#   kappa: 0.05               # TransportGraspController coupling gain
+#   delta_q_max: 1.0          # max additional closure beyond grasp pose (rad)
+#   # Soft close — below SDK hard limits [1.47, 1.47, 1.47, 1.47, 1.2, 0.56].
+#   # Order: [index_mcp, middle_mcp, ring_mcp, little_mcp, thumb_rotate, thumb_flex]
+#   grasp_pose: [0.9, 0.9, 0.9, 0.9, 0.7, 0.35]
+
+grasp_approach:
+  # Two-stage Phase 1 approach in sdk_pose_tracking.py. The hands first reach a
+  # PRE-GRASP STANDOFF (the grasp pose but `pregrasp_offset` wider than the
+  # object), then close STRAIGHT IN along the inter-palm axis. This avoids the
+  # old single straight-line approach that brought the palms in diagonally and
+  # snagged on the object edges. The close is a squeeze ramp -pregrasp_offset->0,
+  # continuous with the Phase 2 palm-press squeeze (0 -> +s).
+  pregrasp_offset: 0.06   # m: palms stand off this much wider per side before the
+                          #    straight-in close. MUST be < box_half_width (0.08).
+                          #    Set to 0.0 to disable the standoff (direct approach).
+  close_time: 1.5         # s: duration of the straight-in lateral close (Phase 1b /
+                          #    Phase 0b). This is a MINIMUM, not a fixed budget, once
+                          #    collision_avoidance.max_hand_speed_m_s is configured --
+                          #    close_phase_steps() (controllers/joint_path_execution.py)
+                          #    floors the step count so the close's smoothstep-peak
+                          #    Cartesian speed never exceeds that cap, extending past
+                          #    close_time whenever pregrasp_offset needs more time
+                          #    under it. Root-cause fix for a confirmed live-hardware
+                          #    incident: this phase used to be governed SOLELY by
+                          #    close_time, completely ignoring max_hand_speed_m_s --
+                          #    with pregrasp_offset=0.08 the true peak speed was a
+                          #    fixed ~0.08 m/s regardless of any configured cap (8x
+                          #    over a 0.01 m/s target), landing the hands on the
+                          #    object at unsafe speed right at the end of the
+                          #    approach even with Phase 1a/0a's own (correctly
+                          #    capped) RRT* reach already fixed.
+
+  # Small per-hand LOCAL/body-frame orientation tilt, applied on top of every
+  # commanded palm orientation (Phase 1a/1b/2/hold, and grasp_sequence.py's
+  # mirrored Phase 0a/0b) via trajectory/targets.py's apply_palm_tilt(). Added
+  # after a live test showed the palm-press loop saturate at squeeze_max with
+  # near-zero measured force -- FK against the real URDF confirmed the thumb
+  # tip sits 25-35mm past L_ee_link/R_ee_link along the press axis (more than
+  # the entire squeeze_max=0.02m budget), so the thumb plausibly contacts the
+  # object before the palm sensor does. This tilt is a live-tunable mitigation,
+  # not a predicted fix -- try small values and watch/feel what happens.
+  # [roll, pitch, yaw] in DEGREES, about the hand's OWN local axes:
+  #   roll  = local X = inter-palm press/squeeze axis (same real-world sense
+  #           both hands)
+  #   pitch = local Y = forward/reach axis (same real-world sense both hands)
+  #   yaw   = local Z = up/down (FLIPS real-world sign between hands: +Z left,
+  #           -Z right -- see CLAUDE.md Frame conventions)
+  # A real-world-symmetric tilt therefore needs OPPOSITE signs between hands
+  # for roll/yaw but the SAME sign for pitch -- these two are independent, not
+  # auto-mirrored, since that asymmetry is easy to get backwards while tuning.
+  # All zero (default) is an exact no-op -- today's exact behavior.
+  # Complementary lever: grip_force.grasp_pose's thumb_flex (currently 0.0 --
+  # thumb fully straight/unflexed, i.e. maximally protruding) directly reduces
+  # thumb protrusion past the palm plane, independent of wrist orientation.
+  palm_tilt_deg_left:  [0.0, 15.0, 0.0]
+  palm_tilt_deg_right: [0.0, -15.0, 0.0]
+
+collision_avoidance:
+  # Joint-space RRT* planner (kinematics/rrt_planner.py) that replaces the
+  # straight-line interpolation for the GROSS REACH to the pre-grasp standoff
+  # only -- sdk_pose_tracking.py Phase 1a and grasp_sequence.py Phase 0a. The
+  # final straight-in close onto the object (Phase 1b / Phase 0b) is
+  # unchanged either way -- that's a different, already-bounded problem, not
+  # a long reach that could swing through the head.
+  enabled: true           # false = old single straight-line approach (no RRT*, no
+                          #         collision checking at all)
+  head_radius_m: 0.08      # m: PLACEHOLDER -- MEASURE THE REAL HEAD/OBJECT
+                          # RADIUS AND SET THIS DIRECTLY before the next live
+                          # test. Replaces the old axis-aligned box.size-based
+                          # obstacle with a sphere (orientation-invariant --
+                          # box.size still does grasp-width duty elsewhere,
+                          # untouched). The sphere's CENTER is placed so its
+                          # TOP surface sits at the object marker's own
+                          # measured position, shifted down along the
+                          # marker's measured "out of surface" axis by this
+                          # radius (mirrors box_half_height's convention in
+                          # trajectory/sources.py) -- so this radius should be
+                          # the real physical distance from the marker down to
+                          # the head/object's centroid, not a half-width guess.
+  head_margin_m: 0.015     # m: safety margin added to box.size for the swept-path
+                          # ("transit") check only -- buffers known marker/
+                          # calibration uncertainty (~0.5-1.5cm today). Does NOT
+                          # affect the standoff goal itself, which is checked
+                          # against the exact (unpadded) box.size. NOTE: measured
+                          # empirically that 0.04 (originally chosen) is actually
+                          # TOO TIGHT here -- it makes the thumb collision-geometry
+                          # at the natural resting pose (ARM_DEFAULT_Q, which already
+                          # holds the hands close around the default box_center by
+                          # design) register as already-colliding before any motion
+                          # starts (StartInCollisionError on essentially every
+                          # approach). 0.015 keeps that pose valid while still
+                          # exceeding the documented calibration residual.
+  head_center_offset_m: [-0.03, 0.0, 0.0]  # additional [x,y,z] nudge to the sphere
+                                          # center, in the object marker's own
+                                          # rotation frame (same axes as the
+                                          # radius-based Z shift above -- X/Y are
+                                          # the marker's in-plane axes, Z is its
+                                          # "out of surface" axis). Added ON TOP
+                                          # of the existing radius-based offset,
+                                          # so [0,0,0] (default) reproduces
+                                          # today's behavior exactly (sphere's
+                                          # top surface sits at the marker, no
+                                          # extra shift). Use this to fit the
+                                          # sphere to a non-perfectly-spherical/
+                                          # off-center head without changing
+                                          # head_radius_m itself.
+  head_anchor_distance_m: null  # m: distance from the marker down to the head's
+                                 # true centroid, DECOUPLED from head_radius_m.
+                                 # null (default) means "same as head_radius_m",
+                                 # reproducing the old coupled behavior where
+                                 # shrinking/growing the radius also silently
+                                 # relocated the sphere's center. Once you have a
+                                 # real measured marker-to-centroid depth, set it
+                                 # here explicitly -- then head_radius_m can be
+                                 # tuned purely for collision-avoidance sizing
+                                 # (bigger = safer margin, smaller = more
+                                 # reachable poses near the head) WITHOUT also
+                                 # moving the sphere's center.
+  head_stack_count: 1      # PLACEHOLDER -- number of ADDITIONAL spheres stacked
+                            # below the primary one, same radius (head_radius_m),
+                            # extending the modeled obstacle volume further along
+                            # the marker's own "into the object" depth axis (world
+                            # -Z when no marker orientation is available, e.g.
+                            # grasp_sequence.py). Exists because a single sphere
+                            # only covers the volume right around the marker --
+                            # in some configurations RRT* correctly finds that one
+                            # sphere collision-free by routing a hand UNDER it,
+                            # which is unsafe in reality since there is more
+                            # physical head/neck and the table surface below that
+                            # a single sphere doesn't represent at all. 0 (default)
+                            # = today's single-sphere behavior, unchanged.
+  head_stack_spacing_m: 0.1  # m: center-to-center distance between consecutive
+                              # stacked spheres (including the primary -> first
+                              # stacked sphere). Should be LESS than
+                              # 2*head_radius_m so consecutive spheres overlap
+                              # and leave no gap an RRT edge could slip through.
+                              # Ignored when head_stack_count is 0.
+  floor_z_m: 0.0          # m: PLACEHOLDER -- pelvis-frame Z height below which
+                            # the arm must never go (a hard "floor" or "table"
+                            # plane, complementing the head sphere/stack -- a
+                            # direct Z-axis limit rather than an approximation
+                            # built from spheres). null (default) = disabled,
+                            # today's behavior unchanged. CRITICAL when setting
+                            # this: it must sit BELOW every Z height the arm
+                            # legitimately needs to reach (resting pose, grasp/
+                            # standoff height) -- setting it too high will
+                            # immediately raise StartInCollisionError (the
+                            # resting pose itself is already "below the floor")
+                            # or GoalInCollisionError (the standoff/grasp goal
+                            # is). Applies to BOTH the transit check AND the
+                            # final goal (unlike the head sphere's goal
+                            # exception) -- there's no legitimate reason for
+                            # either to be below a real physical floor/table.
+  floor_margin_m: 0.0      # m: safety margin -- the TRANSIT (padded) floor sits
+                            # this much HIGHER than the exact floor_z_m used for
+                            # the goal check, same direction as head_margin_m
+                            # (padded = more conservative). Ignored when
+                            # floor_z_m is null.
+  max_iters: 9000          # cheap to raise -- typical successful plans finish in
+                          # ~0.05-0.1s, well under time_budget_s, so extra iteration
+                          # headroom costs nothing in the common case and measurably
+                          # improves worst-case reliability (see rrt_planner.py).
+  time_budget_s: 30.0
+  step_size_rad: 0.3
+  goal_bias: 0.15          # fraction of samples that are q_goal exactly
+  segment_bias: 0.8        # fraction of samples drawn near the straight-line
+                          # q_start->q_goal segment (+ segment_sigma_rad spread) --
+                          # pure uniform sampling in 14D was measured to fail
+                          # entirely on a real test obstruction; see
+                          # kinematics/rrt_planner.py module docstring. Remaining
+                          # 1 - goal_bias - segment_bias fraction is pure uniform,
+                          # for detours wider than segment_sigma_rad can reach.
+  segment_sigma_rad: 0.2   # rad: Gaussian spread of segment-biased samples. Tuned
+                          # against a realistic recovery scenario (~90%+ success
+                          # rate at max_iters=1500; ~93% at 3000) -- occasional
+                          # failure is expected of a stochastic one-shot planner
+                          # and is SAFE (raises RRTBudgetExhaustedError -> hard
+                          # abort -> return-to-default), not a collision risk.
+  rewire_radius_rad: 0.6   # fixed radius, not the asymptotic shrinking-ball formula
+                          # -- see kinematics/rrt_planner.py module docstring
+  goal_connect_radius_rad: 0.4
+  edge_check_resolution_rad: 0.05
+  shortcut_attempts: 150
+  max_path_speed_rad_s: .5  # rad/s: PLACEHOLDER -- cap on the combined 14-DOF
+                               # joint-space speed (same vector-norm convention as
+                               # step_size_rad/rewire_radius_rad) during RRT*
+                               # waypoint playback (execute_joint_path). null
+                               # (default) = no cap, current behavior:
+                               # interpolation_time is a HARD budget regardless of
+                               # planned path length, so a long detour around the
+                               # head moves proportionally faster. When set,
+                               # interpolation_time becomes a MINIMUM instead --
+                               # execution automatically extends past it whenever
+                               # the path is long enough to need more time under
+                               # this cap. This is a bound on the TRUE PEAK rate
+                               # (not the segment average) -- execute_joint_path
+                               # internally scales the required-time derivation by
+                               # smoothstep's 1.5x peak-slope factor, since a live
+                               # incident confirmed the dangerous fast/violent
+                               # motion still happened with this cap active before
+                               # that correction (the cap was silently only
+                               # bounding the average, allowing a 1.5x-higher true
+                               # peak). UNMEASURED: start conservative (e.g.
+                               # 0.5-1.0 rad/s) and tune up live once confirmed
+                               # comfortable/safe.
+  max_hand_speed_m_s: .1  # m/s: PLACEHOLDER -- cap on Cartesian hand-tip
+                             # speed (worst-case of L/R hand, via ik.fk()) during
+                             # RRT* waypoint playback. Complements
+                             # max_path_speed_rad_s: joint-space rad/s alone
+                             # doesn't bound Cartesian speed, since the SAME
+                             # joint-space rate can move the hand much faster
+                             # through space if it comes from large proximal
+                             # joints (shoulder/elbow) vs. distal ones (wrist).
+                             # null (default) = no cap. Same true-peak-vs-average
+                             # correction as max_path_speed_rad_s applies here too
+                             # (see that comment) -- this bounds the true peak
+                             # Cartesian speed, not the segment average.
+                             # UNMEASURED: start conservative (e.g. 0.1-0.2 m/s)
+                             # and tune up live once confirmed comfortable/safe.
+  arrival_tolerance_rad: .05  # rad: PLACEHOLDER -- combined joint-space vector-norm
+                                # tolerance (same convention as step_size_rad) for
+                                # verifying the robot ACTUALLY reached the final
+                                # execute_joint_path waypoint before the phase is
+                                # declared done, instead of trusting total_time (fixed
+                                # or cap-derived) as a proxy for arrival. null (default)
+                                # = no check, current behavior. UNMEASURED: start
+                                # conservative (e.g. 0.05 rad) and tune live.
+  arrival_timeout_s: 10.0       # s: max time to wait for convergence before printing a
+                                # warning and proceeding anyway (no hard abort). Raised
+                                # from 2.0 -- real hardware settling after a multi-
+                                # waypoint RRT* reach can plausibly take longer than a
+                                # dry-run sim (no real actuator lag) would suggest.
+  arrival_poll_interval_s: 0.02  # s: how often to re-check convergence while waiting.
+  cartesian_arrival_tolerance_m: null    # m: PLACEHOLDER -- SECOND, independent arrival
+                                          # check alongside arrival_tolerance_rad, sharing
+                                          # the same poll loop and arrival_timeout_s budget
+                                          # (not a separate sequential wait). Requires
+                                          # BOTH this AND cartesian_arrival_tolerance_rad
+                                          # to be set (both null = this check disabled,
+                                          # current behavior). Checks the end effector's
+                                          # ACTUAL Cartesian position (via ik.fk(actual_q),
+                                          # worst of L/R hand) against the intended final
+                                          # Phase 1a/0a waypoint's pose -- arrival_tolerance_rad
+                                          # alone only confirms joint-space closeness, which
+                                          # does not guarantee Cartesian closeness (the same
+                                          # joint-space delta produces different Cartesian
+                                          # displacement depending on which joints it's
+                                          # concentrated in). Added because Phase 1b/0b's
+                                          # first solve_ik() call warm-starts from whatever
+                                          # current_q this function returns -- on live
+                                          # hardware (where the real arm can lag behind
+                                          # commanded targets, unlike the dry-run sim), a
+                                          # stale Cartesian handoff pose is a plausible
+                                          # source of a large first-tick jump right at the
+                                          # Phase1a->1b seam. UNMEASURED: start conservative
+                                          # (e.g. 0.01 m) and tune live.
+  cartesian_arrival_tolerance_rad: null  # rad: rotation-error companion to
+                                          # cartesian_arrival_tolerance_m above (angle-axis
+                                          # norm via pin.log3, same convention ik_solver.py's
+                                          # own IK cost function uses for rotation error;
+                                          # worst of L/R hand). Both must be set (non-null)
+                                          # to enable the Cartesian arrival check -- see that
+                                          # comment for the full reasoning. UNMEASURED: start
+                                          # conservative (e.g. 0.05 rad) and tune live.
+  max_step_rad: 0.05  # rad: HARD per-tick floor on execute_joint_path's n_steps --
+                       # no single commanded tick may move a segment more than this
+                       # many radians (combined 14-DOF vector norm), REGARDLESS of
+                       # max_path_speed_rad_s/max_hand_speed_m_s or the fixed
+                       # interpolation_time default. Root-cause fix for a confirmed
+                       # live-hardware incident: per-segment time was allocated
+                       # purely proportional to joint-space arc length, then
+                       # discretized via int(seg_time/control_dt) with NO floor --
+                       # a segment that happened to get a thin time slice (e.g. the
+                       # final RRT* goal-connect edge, after shortcut_path left
+                       # earlier segments consuming most of the budget) could
+                       # collapse to n_steps=1: one command at q_from, the very next
+                       # command one control_dt (20ms) later already at q_to. That's
+                       # a near-instant full-amplitude joint jump with nothing to
+                       # catch it (execute_joint_path calls set_joint_targets
+                       # directly, unlike every solve_ik()-driven phase which routes
+                       # through set_ee_targets's low-pass filter). This floor makes
+                       # that collapse structurally impossible: n_steps is now
+                       # max(time-derived, ceil(seg_length/max_step_rad)). 0.05 rad
+                       # matches edge_check_resolution_rad's granularity as a
+                       # starting point -- tune down for smoother-but-slower, up for
+                       # faster-but-still-bounded, but never remove/null this once a
+                       # live incident has been reproduced (see docs/followups.md).
+  seed: null               # int for reproducible tests; null = nondeterministic live
+
+palm_press:
+  # Palm-force PRESS control (sdk_pose_tracking.py, --source *). When enabled,
+  # the FINGERS just hold grip_force.grasp_pose (no finger force loop) and the
+  # PALM normal force is regulated by pressing the two palms together: an outer
+  # loop drives a press depth `s` that shrinks the hand-target separation in
+  # compute_hand_targets, and the IK moves the wrist/elbow to press. Full
+  # architecture + math: docs/palm_force_control.md.
+  #
+  # If enabled AND palm_press is on, the finger-force loop in grip_force is
+  # bypassed (fingers static). grip_force.grasp_pose still sets the finger hold.
+  enabled: true
+
+  # --- Calibration: palm counts -> Newtons ---
+  # The palm sensor reports raw int16 counts, NOT Newtons. Obtain this scale with
+  #   python scripts/read_palm_force.py --no-dry-run --baseline --calibrate <N>
+  # (press with a known load). Until calibrated, force_* below are effectively in
+  # raw summed counts (counts_per_newton = 1.0). PLACEHOLDER — must be measured.
+  counts_per_newton: 720.0
+
+  # --- Force targets (Newtons, once counts_per_newton is calibrated) ---
+  # force_target is regulated to; tune by trial-and-error pulling the object out
+  # of the hands at increasing force. force_max = crush guard (back off above it);
+  # force_min = hold floor. PLACEHOLDERS — force_target: 0.0 => NO press until set,
+  # so this is safe to leave enabled before calibration/tuning.
+  force_min: 0.0
+  force_target: 0.0
+  force_max: 8.0
+
+  # --- Press-loop dynamics ---
+  kappa: 0.0005          # integral gain (m/N per step): s += kappa*(F_des - F)
+  squeeze_max: 0.06      # max press depth s (m); MUST be < box_half_width (=0.08)
+
+  # --- Step-and-settle cadence ---
+  # The press depth s is realised through the IK servo and the arm's own
+  # dynamics, and (under force_source: wrist_wrench) sensed through a torque
+  # estimate that LAGS real contact. The original continuous law advanced s
+  # every tick, so at the real ~6-10Hz loop rate it commanded new inward
+  # motion before the previous motion had shown up in the reading -- it kept
+  # closing because it had not yet SEEN the contact it already created, and
+  # so overshot. With step_increment set, s advances by at most that many
+  # metres and then HOLDS for settle_time seconds before advancing again:
+  # move in a little, wait, read the force, move in again.
+  #   step_increment: null restores the original continuous behavior.
+  # The crush guard is exempt from the hold -- retreating from an over-pressed
+  # palm never waits on a timer.
+  # UNMEASURED starting values: 2mm per advance, ~0.4s to settle. Raise
+  # settle_time if force readings still lag the motion; lower step_increment
+  # if the approach lands too hard.
+  step_increment: 0.002  # m: max inward advance per step (null = continuous)
+  settle_time: 0.4       # s: hold after each inward advance before the next
+
+  # --- Signal conditioning ---
+  baseline_frames: 20    # no-contact frames averaged at Phase 1.5 to zero the palm
+  noise_threshold: 10    # counts above baseline to count a cell as "active" (diagnostic)
+  # combine the two hands for the target-tracking loop: min | mean. mean
+  # (default) drives the PAIR'S AVERAGE toward force_target -- changed from
+  # min after a live finding where min kept driving whichever hand read
+  # weaker toward the target while the other ran up toward force_max (75%
+  # of the crush-guard ceiling) with no corresponding benefit, instead of
+  # the two settling near the target together. min still guarantees BOTH
+  # hands individually reach the setpoint, but is unreachable if the two
+  # hands have real per-hand asymmetry (contact geometry, calibration) --
+  # set back to min if that stronger guarantee is actually wanted.
+  # guard_force() (the crush-guard check) is ALWAYS max of the two hands,
+  # regardless of this setting -- unrelated safety concept, unaffected.
+  signal: mean
+
+  # --- Force signal source ---
+  # palm_sensor (default) -- the central-palm tactile array via PalmForceReader.
+  # wrist_wrench -- NOT a hardware sensor (none exists on this robot/SDK --
+  #   confirmed: the DDS LowState_/MotorState_ messages carry only a per-motor
+  #   tau_est scalar, no wrench field). Instead estimates per-hand force from
+  #   measured joint torque: tau_ext = tau_measured - gravity_torque(q), then
+  #   pinv(J^T) @ tau_ext projected onto the inter-palm press axis. See
+  #   controllers/palm_force.py's WristWrenchForceReader and
+  #   docs/palm_force_control.md for the sign-convention derivation and the
+  #   caution that force_max/touch_threshold/loss_floor tuned against the
+  #   palm sensor are NOT guaranteed to mean the same real-world force here.
+  #palm_sensor // wrist_wrench
+  force_source: wrist_wrench
+
+  # --- Contact-loss safety watchdog (SDK-6 head-drop guard) ---
+  # Armed once the grip is real (min-palm force crosses touch_threshold, i.e. BOTH
+  # palms loaded); trips if the min-palm force then falls below loss_floor for
+  # loss_frames consecutive frames. On trip the press is frozen (never driven
+  # further inward) and the arm holds its current pose stiffly via kp -- it does
+  # NOT keep squeezing a head that has dropped or slipped out. Complementary to
+  # the vision-based object_lost (marker) signal. No-op in dry-run (reader = 0 N
+  # never arms it). UNMEASURED placeholders in the same Newton units as force_* --
+  # tune with real data after counts_per_newton calibration.
+  touch_threshold: 0.5   # N: min-palm force that counts as "gripped" (arms the watchdog)
+  loss_floor: 0.2        # N: min-palm force below which contact is "lost" (<= touch_threshold)
+  # Consecutive below-floor frames before a loss is CONFIRMED (~1-1.7s at the real
+  # 6-10Hz loop rate). Raised 3 -> 10 because force_source is currently
+  # wrist_wrench -- a torque-derived estimate that is noisier and more
+  # model-dependent than the palm tactile sensor these thresholds were written
+  # for (see palm_force.py's WristWrenchForceReader CAUTION). A brief noise dip
+  # below 0.2N should not read as a dropped head. This is the main knob to raise
+  # further if the guard still fires spuriously on real hardware.
+  loss_frames: 10
+  # Turn the contact-loss guard off entirely WITHOUT disabling the palm-press
+  # loop itself (palm_press.enabled: false would kill the press too). With this
+  # false, a lost grip never freezes the press -- only do that deliberately.
+  watchdog_enabled: true
+  # false (default): a confirmed loss freezes the press but CLEARS as soon as
+  # force recovers above loss_floor, so a spurious trip costs one dip rather
+  # than the rest of the run. true restores the original latched behavior
+  # (frozen until the process exits -- nothing calls reset() mid-run).
+  # The guard still prints [SAFETY] on every loss and regain either way;
+  # tracking itself never stops for this, only the inward press does.
+  watchdog_latch: false
+
+  # --- Seat-and-freeze: when the press STOPS regulating ---
+  # The press loop's job is to ESTABLISH the grip, not to keep regulating force
+  # for the whole run. The press depth s is NOT a private side channel -- it is
+  # fed straight into compute_hand_targets(squeeze=s), i.e. into the very same
+  # IK hand targets Phase 2's tracking is trying to hit. Regulating force every
+  # tick therefore FIGHTS the tracker on the press axis (and with force_source:
+  # wrist_wrench it fights using noise, since that estimate is torque-derived).
+  #   seat (DEFAULT) -- run the press loop until the measured force converges,
+  #     then HOLD that depth for the rest of the run and let tracking own the
+  #     hand targets. Freezing s does NOT freeze the hands: s keeps flowing
+  #     through compute_hand_targets with the live theta/box_center, so the
+  #     grip geometry still rotates with the tracked object.
+  #   continuous -- the original always-regulating behavior, kept for hardware
+  #     A/B comparison without a code revert.
+  # Once seated there is NO un-seating, even if contact is later lost: the
+  # watchdog above still prints [SAFETY] loudly, but control of the hand targets
+  # is never handed back to the force loop mid-tracking.
+  hold_mode: seat
+  # N: |F - force_target| band that counts as converged. UNMEASURED PLACEHOLDER.
+  # Same caution as loss_frames above -- this is tuned against whatever
+  # force_source is active, and wrist_wrench's Newtons are noisier and more
+  # model-dependent than the palm sensor's. Too tight and the press never seats
+  # (it keeps regulating, i.e. the old behavior); too loose and it seats early
+  # at a weaker grip than requested.
+  seat_tolerance: 0.5
+  # Consecutive in-band ticks required to declare the press seated. Deliberately
+  # NOT 1: at the real ~6-10Hz Phase 2 loop rate this is ~0.5-0.8s of sustained
+  # in-band force, so a single wrist_wrench noise spike costs a counter reset
+  # rather than permanently seating the grip too shallow.
+  seat_frames: 5
+  # N: minimum force EACH hand must individually read before the press may
+  # seat. The combined signal alone cannot tell a balanced grip from a
+  # lopsided one -- with signal: mean, left +6N / right 0N averages to the
+  # same value as a balanced +3/+3, and seating there would freeze a
+  # one-sided grip as the hold position. This gate rejects that case.
+  # null disables the check (aggregate-only seating, the old behavior).
+  # UNMEASURED: start near half the target force and tune live.
+  seat_per_hand_min: 1.0
+
+  # --- Force-control mode (Road 1: Jacobian feedforward) ---
+  # mode selects how the palm grip force is produced:
+  #   position (DEFAULT) -- the s-depth loop above: shrink the hand-target
+  #     separation and let the stiff IK servo turn "aim past the surface" into
+  #     force. Unchanged, safe, the fallback.
+  #   jacobian -- hold a fixed seat separation (NOT force-driven) and produce the
+  #     grip force as torque feedforward tau = J^T W added on top of gravity comp
+  #     (see docs/palm_force_jacobian.md). kp is UNTOUCHED (Road 1). This is the
+  #     faster-responding path; flip to it LIVE (human-run) after the tiny-force
+  #     sign check. Reuses force_target (= F_des setpoint) and force_max (= F_cmd
+  #     clamp) above, plus the S0 watchdog (a trip zeros the wrench).
+  mode: position         # position | jacobian
+  kappa_f: 0.5           # force-loop trim gain (N per step per N error); jacobian mode
+  seat_squeeze: 0.0      # m: fixed "just touching" seat depth held in jacobian mode
+                         #    (0.0 = palms at the object faces, since box_half_width=0.08
+                         #    already sits at the surface). Force comes from tau_ff, not this.
+  f_des_ramp_time: 2.0   # s: ramp F_des 0 -> force_target (soft-start; never step torque on contact)
+  force_feedforward: true # jacobian mode: include the F_des feedforward term (fast). false =
+                          #    pure-integral trim only (slower, position-loop-like transient).
+  tau_press_max: 8.0     # N*m: per-joint saturation on the press feedforward torque tau_press.
+                          #    The SDK does NOT clamp tau_ff in software, so we cap it ourselves.

@@ -20,12 +20,23 @@ class MarkerTracker:
         intrinsics: CameraIntrinsics,
         T_optical_to_d435: np.ndarray,
         T_d435_to_pelvis: np.ndarray,
+        pelvis_offset: Optional[np.ndarray] = None,
     ):
         self._source = frame_source
         self._detector = detector
         self._intrinsics = intrinsics
         self._T_optical_to_d435 = T_optical_to_d435
         self._T_d435_to_pelvis = T_d435_to_pelvis
+        # Applied directly in pelvis frame, AFTER the full optical->mount->
+        # pelvis composition below -- this is the one place "pelvis frame"
+        # is unambiguous and final, so e.g. [0, 0.05, 0] means exactly "+5cm
+        # in pelvis Y" with no rotation in between to complicate it. Meant
+        # for a deliberate, easily-reversible empirical probe (see
+        # configs/default.yaml perception.pelvis_offset_hotfix), NOT for the
+        # real camera-mount calibration -- that lives in T_optical_to_d435.
+        self._pelvis_offset = (
+            np.zeros(3) if pelvis_offset is None else np.asarray(pelvis_offset, dtype=float)
+        )
         self._latest: dict[int, MarkerObservation] = {}
         # Intermediate transform-chain stages, kept per marker for diagnostics
         # (see get_diagnostic_pose) -- isolating a real-world calibration
@@ -45,6 +56,7 @@ class MarkerTracker:
         for det in raw:
             pose_d435_mount = self._T_optical_to_d435 @ det.pose_in_optical
             pose_pelvis = self._T_d435_to_pelvis @ pose_d435_mount
+            pose_pelvis[:3, 3] += self._pelvis_offset
             self._last_optical[det.marker_id] = det.pose_in_optical
             self._last_d435_mount[det.marker_id] = pose_d435_mount
             obs = MarkerObservation(
@@ -52,6 +64,7 @@ class MarkerTracker:
                 pose_in_pelvis=pose_pelvis,
                 timestamp=timestamp,
                 reprojection_error=det.reprojection_error,
+                pose_in_optical=det.pose_in_optical,
             )
             observations.append(obs)
             self._latest[det.marker_id] = obs
@@ -59,6 +72,13 @@ class MarkerTracker:
 
     def get_latest(self, marker_id: int) -> Optional[MarkerObservation]:
         return self._latest.get(marker_id)
+
+    def set_T_d435_to_pelvis(self, T: np.ndarray) -> None:
+        """Update the mount-to-pelvis transform in place, e.g. once the
+        robot's actual live waist angles are known post-connect (the
+        constructor-time value assumes zero, since it's computed before the
+        robot is even connected)."""
+        self._T_d435_to_pelvis = T
 
     def get_diagnostic_pose(self, marker_id: int) -> Optional[dict]:
         """Return {'optical', 'd435_mount', 'pelvis'} 4x4 poses for the most

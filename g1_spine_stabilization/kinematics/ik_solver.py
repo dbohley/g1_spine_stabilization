@@ -349,6 +349,8 @@ class G1HandIK:
         self.opti.subject_to(
             self.opti.bounded(lower, self.var_q, upper)
         )
+        self._eff_lower = lower.copy()
+        self._eff_upper = upper.copy()
 
         # Cost weights:
         #  50.0 * trans   — position accuracy
@@ -468,11 +470,105 @@ class G1HandIK:
 
         return sol_q, sol_tauff
 
+    def solve_ik_refined(self, L_target, R_target, current_q, n_refine=3):
+        """Repeatedly re-solve the same target, re-warm-starting from each
+        solve's own output, before returning.
+
+        For a single-shot solve_ik() call whose warm start (current_q) is far
+        from the target in joint space, IPOPT can terminate "successfully"
+        (converged within its own tolerance, well under max_iter) at a
+        solution that is still meaningfully off in Cartesian space -- e.g. a
+        confirmed 3cm position error from a single pass when current_q was an
+        extreme test-start pose, vs. ~1cm after a second pass re-warm-started
+        from that same output. This is a local-minimum/warm-start-quality
+        effect, not an IPOPT convergence failure (ipopt_exhaustion_count is
+        untouched by it), so raising max_iter alone would not help -- the
+        fix is simply to solve more than once from progressively better warm
+        starts. Intended for one-shot target solves used to seed something
+        else (e.g. the RRT planner's goal_q) rather than every-tick tracking
+        calls, since it costs n_refine solve_ik() calls instead of one, and
+        the smooth_cost term's meaning is different for a one-shot seed solve
+        (there is no real "previous timestep" to stay smooth relative to).
+        """
+        q = current_q
+        for _ in range(n_refine):
+            q, _ = self.solve_ik(L_target, R_target, q, np.zeros(self.reduced.model.nv))
+        return q
+
     def fk(self, q):
         """Forward kinematics — returns EE poses for a given joint config."""
         data = self.reduced.model.createData()
         pin.framesForwardKinematics(self.reduced.model, data, q)
         return data.oMf[self.L_ee_id], data.oMf[self.R_ee_id]
+
+    def reset_smoothing(self, q):
+        """Reseed the IK output smoothing filter and warm-start state from an
+        explicit joint config, discarding prior history.
+
+        Call this whenever the arm was moved by something other than
+        solve_ik() (e.g. execute_joint_path's direct set_joint_targets()
+        playback) -- otherwise smooth_filter's queue keeps blending fresh
+        solve_ik() output against stale pre-gap samples that have nothing to
+        do with where that motion actually left the arm, producing a
+        spurious corrective jump on the first solve_ik() call after the gap.
+        """
+        q = np.asarray(q, dtype=float).copy()
+        self.smooth_filter.queue = [q.copy() for _ in range(self.smooth_filter.window_size)]
+        self.smooth_filter.filtered = q.copy()
+        self.init_data = q.copy()
+
+    def effective_joint_limits(self):
+        """(lower, upper) joint position limits, INCLUDING the tightened
+        shoulder_roll bounds solve_ik()'s IPOPT constraints already enforce.
+        Read-only -- exposed so other code (e.g. the RRT* planner) samples
+        within the exact same box instead of duplicating
+        L_SHOULDER_ROLL_MIN/R_SHOULDER_ROLL_MAX as a separate constant.
+        """
+        return self._eff_lower.copy(), self._eff_upper.copy()
+
+    def gravity_torque(self, q):
+        """Pure gravity compensation torque (14,) at joint config q, via the
+        same corrected-inertia reduced model solve_ik()'s RNEA call uses.
+        Unlike solve_ik()'s sol_tauff, this is not passed through
+        tauff_filter -- callers wanting that smoothing apply it themselves.
+        """
+        q = np.asarray(q, dtype=float)
+        return pin.computeGeneralizedGravity(
+            self.reduced.model, self.reduced.data, q,
+        ).copy()
+
+    def ee_jacobians(self, q):
+        """End-effector Jacobians (J_L, J_R), each 6x14, at joint config q.
+
+        Frame convention: pin.LOCAL_WORLD_ALIGNED — the Jacobian's operational
+        point is the EE origin (L_ee_link / R_ee_link, the inner-palm contact
+        point) but its axes are aligned to the pelvis/base frame. A Cartesian
+        press wrench W expressed in the pelvis frame therefore maps to joint
+        feedforward torque by tau = J^T W (principle of virtual work, with W the
+        wrench the palm exerts ON the object). W and J MUST share this frame or
+        the torque direction is wrong.
+
+        Purely kinematic (independent of the gravity-comp inertia correction).
+        Each arm's Jacobian is nonzero only in that arm's 7 columns (left 0-6,
+        right 7-13, matching the reduced-model joint order), so summing
+        J_L^T W_L + J_R^T W_R cleanly loads each arm from its own wrench only.
+
+        Args:
+            q: (14,) joint config in reduced-model order.
+
+        Returns:
+            (J_L, J_R): two (6, 14) numpy arrays.
+        """
+        q = np.asarray(q, dtype=float)
+        J_L = pin.computeFrameJacobian(
+            self.reduced.model, self.reduced.data, q,
+            self.L_ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
+        J_R = pin.computeFrameJacobian(
+            self.reduced.model, self.reduced.data, q,
+            self.R_ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
+        return np.asarray(J_L).copy(), np.asarray(J_R).copy()
 
     def get_full_model_and_data(self):
         """Expose the un-reduced (53-DOF) Pinocchio model + a fresh data object.

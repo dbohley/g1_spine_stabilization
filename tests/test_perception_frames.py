@@ -55,3 +55,40 @@ def test_d435_to_pelvis_returns_valid_se3():
     assert np.isclose(np.linalg.det(R), 1.0, atol=1e-6)
     # Translation should be in a reasonable range (head is above pelvis)
     assert T[2, 3] > 0.1  # d435 is above the pelvis
+
+
+@pytest.mark.skipif(
+    pytest.importorskip("pinocchio", reason="pinocchio not installed") is None,
+    reason="pinocchio not installed",
+)
+def test_waist_q_full_moves_d435_to_pelvis_away_from_zero_assumption():
+    """A nonzero live waist reading must actually change T_d435_to_pelvis --
+    regression guard for the zero-waist assumption bug (frames.py always
+    defaulted to np.zeros(model.nq), never checking the robot's real state)."""
+    from g1_spine_stabilization.kinematics.ik_solver import G1HandIK
+    from g1_spine_stabilization.perception.frames import (
+        d435_to_pelvis_from_pinocchio, waist_q_full,
+    )
+
+    ik = G1HandIK()
+    model, _ = ik.get_full_model_and_data()
+
+    # Each of the three waist joint names must resolve to a real joint in
+    # the full (un-reduced) model -- getJointId's sentinel for "not found"
+    # is model.njoints.
+    for name in ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"):
+        assert model.getJointId(name) != model.njoints, f"{name} not found"
+
+    q_zero = waist_q_full(model, 0.0, 0.0, 0.0)
+    assert np.allclose(q_zero, 0.0)
+
+    q_tilt = waist_q_full(model, 0.0, 0.0, np.radians(5.0))
+    T_zero = d435_to_pelvis_from_pinocchio(locked_joint_config=q_zero, ik=ik)
+    T_tilt = d435_to_pelvis_from_pinocchio(locked_joint_config=q_tilt, ik=ik)
+
+    pos_delta = np.linalg.norm(T_tilt[:3, 3] - T_zero[:3, 3])
+    assert pos_delta > 1e-3, (
+        "a 5deg waist_pitch reading should produce a measurable shift in "
+        "T_d435_to_pelvis -- if this is ~0, waist_q_full isn't wiring the "
+        "value into the q vector Pinocchio actually uses"
+    )

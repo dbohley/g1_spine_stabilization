@@ -1353,6 +1353,371 @@ position/rotation offsets.
   `d435_link_to_optical` correction instead, which is the intended,
   config-tunable place for it.
 
+## Live-marker misalignment investigation + applied-shift diagnostic marker
+
+### What prompted this
+
+A live report: markers shown in Rerun were completely off from their real
+physical position/orientation, and the robot's end effectors went to a
+position that was closer to plausible but still not where the marker
+physically was. Investigated the full pipeline (`detector.py` -> `frames.py`
+-> `tracker.py` -> `MarkerSource` -> `compute_hand_targets` -> `solve_ik` ->
+Rerun logging in `sdk_pose_tracking.py`, plus the SDK's own `RerunPreview`
+robot-mesh rendering) via direct code reads and numeric verification, not just
+inspection.
+
+### Findings
+
+- **CLAUDE.md was stale** — it asserted the old, superseded
+  `rpy: [-1.5708, 0.0, -1.5708]` calibration was "correct" and that the ~10cm
+  discrepancy above was "still unresolved," when this calibration session had
+  already fixed both. The commit that applied the fix updated this file and
+  the YAML but never touched CLAUDE.md. Fixed now (5 locations).
+- **Confirmed, unrelated display bug**: `RerunPreview.set_camera_intrinsics()`
+  in the vendored `g1_inspire_sdk` accepts an optional `T_cam_in_world` to
+  place the camera/pointcloud/image entities in the pelvis frame, but nothing
+  in either repo ever passes it — the SDK's own `RealSenseCamera` ->
+  `_publish_intrinsics_to_preview()` call site only passes intrinsics. So the
+  point cloud/RGB/depth always rendered at Rerun's default identity pose
+  instead of the real D435 mount pose (~0.43m up-torso, ~47.6° pitched down),
+  which would look like a large, obvious misalignment against the robot mesh
+  that has nothing to do with the actual marker-transform pipeline. Fixed
+  from our own code (no vendored-clone edit): `run_pose_tracking_preview.py`'s
+  `--source marker` branch now calls `preview.set_camera_intrinsics(native,
+  T_cam_in_world=T_d435_to_pelvis @ T_opt_to_d435)` itself, right after
+  building those transforms.
+- **Ruled out**: URDF drift between `g1_with_hands.urdf` (used for
+  `T_d435_to_pelvis` via Pinocchio FK) and `g1_inspire_sdk`'s
+  `g1_body29_inspire_hand.urdf` (used to render the robot mesh in Rerun). The
+  two files do split the pelvis->torso->d435 joint chain differently
+  (different waist_roll/waist_pitch z-offsets), but the *cumulative*
+  pelvis-to-`d435_link` z-offset is bit-for-bit identical (0.47387m) in both,
+  with waist locked at zero. Also ruled out: `detector.py` corner-order/
+  object-points (verified synthetically against a generated
+  DICT_APRILTAG_36h11 marker), `frames.py`'s compose order and Euler
+  convention (verified numerically against the URDF fixed-axis formula), and
+  `MarkerSource`'s delta-tracking logic (the "SDK-6 marker-tracking fix" is
+  genuinely present in current code and passes its regression test).
+- **Likely actual root cause**: this calibration's own caveat above ("close
+  to identity with some room for error, I can't set them perfectly") plus
+  `calibrate_camera_extrinsics.py` hardcoding the ground-truth calibration
+  marker orientation as `np.eye(3)` — any real misalignment between the
+  physical calibration marker and true pelvis-frame axes gets baked
+  permanently into `T_optical_to_d435` as a **constant systematic bias**.
+  This explains why the two reported symptoms look so different in severity:
+  `MarkerSource`'s `theta` is a rotation *delta*
+  (`target_start_rot.T @ R_current`), and a constant rotation bias cancels
+  out of that exactly (`(B@R1).T @ (B@R2) == R1.T @ R2` for any rotation
+  `B`) — so the arm's rotation tracking is substantially shielded from this
+  bias. But `sdk_pose_tracking.py`'s raw `markers/object`/`markers/target`
+  Rerun diagnostics log `pose_in_pelvis` directly with zero delta
+  cancellation, so they show the *entire* uncancelled bias in both position
+  and orientation — matching "markers look completely wrong, arm looks
+  merely off" (the arm isn't fully protected either, since `box_center` is
+  still anchored to the absolute `object_start_pos` reading in both tracking
+  modes).
+
+### What was done
+
+- CLAUDE.md's 5 stale calibration references fixed (see above).
+- `run_pose_tracking_preview.py`: the camera-pose fix above.
+- `trajectory/sources.py`: `MarkerSource` gained a public `box_center`
+  property (mirrors `last_obj_obs`/`last_tgt_obs`) exposing the corrected/
+  tracked object-center pose, for diagnostics.
+- `sdk_pose_tracking.py`: `_log_marker_info` now also logs
+  `markers/applied_shift` — `source.box_center` with the tracked `theta`
+  rotation applied (`Rx(theta)`, matching `compute_hand_targets`'s own
+  convention) — in yellow, alongside the existing raw marker triads
+  (`markers/object`/`markers/target`) and per-hand IK targets
+  (`targets/L_hand`/`targets/R_hand`). With `box_half_height > 0` this should
+  sit visibly below `markers/object`, confirming the marker-sits-on-top
+  correction is applied as intended, and gives a third, intermediate
+  reference point for isolating a future misalignment (raw marker vs.
+  corrected/tracked object center vs. final per-hand target).
+- `calibrate_camera_extrinsics.py` gained an optional `--marker-rpy R P Y`
+  argument (default identity, preserving old behavior) so a future
+  recalibration can supply a *measured* ground-truth orientation instead of
+  assuming perfect eyeballed alignment — directly targeting the likely root
+  cause above.
+
+### Still needed (live hardware, human-run — not done in this session)
+
+None of the above changes the actual numbers in `configs/default.yaml`'s
+`d435_link_to_optical` — recalibration is still expected to be necessary.
+
+**Superseded by "Live waist-angle fix + proper multi-point recalibration"
+below**: a live retest after the fixes in this section surfaced a bigger,
+separate issue (the zero-waist assumption) that has to be fixed *before* this
+5-step protocol is re-run, and the protocol itself was upgraded from 2
+collinear points to 3-4 non-collinear ones. Kept here for the historical
+record of what this section actually tried; follow the section below instead.
+
+1. Set up a calibration marker with its orientation *measured* (squared
+   fixture, level/protractor against the pelvis's known axes), not eyeballed.
+2. Re-run `calibrate_camera_extrinsics.py --marker-id <id> --marker-pos <x>
+   <y> <z> --marker-rpy <r> <p> <y>` with that marker; paste the result into
+   `configs/default.yaml`.
+3. `--verify` against a second marker at a different position/distance to
+   confirm the fix generalizes (repeat the 6mm/4.05°-style check above).
+4. Use the new `markers/applied_shift` marker plus `get_diagnostic_pose()`'s
+   existing per-stage prints (`optical`/`d435_mount`/`pelvis`) in
+   `_log_marker_info` to confirm the corrected calibration agrees with
+   physical reality at each transform stage, not just the final pose.
+5. Double check `perception.marker_size: 0.04` against the actual physical
+   printed marker size — a scale mismatch is easy to confuse with a
+   mounting-calibration error (see the `--verify` docstring).
+
+## Live waist-angle fix + proper multi-point recalibration
+
+### What prompted this
+
+A live retest (real robot, `--no-dry-run`) after the fixes above still showed
+the arm reaching "tens of cm" off from the real target — and this time the
+point cloud, marker arrows, and arm target all agreed *with each other*
+(confirming the earlier `set_camera_intrinsics` display-bug fix worked), which
+means the remaining error is one real, shared bias in the transform chain,
+not a rendering artifact.
+
+### Root cause found: the zero-waist assumption was never checked
+
+`pose_in_pelvis = T_d435_to_pelvis @ T_optical_to_d435 @ pose_in_optical`.
+`T_optical_to_d435` is the camera-mount-to-optical calibration above — a
+fixed physical property of the mount that should never change.
+`T_d435_to_pelvis` is different: it's computed via Pinocchio FK through the
+robot's three waist joints (the only joints between pelvis and the camera
+mount), and `d435_to_pelvis_from_pinocchio()`
+(`g1_spine_stabilization/perception/frames.py:24-48`) always used
+`q = np.zeros(model.nq)` — i.e. assumed the waist sits at exactly zero.
+Every call site in the repo left its `locked_joint_config` parameter at the
+default `None`, so the zero branch always fired, unchecked against the
+robot's real state.
+
+The vendored SDK does try to hold the waist at `[0,0,0]` via a real PD loop
+(`waist_kps: [300,300,300]`, `~/g1_inspire_sdk/g1_inspire_sdk/_config/
+g1.yaml:19-24`), but a humanoid's own balance controller can plausibly nudge
+the waist by a few degrees to counterbalance an arm reaching out with a load
+— and empirically (see Tests below), a mere 5° of unaccounted waist_pitch
+alone shifts `T_d435_to_pelvis`'s position by 37mm at the camera mount itself,
+before the further amplification from projecting out to an actual marker
+0.5-1m away. Easily consistent with "tens of cm."
+
+**Why this had to be fixed before recalibrating `T_optical_to_d435` again**:
+that value is supposed to be a fixed constant, but the zero-waist assumption
+means a fresh recalibration attempt couldn't tell "the camera is genuinely
+mounted crooked" (real, fixed, worth fixing) from "the waist happened to be
+tilted during this specific test" (a different, moving-target error that has
+nothing to do with the mount and will differ next time). Recalibrating first
+would have curve-fit today's waist tilt into a value assumed constant.
+
+### What was done
+
+- `g1_spine_stabilization/perception/frames.py`: new `waist_q_full(model,
+  waist_yaw, waist_roll, waist_pitch)` — builds a full-model `q` vector with
+  the three waist angles placed at their correct Pinocchio indices via
+  `getJointId()`/`idx_q` (Pinocchio's `q` ordering is unrelated to the SDK's
+  motor-index ordering, so this can't be a raw positional write). No change
+  to `d435_to_pelvis_from_pinocchio()` itself — its `locked_joint_config`
+  parameter already existed, it just had never been exercised.
+- `g1_spine_stabilization/perception/tracker.py`: new `MarkerTracker.
+  set_T_d435_to_pelvis()`, so the already-constructed tracker's transform can
+  be corrected after the fact.
+- `scripts/run_pose_tracking_preview.py`: after `robot.start_streaming()`
+  (`MarkerTracker` is built, and needs `T_d435_to_pelvis`, *before*
+  `robot.connect()` in this script — deliberately not reordered, since that
+  ordering exists so a camera-setup failure is caught before `initialize()`
+  physically moves the arm, and changing that is a separate live-hardware
+  safety decision), for `--source marker` only: reads
+  `robot.arm.low_state.motor_state[12/13/14].q` (WaistYaw/Roll/Pitch — SDK
+  motor-index convention, confirmed against Unitree's own reference example),
+  builds the corrected transform via `waist_q_full` +
+  `d435_to_pelvis_from_pinocchio(locked_joint_config=...)`, pushes it into the
+  tracker via the new setter, and re-logs the Rerun camera pose so it stays in
+  sync. Prints the measured waist angles and the position/rotation delta from
+  the zero-waist assumption, so it's visible on the next live run whether/how
+  much this mattered. **In `--dry-run` mode `robot.arm.low_state` stays `None`
+  entirely** (not a zero-valued stand-in — confirmed by reading
+  `g1_arm.py:150-152`), so the correction is skipped there with a printed note;
+  the zero-waist assumption is what dry-run is supposed to simulate anyway
+  (there's no real robot to read from).
+
+### Tests
+
+2 new hardware-free tests: `tests/test_perception_frames.py::
+test_waist_q_full_moves_d435_to_pelvis_away_from_zero_assumption` (confirms
+the three joint names resolve in the full model, and that a 5° waist_pitch
+reading actually changes the FK output — this is the same check that produced
+the 37mm figure above); `tests/test_tracker.py::
+test_set_t_d435_to_pelvis_updates_subsequent_steps` (confirms the setter's
+effect is visible on the tracker's next `step()`). 209 tests pass total.
+
+### Flagged, not fixed: `MotionSwitcher`/`ReleaseMode` never called
+
+Unitree's own low-level reference example (`~/g1_inspire_sdk/third_party/
+unitree_sdk2_python/example/g1/low_level/g1_low_level_example.py:89-98`)
+calls `MotionSwitcherClient.CheckMode()`/`ReleaseMode()` before its low-level
+`LowCmd` commands take effect, to release the robot's onboard motion-
+control/balance service. **Neither the vendored SDK nor this repo calls this
+anywhere** (confirmed by an exhaustive grep of both). So whether our own
+position commands — to the waist, or to *any* joint — are fully authoritative
+on this hardware, vs. arbitrated/overridden by the robot's own onboard
+controller, is unverified. The fix above sidesteps needing an answer (it
+reads the waist's real position directly, regardless of who has control
+authority over it), but this is a separate, higher-stakes, robot-control-
+authority question with real safety implications on a live humanoid — it
+needs its own deliberate investigation and human decision, not a fix bundled
+into a calibration session.
+
+### Proper recalibration procedure (do this after confirming the fix above mattered)
+
+This is inherently live, physical, and human-executed — code can only get you
+this far. Using the existing `scripts/calibrate_camera_extrinsics.py`
+(already supports `--marker-rpy` for a measured, non-identity ground-truth
+orientation):
+
+1. **Confirm the waist fix actually mattered first.** Run `--source marker
+   --no-dry-run` and read the new diagnostic print. Small delta (well under a
+   degree / a few mm) → the waist wasn't the dominant error, go straight to
+   recalibrating. Several degrees / multiple cm → likely explains most of the
+   "tens of cm" on its own; confirm live before spending more time here.
+2. **Measure 3-4 calibration points, not 2** — each with a physically
+   measured position (tape measure/fixture against a known pelvis-frame
+   reference) *and* a measured orientation (level/square/protractor, fed via
+   `--marker-rpy`, not left at identity). Spread across genuinely different
+   distances *and* lateral/vertical offsets — not collinear along one axis
+   like the original two-point set (0.40m/0.50m, both on the X axis at
+   Y=Z=0), which can't distinguish a mounting-rotation error from a
+   `marker_size` scale error or catch an off-axis mounting offset.
+3. **Run the single-point tool against each point independently**, collecting
+   the printed correction from each — no new multi-point-fit code needed
+   (deliberately kept simple: procedural rigor over new, hardware-unvalidated
+   least-squares math). If the corrections agree closely, that's good
+   evidence of a genuine, stable, generalizable calibration — average them.
+   If they disagree, check whether the disagreement grows with marker
+   distance (→ `marker_size` scale error) or is roughly distance-independent
+   (→ a real, still-uncorrected mounting rotation/translation).
+4. **Hold out at least one point** from the averaging step, `--verify` the
+   chosen correction against it before committing.
+5. Paste the final `d435_link_to_optical` into `configs/default.yaml`; only
+   drop the `TENTATIVE` comment once verified against a genuinely held-out
+   point with small residual.
+
+### Update: found and fixed an actual marker_size bug, applied a fresh single-point correction
+
+Before doing the multi-point pass above, physically re-measured the real
+printed marker and found `perception.marker_size` (0.04) was wrong — the real
+size is 0.045m. Corrected in `configs/default.yaml`. This matters a lot here:
+a wrong marker size scales `solvePnP`'s recovered distance proportionally,
+and (per this file's own `--verify` docstring) that kind of scale error looks
+identical to a mounting-position error at whatever one distance it was fit
+against, and diverges at a different distance — exactly the ambiguity the
+multi-point procedure above exists to catch.
+
+Ran the calibration tool once more, this time with the corrected
+`marker_size=0.045`, against marker ID=0, **flat** (rpy measured as `0 0 0`,
+same yaw convention markers have used for the whole project — see rationale
+below), physically measured at pelvis-frame `(0.25, 0.0, 0.23)` — a
+genuinely different point from the original two (closer, and off the
+original flat Z=0 line):
+
+```
+[calibrate] Measured error with current calibration:
+  position error: 0.0683 m
+  rotation error: 12.65 deg
+[calibrate] Computed correction:
+  xyz: [-0.0314, -0.0490, -0.0129]
+  rpy: [-1.5885, 0.0723, -1.4808]
+```
+
+The *old* "tentative" calibration (verified as 6mm/4.05° against marker
+ID=2 — see the section above) was fit and checked entirely under the wrong
+`marker_size=0.04`. Diverging this badly (6.83cm/12.65°) at a new,
+non-collinear point confirms it was substantially absorbing the marker_size
+scale error into its rotation/translation numbers, not measuring a real
+mounting problem. Notably, this freshly-computed correction is fairly close
+to the *original, pre-any-calibration* URDF default
+(`rpy: [-1.5708, 0.0, -1.5708]`) — closer than the old tentative value was —
+suggesting the camera mount itself was never that far off, and the original
+~10cm/9° discrepancy that started this whole investigation was likely driven
+substantially by the marker_size bug, not a real mounting error.
+
+**On the `--marker-rpy 0 0 0` input**: the marker was placed flat (roll/pitch
+= 0, physically guaranteed by gravity, assuming the robot itself is
+standing level) and facing the same way markers have faced for the whole
+project (yaw unchanged from established practice, not a new guess) — so
+`0 0 0` here isn't an eyeballed estimate, it's the same ground-truth
+assumption the very first calibration attempt used, now with roll/pitch
+actually physically verified instead of assumed.
+
+**Applied to `configs/default.yaml` per the user's explicit request to try it
+live now rather than wait to collect more averaging points first** — still
+genuinely a single point, so still `TENTATIVE`. Steps 2-4 above (3-4
+non-collinear points, compare/average, hold one out to verify) are still the
+right next step if the live behavior after this isn't fully corrected, but
+trying the immediate live result first was a reasonable call given how much
+the old value was already known to be contaminated by the marker_size bug.
+
+### Update: user moved the calibration marker mid-investigation (root-caused, not a code bug)
+
+Between two calibration runs at the same nominal point, the user intentionally
+repositioned the physical marker, believing `cv2.solvePnP`/ArUco reports a
+corner's position rather than the marker's center. Checked directly against
+`detector.py:47-56`: the object-points array is defined symmetric about
+`(0,0,0)` (`[-half,+half,0]`, `[+half,+half,0]`, `[+half,-half,0]`,
+`[-half,-half,0]`) — `solvePnP`'s returned `tvec` is therefore already the
+marker's **center**, not a corner. No such bug exists in this code. Moving the
+marker while still passing the same `--marker-pos` argument for the second run
+introduced a real mismatch between the typed ground truth and the marker's
+actual position, which fully explains the apparent "instability" between the
+two runs (numerically: half the marker's diagonal, `0.0225*sqrt(2)≈3.18cm`, is
+very close to the observed `3.29cm` discrepancy).
+
+Separately, numerically verified (perturbation test, `frames.py`'s composed
+transform) which axis of `d435_link_to_optical`'s rotation dominates left-right
+(pelvis Y) position error: **yaw** (~8.7mm per degree at a representative 0.5m
+optical-Z reading), vs. roll (~0.6mm/deg, mostly drives depth/height) and pitch
+(~0.2mm/deg, negligible at this pose). Useful reference for anyone debugging a
+"things look shifted left/right" symptom in the future: check yaw first.
+
+**User's assessment (2026-08-23), taken as the working understanding**: the
+calibration marker's yaw has been correct/consistent this whole project, and
+the real source of "the robot thinks the head is farther right/left than it
+actually is" is that **the robot's pelvis itself physically shifts slightly
+in the world during operation** — reaction forces from the hand contacting the
+head nudge the standing robot's base, breaking CLAUDE.md's Critical Assumption
+#1 ("robot is fixed in space"). This is architecturally different from every
+other error source chased in this file (marker_size, camera mount, waist
+joint locked-at-zero) — those are all fixed constants or FK-computable; base
+drift from ground-contact reaction forces is neither, and no amount of camera
+or waist calibration corrects for it.
+
+**Proposed fix (not yet implemented, deliberately deferred by the user to
+focus on a different issue first — see the next section below)**: the
+vendored SDK's `LowState` message includes a full `imu_state`
+(`~/g1_inspire_sdk/third_party/unitree_sdk2_python/unitree_sdk2py/idl/
+unitree_hg/msg/dds_/_IMUState_.py`: `quaternion`, `gyroscope`,
+`accelerometer`, `rpy`), accessible identically to the waist joint state
+already used in the Step 1 fix above (`robot.arm.low_state.imu_state.rpy`).
+An IMU measures orientation against gravity/inertial reference, not against
+another robot part, so a genuine base twist would show up directly in this
+reading. Sketch of the fix, following the same baseline-then-delta pattern
+`MarkerSource` already uses for the target marker:
+1. Capture a baseline IMU reading at the start of tracking, before contact
+   forces are introduced.
+2. Each step, compute the live delta from that baseline
+   (`R_delta = R_baseline.T @ R_current`).
+3. Compose that delta into the transform chain so a real mid-trial base twist
+   is corrected in real time, not just assumed away.
+
+**Open questions before implementing**: (a) the URDF has both `imu_in_torso`
+and `imu_in_pelvis` dummy sensor links, but the SDK's `LowState` exposes only
+one `imu_state` field — need to confirm which physical location it actually
+measures before composing a correction at the right point in the kinematic
+chain (composing it at the wrong point would introduce a new error rather
+than fix this one); (b) whether the drift is fast/dynamic (needs per-step
+correction) or more of a one-time settle-and-stay-shifted after initial
+contact (a single re-baseline after contact begins might suffice, much
+simpler than continuous correction).
+
 ## box_half_height: correcting for the object marker sitting on top of the box
 
 ### What was done
@@ -1412,4 +1777,828 @@ default).
   unchanged; both use a synthetic `box_center` (`[L_EE_DEFAULT[0], 0.0,
   L_EE_DEFAULT[2]]`), never derived from a marker reading, so there's no
   marker-on-top offset to correct there.
+
+## Data recording (robot + human trial comparison)
+
+### What was built
+
+Goal: record trial data from the robot's live tracking runs, and from a
+human performing the same physical task, into pickle files sharing one
+schema, so the two can later be compared.
+
+**Files changed:**
+- `g1_spine_stabilization/data_recording/recorder.py` (new module, with
+  empty `__init__.py`) — the shared schema/logic imported identically by
+  both the robot controller and the human-trial script:
+  - `angle_diff_rpy(R_object, R_target)` — per-axis [roll, pitch, yaw]
+    angle difference, computed by decomposing the single relative rotation
+    `R_object.T @ R_target` via `scipy.spatial.transform.Rotation.
+    as_euler('xyz')` (not independent per-marker Euler angles subtracted).
+  - `angular_velocity_rotvec(R_prev, t_prev, R_cur, t_cur)` — finite-
+    difference angular velocity via `rotvec(R_cur @ R_prev.T) / dt`;
+    returns `None` (not a divide-by-zero) when `dt <= 0`.
+  - `MarkerSample` dataclass — one recorded instant: `t`, `wall_time`,
+    both markers' `*_pose`/`*_obs_timestamp`/`*_reprojection_error`,
+    `angle_diff_rpy`, both `*_angular_velocity`, `theta` (robot-only), and
+    a `load_cell_wrench` field reserved for the future neck-mounted load
+    cell (always `None` today — no sensor exists yet, this just keeps the
+    schema forward-compatible).
+  - `RunRecorder` — accumulates `MarkerSample`s via `start()`/`record()`,
+    pickles them via `save()`. `save()` is idempotent (a second call is a
+    no-op returning the same path) so it's safe to call unconditionally
+    from a `finally` block.
+  - `default_run_path()` — builds `data/runs/run_<timestamp>_<source>
+    [_<tracking_mode>].pkl`, cleanly omitting the tracking-mode segment
+    when it's `None` (e.g. `--source sine`).
+- `g1_spine_stabilization/controllers/sdk_pose_tracking.py` —
+  `run_pose_tracking_sdk` gained an optional `recorder=None` parameter.
+  `recorder.start()` runs at the top of Phase 2; `recorder.record(...)`
+  runs once per Phase-2 iteration, fed `getattr(source, 'last_obj_obs',
+  None)`/`getattr(source, 'last_tgt_obs', None)` (works uniformly across
+  `SineSource`, which has no such attributes, and `MarkerSource`/its
+  `RateLimitedSource`/`NoiseFilteredSource` wrappers, which proxy them via
+  `__getattr__`). `recorder.save()` runs in a `finally` attached to Phase
+  2's existing `try/except KeyboardInterrupt` — the inner try/except is
+  untouched (same print, same swallow-and-fall-through), so this is a
+  strictly additive change. A comment at the `finally:` explains why a
+  plain `try/finally` is used here instead of `grasp_sequence.py`'s
+  `pending_exc`-reraise pattern (that pattern guarantees *multiple*
+  sequential hardware side effects each resilient to a further interrupt;
+  here there's exactly one guaranteed side effect, and `save()` is a pure
+  pickle write that can't itself raise).
+- `scripts/run_pose_tracking_preview.py` — new `--record [PATH]` flag
+  (`nargs="?", const="__AUTO__"`: absent → disabled, bare `--record` →
+  auto-generated path, `--record path.pkl` → explicit path). Constructs a
+  `RunRecorder` after the source/rate-limit/noise-filter wrapping chain is
+  finalized, gated by `data_recording.enabled` in config. `--source sine`
+  stays recordable (useful for exercising the pipeline with zero hardware)
+  but prints a warning that only `t`/`wall_time`/`theta` will be populated,
+  since `SineSource` has no real markers.
+- `scripts/record_human_trial.py` (new) — perception-only script: no
+  robot, no IK, no `compute_hand_targets`. Reuses the same building blocks
+  as `visualize_markers.py`'s `run_realsense()` (`RealSenseSource`,
+  `AprilTagDetector`, `MarkerTracker`, `d435_to_pelvis_from_pinocchio()`
+  with no `ik` arg — pure Pinocchio FK, no robot connection) and the same
+  `configs/default.yaml` `perception:` section, so both scripts track
+  identical markers. Imports `RunRecorder` from the same module as the
+  robot script, making schema identity structural rather than
+  conventional. `--source {realsense,mock}`, `--dry-run`, `--tracking`
+  (label only, no math), `--record [PATH]`, `--duration`. No Rerun
+  dependency (kept simple, matching `visualize_markers.py`'s style) — this
+  also means, unlike `run_pose_tracking_preview.py`, it can be smoke-tested
+  directly through the Bash tool without hitting the Rerun-spawn sandbox
+  limitation noted below.
+- `configs/default.yaml` — new `data_recording:` section (`enabled`,
+  `output_dir: "data/runs"`, `filename_template`), inserted after
+  `shutdown:`.
+- `.gitignore` — added `data/runs/` (in addition to the existing generic
+  `*.pkl` entry, to also cover the directory itself and any future
+  non-`.pkl` artifact placed there).
+- `tests/test_recorder.py` (new, 15 tests) — `angle_diff_rpy`/
+  `angular_velocity_rotvec` correctness and guard conditions, `RunRecorder`
+  first/second-sample velocity behavior, `None`-observation handling
+  (the `--source sine` case), pickle round-trip, `save()` idempotency,
+  nested-directory auto-creation, `default_run_path()` filename format
+  (including the no-tracking-mode case), constructor validation.
+- `tests/test_sdk_transport.py` — one new test,
+  `test_pose_tracking_sdk_saves_recording_after_interrupt_during_tracking`,
+  modeled directly on the existing
+  `test_pose_tracking_sdk_releases_hands_after_interrupt_during_tracking`:
+  injects a `KeyboardInterrupt` via `monkeypatch` on `ik.solve_ik`'s first
+  Phase-2 call, runs `run_pose_tracking_sdk(..., recorder=recorder)`,
+  confirms the pickle file exists afterward.
+
+### Test results
+
+184 tests pass (`pytest tests/ -v`), up from the count previously cited in
+CLAUDE.md's Current Status — that number was already stale before this
+session (a discrepancy the Plan agent flagged during design, consistent
+with a similar stale-count note from SDK-5). CLAUDE.md has been updated to
+cite 184 directly rather than propagate another soon-to-be-stale number.
+
+### Human-run smoke checks (not executed by Claude Code)
+
+- `scripts/record_human_trial.py --source mock --record --duration 3` WAS
+  run directly (no Rerun dependency, so no sandbox issue) — produced a
+  well-formed pickle; inspected manually: `angle_diff_rpy`/
+  `object_angular_velocity`/`target_angular_velocity` all matched the mock
+  tracker's known rotation-about-X motion.
+- `scripts/run_pose_tracking_preview.py --source sine --record` /
+  `--source mock --tracking 6dof --record` were **not** run directly, per
+  the existing sandbox limitation (see `[[sdk6-jerk-fix-decisions]]` /
+  memory): `RerunPreview(spawn=True)` spawns a detached GUI/server process
+  that doesn't exit when the script finishes, causing pipe hangs. The
+  `--record` code path this would exercise is validated instead by (1) the
+  new `test_pose_tracking_sdk_saves_recording_after_interrupt_during_tracking`
+  test, which runs the exact same `run_pose_tracking_sdk(..., recorder=...)`
+  call the script makes, without spawning Rerun, and (2) `RunRecorder`
+  itself being fully unit-tested. Still recommended before calling this
+  session done: `python scripts/run_pose_tracking_preview.py --source sine
+  --record` and `--source mock --tracking 6dof --record`, run by hand,
+  confirming a `.pkl` lands under `data/runs/`.
+- Real-hardware recording (`--source marker --no-dry-run --record` on the
+  robot; `record_human_trial.py --source realsense` with a real camera) is
+  human-run only, per CLAUDE.md's Hard Rules for the robot script and
+  simply not yet exercised against real hardware for the human script.
+
+### Rough edges for next session
+
+- No comparison-analysis script yet (loading a robot pickle and a human
+  pickle side-by-side and plotting/diffing them) — explicitly out of scope
+  for this feature per the request; natural next step once real trial data
+  exists.
+- `load_cell_wrench` is a schema placeholder only; wiring it up is blocked
+  on the neck-mounted load cell not existing yet.
+- No noise/rate-limiting is applied to the *recorded* marker data — the
+  recorder reads whatever `source.last_obj_obs`/`last_tgt_obs` are on the
+  wrapped source, which for `--source marker` already passes through
+  `NoiseFilteredSource`/`RateLimitedSource` before `compute_hand_targets`
+  sees it, but the raw (pre-filter) marker reading is not separately
+  available to the recorder without further plumbing. Worth deciding,
+  once real marker data exists, whether the comparison analysis wants
+  filtered or raw marker poses.
+
+### Things not modified
+
+- `assets/g1_with_hands.urdf`, EE frame defs, shoulder_roll bounds, IK cost
+  weights — unchanged.
+- `~/g1_inspire_sdk` — not modified.
+- Phase 1/1.5/3 and their existing `KeyboardInterrupt` handling in
+  `sdk_pose_tracking.py` — untouched; only Phase 2 gained recorder calls
+  and a `finally`.
+- `trajectory/sources.py` — unchanged; the recorder reads its existing
+  `last_obj_obs`/`last_tgt_obs`/`object_lost` properties, no new ones
+  needed.
+
+### Addendum: robot_run_/human_run_ filename prefix
+
+Follow-up requested right after the session above: origin (robot vs. human)
+was only visible in an auto-generated filename via `source_label`
+(`sine`/`mock`/`marker` vs. the then-hardcoded `"human"`), or by opening the
+pickle and checking `origin`. Added an explicit prefix so it's visible at a
+glance in `data/runs/`.
+
+- `data_recording/recorder.py` — `DEFAULT_FILENAME_TEMPLATE` gained a
+  leading `{origin}_run_` (was just `run_`); `default_run_path()` gained an
+  `origin: Optional[str] = None` parameter. When `origin` is `None` the
+  existing underscore-collapse regex strips the now-empty leading segment,
+  so any caller that doesn't pass `origin` still gets the old unprefixed
+  `run_...` filename — backward compatible by construction, not by a
+  special case. `RunRecorder.__init__` passes `origin=self.origin`
+  (already validated to `"robot"`/`"human"`) automatically, so neither
+  `run_pose_tracking_preview.py` nor `record_human_trial.py` needed a
+  call-site change for the prefix itself.
+- `scripts/record_human_trial.py` — **`source_label` semantics changed**:
+  was hardcoded `"human"` (which would have made the new prefix redundant,
+  `human_run_..._human_...`); now `args.source` (`"realsense"` or
+  `"mock"`), so filenames read e.g. `human_run_20260720_..._realsense_
+  orient-only.pkl` — no redundancy, and it additionally tells you at a
+  glance whether a given human-trial file came from a real camera trial or
+  a hardware-free mock smoke test.
+- `configs/default.yaml` — `data_recording.filename_template` default
+  updated to match; inline comment explains the `{origin}` placeholder.
+- `tests/test_recorder.py` — 3 new tests (prefixed-by-origin for human,
+  the origin=None backward-compat fallback, `RunRecorder`'s
+  auto-generated path carrying the right prefix for both origins); the
+  two pre-existing `default_run_path` filename tests updated to pass
+  `origin="robot"` and assert the new pattern. 187 tests pass total.
+
+Things not modified: the pickle's internal `origin` field (already existed,
+unchanged — the filename prefix is a convenience on top of it, not a
+replacement); `MarkerSample` schema; the `--record` CLI flag itself on
+either script.
+
+### Addendum: angle_diff_rpy reference-frame convention (biomechanics alignment)
+
+Follow-up discussion right after the session above surfaced a real
+ambiguity: `angle_diff_rpy` decomposes a SINGLE relative rotation, so it's
+anchored to whichever marker is passed as the first argument — this was
+`object` in the original implementation, meaning the recorded roll/pitch/
+yaw were expressed in the moving segment's own frame, not the reference
+segment's, for anyone reusing this for the human neck trial (head =
+`object_marker_id`, torso = `target_marker_id`, per the user's stated
+convention: "the reference target is the torso while the head is the
+object, since the object is what we are moving"). The user wants recorded
+errors to match the standard biomechanics convention — distal/moving
+segment (head) described relative to the proximal/stable reference segment
+(torso), in the torso's own axes — so this maps cleanly to clinical
+flexion/extension/rotation/lateral-bending terminology later, and asked
+that the convention be very well documented since it's easy to get backward
+(this conversation did, once, before the correction).
+
+**Files changed:**
+- `data_recording/recorder.py` — `angle_diff_rpy(R_object, R_target)`
+  renamed to `angle_diff_rpy(R_reference, R_moving)` (same math,
+  `R_reference.T @ R_moving`, intrinsic-xyz decomposition) — the rename
+  itself is part of the fix: "object"/"target" role names don't by
+  themselves indicate which one anchors the decomposition, which is
+  exactly the confusion that prompted this addendum. `RunRecorder.record()`
+  now calls `angle_diff_rpy(target_pose[...], object_pose[...])` —
+  **target is always the reference, object is always moving** — correct
+  for both the robot case (target = external tracking reference) and the
+  human case (target_marker_id = torso) without any anatomy-specific
+  special-casing, because `target` already plays the "stable reference"
+  role by definition in both conventions this module serves. Module
+  docstring rewritten with a prominent "Reference-frame convention" section
+  covering: the math, the biomechanics rationale, the worked head/torso
+  example, an explicit contrast with `MarkerSource._theta_from_target_
+  rotation` (`trajectory/sources.py` — a different, single-axis,
+  relative-to-target's-own-starting-pose computation used only to drive
+  the IK, not to be confused with this field), and a caveat that
+  `object_angular_velocity`/`target_angular_velocity` remain in the
+  ambient pelvis frame (space-fixed), not body-relative like
+  `angle_diff_rpy` — a known, deliberate asymmetry, not silently changed
+  since the user's request was specifically about the angle metric.
+- `docs/data_recording_conventions.md` (new) — consolidates everything
+  worked out across the data-recording conversation into one authoritative
+  reference: schema recap, filename convention, the angle_diff_rpy
+  reference-frame convention in full (main content), the pelvis-frame
+  invariance proof (angle_diff_rpy and angular-velocity *magnitude* are
+  exactly invariant to camera placement/calibration error — proven
+  algebraically via the shared-transform-cancels argument; absolute
+  poses and angular-velocity *axis* direction are not), and the marker
+  local-axis convention from `detector.py`'s `_object_points` (+X =
+  rightward along the tag's canonical-upright top edge, +Y = upward, +Z =
+  out of the printed face), with a pointer to verify it physically via
+  `scripts/visualize_markers.py --source realsense`'s `drawFrameAxes`
+  overlay on the **target** (reference) marker specifically.
+- `configs/default.yaml` — one-line pointer comment on `data_recording:`
+  to the new doc, matching the existing `palm_press` → `docs/
+  palm_force_control.md` pattern.
+- `tests/test_recorder.py` — 3 new tests: `test_angle_diff_rpy_argument_
+  order_is_not_a_sign_flip` (proves swapping reference/moving is not just
+  a sign flip for non-trivial rotations — a direct regression guard against
+  silently reverting to the old, ambiguous convention), `test_recorder_
+  angle_diff_anchored_to_target_not_object` (proves `RunRecorder.record()`
+  itself, not just the pure function, anchors to target). The two
+  pre-existing `angle_diff_rpy` tests renamed their local variables to
+  `R_reference`/`R_moving` for consistency; `test_recorder_pickle_round_
+  trip`'s expected value updated to the new `angle_diff_rpy(target, object)`
+  call order. 2 new tests (189 total).
+
+**Key finding worth restating:** swapping which matrix is the reference is
+NOT a sign flip except to first order for small angles — `R.T`'s Euler
+decomposition differs from `-euler(R)` elementwise for non-trivial
+rotations, because the intrinsic-XYZ sequence is order-dependent (roll
+first, then pitch about the already-rolled Y, then yaw about the
+twice-rotated Z). This is why the old object-anchored data would NOT have
+simply needed a sign flip to reinterpret as torso-anchored after the fact
+— the fix had to happen at the source, and any data recorded before this
+change should be treated as head-frame-anchored, not silently
+reinterpreted.
+
+Things not modified: `angular_velocity_rotvec`'s math or its
+pelvis-frame (not body-relative) convention — flagged as a documented
+caveat/open question per the user's decision to scope this fix to the
+angle metric only; `MarkerSample`'s field list (no new fields, only the
+`angle_diff_rpy` field's *meaning* changed); `theta`/`MarkerSource._theta_
+from_target_rotation` (a deliberately separate, unrelated computation).
+
+### Addendum: angular velocity moved to the camera optical frame (no pelvis composition)
+
+Immediate follow-up to the addendum above. Once `angle_diff_rpy` was fixed
+to be target/torso-anchored, the user asked what frame
+`object_angular_velocity`/`target_angular_velocity` should use, since
+"pelvis frame" isn't a real frame for the human trial (no G1, no pelvis —
+`T_d435_to_pelvis` there is FK for a robot that isn't present). Discussion
+landed on the actual intended use of these two fields: cross-trial
+**normalization** — how much was the torso/head actually moving in a given
+trial, since it won't be identical trial-to-trial, not axis-level
+biomechanical interpretation (that's what the now-fixed `angle_diff_rpy` is
+for). That's a magnitude-only need, and magnitude is exactly invariant to
+any fixed rotation composition (proof: rotations preserve vector norm) —
+so carrying `T_d435_to_pelvis`/`T_optical_to_d435` through this computation
+added a dependency on transforms that are partly fictional (human trial) or
+robot-specific-calibrated (`T_optical_to_d435`) for zero benefit. Decision:
+remove the composition entirely — compute both fields directly from each
+marker's own consecutive camera **optical-frame** readings.
+
+**Files changed:**
+- `perception/types.py` — `MarkerObservation` gained `pose_in_optical:
+  Optional[np.ndarray] = None` (4x4 SE3, OpenCV/REP-103 convention: X
+  right, Y down, Z forward). Optional with a `None` default specifically so
+  every existing construction site (tests, mock trackers,
+  `visualize_markers.py`'s `run_mock()`) keeps working unmodified — only
+  sites that want the new angular-velocity behavior need to populate it.
+- `perception/tracker.py` — `MarkerTracker.step()` now passes
+  `pose_in_optical=det.pose_in_optical` into the `MarkerObservation` it
+  constructs (one line; the data was already in scope, just never
+  forwarded). This is the real/production path, so every live detection
+  (robot and human, `--source marker`/`realsense`) gets it automatically.
+- `data_recording/recorder.py` — `RunRecorder.record()`'s angular-velocity
+  computation switched from `object_pose[:3,:3]`/`target_pose[:3,:3]`
+  (pelvis-frame) to `object_obs.pose_in_optical[:3,:3]`/`target_obs.
+  pose_in_optical[:3,:3]`. When `pose_in_optical` is `None`, the field is
+  `None` for that sample — no fallback to pelvis-derived rotation, which
+  would silently reintroduce the exact composition being removed.
+  `_prev_obj`/`_prev_tgt` now track optical-frame rotations.
+  `angular_velocity_rotvec` itself is unchanged (already frame-agnostic —
+  only which rotation `RunRecorder` feeds it changed). Module docstring's
+  caveat paragraph and the `MarkerSample` field comments rewritten to state
+  the new convention and explicitly warn against cross-referencing these
+  fields' axes with `angle_diff_rpy`'s (different frames, different
+  purposes — magnitude-only normalization vs. axis-level clinical mapping).
+- `scripts/run_pose_tracking_preview.py`'s `_AnimatedMockTracker` and
+  `scripts/record_human_trial.py`'s `_AnimatedHumanMockTracker` — both now
+  populate `pose_in_optical` (reusing the already-computed synthetic pose;
+  there's no real camera to be accurate about, it just needs to be *some*
+  consistent rotation) so `--source mock --record` smoke tests exercise
+  the full schema instead of silently getting `None` for these two fields.
+- `docs/data_recording_conventions.md` — §4 rewritten from "what's
+  invariant to camera calibration" into "two different frames, on purpose":
+  states plainly that `angle_diff_rpy` (target-anchored) and the angular
+  velocities (camera optical-frame) now live in genuinely different frames
+  for different reasons, with a table and the reasoning for each.
+- `tests/test_recorder.py` — `_obs()` helper gained an optional
+  `R_optical` parameter. `test_recorder_second_sample_computes_velocity`
+  renamed to `..._from_optical_not_pelvis` and strengthened: `pose_in_
+  pelvis` is now held IDENTICAL across both samples while `pose_in_optical`
+  actually rotates, so the test would fail if the implementation
+  accidentally read pelvis data (it would report zero velocity instead of
+  the expected nonzero rate) — a direct proof, not just an assertion. New
+  `test_recorder_angular_velocity_none_when_pose_in_optical_unavailable`
+  (graceful degradation).
+- `tests/test_tracker.py` (new) — no existing test file covered the real
+  `MarkerTracker` (as opposed to `MockMarkerTracker`, covered by
+  `test_mock_tracker.py`) at all, so two tests added with a stub frame
+  source/detector (no real camera or cv2 detection): confirms `step()`/
+  `get_latest()` populate `pose_in_optical` matching the raw detection
+  exactly.
+
+**Why this doesn't conflict with the target-frame decision for
+`angle_diff_rpy`:** they're solving different problems. `angle_diff_rpy`
+needs the pelvis-frame composition (or rather, needs to be invariant to
+it, which target-anchoring provides) because its output is read
+axis-by-axis for clinical mapping. The angular-velocity fields never
+needed axis-level meaning — only a trial-comparable scalar — and magnitude
+never depended on the composition in the first place, so removing it here
+loses nothing and drops a dependency on two calibration transforms (one
+partly fictional, one robot-specific) that weren't earning their keep for
+this particular pair of fields.
+
+Test count: 3 new tests (192 total, confirmed via `pytest tests/ -v`).
+
+## ATI Axia80 F/T sensor integration
+
+### What was built
+
+The ATI Axia80-M20 6-axis force/torque sensor (Ethernet, RDT-over-UDP port
+49152) is now read into every `--record` run — robot and human — populating
+the previously-reserved load-cell field, in two forms (raw + gravity-
+cancelled) per the user's request. `scripts/sensor_test.py` (a standalone UDP
+print-loop with placeholder calibration) was the starting point.
+
+**Files changed / added:**
+- `g1_spine_stabilization/sensors/force_torque.py` (new `sensors/` subpackage)
+  — `ForceTorqueSensor` (background-daemon-thread RDT/UDP reader, lock-guarded
+  latest wrench, mirrors `PalmForceReader`'s pattern but owns its own recv
+  thread since RDT is a raw stream; degrades to `read_raw()->None` on
+  connect timeout with a printed diagnostic pointing at the setup doc);
+  `GravityCompensator` (pure-numpy: orientation-aware force cancellation +
+  tared torque); `ForceTorqueSource` (glue both scripts share:
+  `from_config`/`start`/`capture_reference`/`read`/`close`). Dependency-light
+  (socket/struct/threading/numpy/scipy) — no robot/IK/SDK import.
+- `data_recording/recorder.py` — `SCHEMA_VERSION` 1→2; single reserved
+  `load_cell_wrench` replaced by `load_cell_wrench_raw` +
+  `load_cell_wrench_grav_comp` (both `(6,)` `[Fx,Fy,Fz,Mx,My,Mz]` N/N·m,
+  sensor frame); `record()` gained the two matching keyword-only params.
+- `controllers/sdk_pose_tracking.py` — `run_pose_tracking_sdk` gained an
+  optional `wrench_source` param; Phase 2 captures the gravity reference on
+  the first step (when a torso rotation is available) and reads raw+comp each
+  iteration into `recorder.record(...)`. New `_obs_rotation` helper (optical-
+  preferred torso rotation).
+- `scripts/run_pose_tracking_preview.py` + `scripts/record_human_trial.py` —
+  both construct a `ForceTorqueSource` (config-gated, `--force-sensor`/
+  `--no-force-sensor` override), start it, capture the reference at the top of
+  the tracking loop, read each iteration, and `close()` it in the existing
+  `finally`. The human script stays perception-only (the reader has no robot
+  dependency).
+- `scripts/sensor_test.py` — refactored to use the shared `ForceTorqueSensor`
+  (single source of truth for the RDT protocol) + read ip/cpf/cpt from config.
+- `configs/default.yaml` — new `force_sensor:` section (ip, port, cpf/cpt
+  placeholders, connect_timeout, baseline_frames, gravity_comp with
+  `marker_to_sensor_rpy`).
+- `docs/force_sensor_setup.md` (new) — networking fix for this machine
+  (confirmed diagnosis: interface `enx00e04c6807dc` up but no IP, nmcli
+  `disconnected`, `ping 192.168.1.1` 0 replies), the sudo `ip addr add` quick
+  fix, the persistent `nmcli` profile, exactly what to hand an admin if sudo
+  is unavailable, direct-connect vs USB-hub note, and how to read cpf/cpt from
+  the web UI.
+- `tests/test_force_torque.py` (new, 13 tests) — GravityCompensator math
+  (cancels pure gravity at ref pose; orientation-aware force re-projection
+  cancels at a NEW orientation; `M` threads through; torque always tared;
+  plain-tare fallbacks; None cases) + ForceTorqueSensor over a localhost UDP
+  loopback with a fake-sensor thread (parse/scale, disabled-returns-None).
+  `tests/test_recorder.py` — new wrench-field + schema-v2 tests.
+
+### Gravity-comp math (the crux)
+
+`F_grav(t) = M · (R_cur.T @ R_ref) · M.T · F0`, subtract from raw force; tare
+the torque. `F0`/`T0`/`R_ref` captured at startup at-rest; `R_cur` = torso
+(target) marker rotation now; `M` = marker→sensor mounting (config, default I).
+No payload weighing needed — the startup reading supplies the weight vector.
+Relative rotation `R_cur.T @ R_ref` is frame-invariant (same reasoning as the
+angular-velocity fields), so optical vs. pelvis torso rotation is equivalent.
+
+### Deviations / limitations (documented, not silently assumed)
+
+- `M` defaults to identity — accurate only if the torso marker is mounted
+  axis-aligned with the sensor; otherwise one config rotation.
+- Torque gravity-cancellation is tare-only (exact at the reference pose); full
+  orientation-aware torque needs the payload COM offset `r` (future measurement).
+- `ForceTorqueSensor.read_raw()` returns the reading even on a nonzero ATI
+  status word (with a one-time warning) rather than nulling it — a status bit
+  is a warning, not a reason to discard data (minor deviation from the plan's
+  "None on status error").
+
+### Networking / not completed by Claude Code
+
+Making the sensor reachable on this machine needs a NIC IP assignment that
+requires sudo/admin (this account may lack it). The code + `docs/
+force_sensor_setup.md` are ready; the actual `ip addr`/`nmcli` change is the
+user's step. Verified read-only: interface `enx00e04c6807dc` has no IP and the
+sensor doesn't ping — matching the documented failure. Until fixed, both
+scripts run fine with `load_cell_wrench_*` = `None`.
+
+### Things not modified
+
+- The arm `gravity_comp` (Pinocchio joint-torque feedforward) — unrelated to
+  F/T gravity cancellation, untouched.
+- `angle_diff_rpy` / angular-velocity conventions — unchanged.
+- No new dependency added (socket/struct/threading are stdlib; numpy/scipy
+  already core).
+
+Test count: 15 new tests (13 in test_force_torque.py + 2 net in
+test_recorder.py). Full count confirmed via `pytest tests/ -v` at 207.
+
+## `d435_link_to_optical` reverted to the original standard-convention default
+
+### What changed and why
+
+`perception.d435_link_to_optical` (`T_optical_to_d435`) is reverted from its
+most recent tentative single-point fit back to the original, non-empirical
+default it started life as: `xyz: [0.0, 0.0, 0.0]`, `rpy: [-1.5708, 0.0,
+-1.5708]` (the standard ROS mount-to-optical-frame convention).
+
+For continuity: the value being reverted *from* — `xyz: [-0.0500, -0.0919,
+0.0154]`, `rpy: [-1.7103, 0.0446, -1.4039]` — was never written up here. It
+came from a live session that repositioned the physical calibration marker
+to what the user judged the correct measurement point, then re-ran
+`scripts/calibrate_camera_extrinsics.py` at `marker_size=0.045` (post the
+marker_size fix documented above). That session's outcome only made it into
+the `configs/default.yaml` comment, not this file — this entry backfills
+that gap.
+
+**Why revert rather than keep chasing a better single-point fit:** every
+value this key has ever held — the marker_size-bug era, the fit right after
+fixing marker_size, and the marker-repositioning fit above — was a single
+measured point. None of them ever received the multi-point (3-4
+non-collinear points) verification the "Live waist-angle fix + proper
+multi-point recalibration" section above says the calibration procedure
+actually needs to be trusted; a single point structurally can't distinguish
+a real mounting-rotation error from a `marker_size` scale error or an
+off-axis mounting offset. And there's a specific, already-documented reason
+to suspect the mount was never meaningfully off in the first place: once the
+real `marker_size` bug was fixed, the freshly-recomputed correction landed
+close to this same original default (see "Update: found and fixed an actual
+marker_size bug" above) — i.e. the ~10cm/9° error that kicked off this whole
+investigation was mostly that bug, not the physical camera mount. Given that,
+and given no fit since has been verified against a genuinely held-out point,
+reverting to the un-fit default is more trustworthy than keeping whichever
+single-point number happened to be measured most recently.
+
+**Not touched:** `T_d435_to_pelvis` (`d435_to_pelvis_from_pinocchio()` in
+`perception/frames.py`) — this is Pinocchio FK against `assets/
+g1_with_hands.urdf`'s `pelvis → ... → torso_link → d435_joint → d435_link`
+chain, was never empirically calibrated, and this change doesn't touch it.
+The two transforms are architecturally separate (see `frames.py`'s module
+docstring); only the mount-to-optical piece is affected here.
+
+**Path back to a calibrated value:** if a future session runs the multi-point
+procedure documented earlier in this file (3-4 non-collinear points,
+including at least one held-out `--verify` point) and it converges on a
+stable correction, that can replace this default again. Until then, this
+default is the trusted value.
+
+**Files changed:** `configs/default.yaml` (`perception.d435_link_to_optical`
+value + comment, rollback-history list updated to include the reverted-from
+value); `CLAUDE.md` (corrected the now-stale "current value" references in
+Current Status, Key Components, Pipeline Overview, and Open Design
+Questions — same four-occurrence pattern noted earlier in this file). No
+code changes — `optical_to_d435_from_config()` and everything downstream
+already just reads whatever is in this YAML key.
+
+No new tests — this is a data-only config revert, not a behavior change; the
+existing `test_perception_frames.py`/`test_calibration.py`/`test_tracker.py`
+tests already exercise `optical_to_d435_from_config()` against synthetic
+transforms, not this specific live value.
+
+## IK smoothing-filter staleness + goal_q local-minimum (Phase 1a→1b jump, round 6)
+
+After five prior rounds of fixes to the RRT approach's "smooth then
+violent" motion bug (see CLAUDE.md's Current Status for the full round-by-
+round history — segment discretization collapse, smoothstep peak-vs-average
+speed caps, Phase 1b/0b's missing speed cap, a `RateLimitedSource` gap-
+inflation bug, and a Cartesian arrival gate before Phase 1b), a live-
+hardware retest still showed the same symptom. Rather than propose another
+guessed mechanism, reproduced the exact reported scenario in dry-run using
+`run_pose_tracking_preview.py`'s `--test-start-left`/`--test-start-right`
+flags (drive the arm to an arbitrary/extreme specified pose before Phase 1
+begins) combined with `--diagnostic-log`/`--log-joint-path` for full per-
+tick instrumentation. Unlike round 3's earlier dry-run attempt (which used
+a normal, non-extreme start and came back clean), this DID reproduce a real
+jump: Phase 1a→1b's handoff `q` was byte-identical (`gap_norm=0.0` — no
+stale-*robot*-state issue), but Phase 1b's very first `solve_ik()` tick
+alone produced a 0.60 rad joint-space delta, decaying over the next few
+ticks.
+
+**Root cause 1 — `G1HandIK.smooth_filter` staleness across a phase that
+never calls `solve_ik()`.** `smooth_filter` (the 4-tap output-smoothing
+`WeightedMovingFilter`, weights `[0.4, 0.3, 0.2, 0.1]`) is only ever fed via
+`solve_ik()`'s internal `add_data()` call. Phase 1a's RRT-planned approach
+(`execute_joint_path`, `controllers/joint_path_execution.py`) moves the arm
+through many real waypoints via `set_joint_targets()` directly — it never
+calls `solve_ik()`, so the filter's 4-sample queue sits completely frozen
+throughout all of Phase 1a, still holding samples from whatever solve last
+ran before Phase 1a started. The instant Phase 1b calls `solve_ik()` for
+the first time, IPOPT itself converges correctly (warm-started from and
+penalized toward the real `current_q`, which *is* set correctly each call),
+but the filtered *output* blends that correct solution (weight 0.4) against
+3 stale, pre-Phase-1a samples (combined weight 0.6) — producing a large
+one-shot corrective jump. Confirmed in isolation (no RRT planner, no robot)
+with a best-case repro (target Cartesian-unchanged from the prior tick):
+still a 0.84 rad jump, decaying `0.84→0.64→0.41→0.15→0.11→0.08` over the
+next 5 ticks — the same shape as the real captured trace.
+
+**Fix:** `G1HandIK.reset_smoothing(q)` (`kinematics/ik_solver.py`) reseeds
+`smooth_filter`'s queue (with `window_size` copies of `q`, so the very next
+`solve_ik()` call blends against `q` itself rather than a discontinuity or
+a multi-tick ramp-up) and `init_data`, discarding prior history. Called
+immediately after `execute_joint_path` returns, in both
+`sdk_pose_tracking.py`'s Phase 1a and `grasp_sequence.py`'s Phase 0a (only
+inside the `collision_avoidance_enabled` branch — the old straight-line
+`else` branch already calls `solve_ik()` every tick, so its filter state
+is never stale to begin with). Does NOT touch `tauff_filter` (separate
+feedforward-torque EMA filter, not implicated — the jump is in `q_cmd`, not
+`tau_ff`).
+
+**Root cause 2 — independent, found while verifying fix 1 wasn't fully
+sufficient.** After applying the `reset_smoothing` fix and re-running the
+exact same repro, the jump shrank (0.60→0.49 rad) but did not disappear.
+Investigating further: `q_1a_final` (Phase 1a's actual endpoint, which
+`execute_joint_path` played back exactly as commanded — confirmed via a
+`fast_path` 2-waypoint RRT plan where the final waypoint equals `goal_q`
+exactly) was itself ~11cm away in Cartesian space from the pregrasp-standoff
+target Phase 1b's first tick asks for. That target should have been nearly
+identical to what `goal_q` was solved for in the first place — so `goal_q`
+itself (computed by the single `solve_ik(L_pre, R_pre, current_q, ...)`
+call that seeds the RRT planner's target, `sdk_pose_tracking.py` line ~496)
+was a bad solution to begin with. Direct investigation of that one solve
+(bypassing `solve_ik()`'s filtering to see the raw IPOPT output): IPOPT
+reported `Solve_Succeeded` in only 14 iterations (well under `max_iter=30`
+— not an exhaustion/convergence failure), yet the raw position error was
+still 3.2cm. Re-warm-starting a second solve from that same raw output
+converged much further (1.0cm). This is a local-minimum/warm-start-quality
+effect: when `solve_ik()`'s warm start is very far from the target in joint
+space (e.g. the extreme test-start pose used here), a single IPOPT pass can
+terminate "successfully" by its own tolerance at a solution that is still
+meaningfully off in an absolute sense, especially since `0.1 * smooth_cost
+= ||q - q_prev||²` actively penalizes moving far from that far-away warm
+start. Confirmed this is warm-start-distance-dependent, not universal: the
+same `goal_q` solve starting from the robot's normal `ARM_DEFAULT_Q` rest
+pose (not an extreme test pose) converges to ~1.4cm error, close to the
+documented ~1.8mm regularization floor plus slack.
+
+**Fix:** `G1HandIK.solve_ik_refined(L_target, R_target, current_q,
+n_refine=3)` (`kinematics/ik_solver.py`) re-solves the same target 2-3
+times, re-warm-starting from each solve's own output. Used only for the
+one-shot `goal_q` seed call (both `sdk_pose_tracking.py` Phase 1a and
+`grasp_sequence.py` Phase 0a), not per-tick tracking calls — the extra
+solve cost isn't worth paying every tick, and `smooth_cost`'s "stay near
+the previous timestep" meaning doesn't really apply to a one-shot seed
+solve the way it does to continuous tracking.
+
+**Combined measured result** on the exact repro command: peak Phase 1b
+first-tick jump dropped from 0.60 rad → 0.16 rad (~4x), and the decay shape
+changed from a sharp discontinuity to a smooth ramp-down.
+
+**Not fully resolved — residual ~0.16 rad first-tick delta.** At
+`control_dt=0.02s` that's ~7.8 rad/s on the very first Phase 1b tick, still
+elevated versus later Phase 1b ticks. Root cause of the residual not yet
+investigated — candidates worth checking in a future session: (a) Phase 1b
+currently has NO per-tick joint-space speed cap of its own (unlike Phase
+1a's `max_step_rad=0.05`) — only `close_phase_steps`'s Cartesian speed
+floor, which per its own docstring does not bound joint-space speed (a
+joint-space overshoot is possible for a small Cartesian step near a
+singularity); (b) `solve_ik_refined`'s `n_refine=3` may not be enough
+passes to fully converge from a very far warm start — worth checking
+whether more passes shrink the residual further, and whether there's a
+principled stopping criterion (e.g. iterate until Cartesian error stops
+improving, rather than a fixed count); (c) whether turning on the existing-
+but-inactive `cartesian_arrival_tolerance_m`/`_rad` gate (`collision_
+avoidance` config, currently `null`) would catch this residual before
+Phase 1b begins, buying time for a slower correction instead of a fast one.
+
+**Not yet verified live** — human-only per Hard Rules. This is the first
+fix across all six rounds that reproduces the exact failure mode in
+isolation, outside the RRT planner and dry-run harness entirely, from first
+principles (see `tests/test_kinematics.py`'s
+`test_reset_smoothing_clears_stale_queue_and_prevents_jump` and
+`test_solve_ik_refined_converges_closer_than_a_single_solve` for the
+isolated repros turned into regression tests) — a stronger basis for
+confidence than prior rounds had before their own live retests, but the
+residual delta means a live retest may still show a smaller, non-zero snap
+worth watching for.
+
+**Files changed:** `kinematics/ik_solver.py` (`reset_smoothing`,
+`solve_ik_refined`); `controllers/sdk_pose_tracking.py` (Phase 1a: calls
+`reset_smoothing` after `execute_joint_path`, uses `solve_ik_refined` for
+`goal_q`); `controllers/grasp_sequence.py` (identical Phase 0a mirror).
+4 new tests: `tests/test_kinematics.py` (`test_reset_smoothing_seeds_
+filter_and_init_data`, `test_reset_smoothing_clears_stale_queue_and_
+prevents_jump`, `test_solve_ik_refined_converges_closer_than_a_single_
+solve`), `tests/test_sdk_transport.py`
+(`test_phase1a_resets_ik_smoothing_after_execute_joint_path`, a spy-based
+integration test). 287 tests pass total.
+
+## True 6-DoF rotation tracking (the "4dof not 6dof" bug)
+
+A prior investigation had flagged that `--tracking 6dof` looked like it was
+really only 4-DoF: full 3-DoF position tracking, but the target marker's
+rotation collapsing into a single scalar, losing pitch and yaw. Investigated
+from first principles (direct code read + numeric verification in the
+project env, not assumed) and **confirmed real, plus a second, independent
+bug found alongside it while designing the fix.** Full writeup, design
+rationale, and the implementation plan this session executed against:
+`docs/six_dof_tracking_fix.md`.
+
+**Bug 1 — single-axis collapse.** `MarkerSource._theta_from_target_rotation`
+(`trajectory/sources.py`) computed the FULL relative rotation of the target
+marker (`R_delta = target_start_rot.T @ R_current` — every axis present and
+correct) and then destroyed it on the very next line:
+`float(np.arctan2(R_delta[2,1], R_delta[2,2]))` — a roll-about-X scalar.
+`compute_hand_targets` (`trajectory/targets.py`) then re-expanded that
+scalar as `Rx(theta)`, constraining every downstream hand rotation to the
+1-parameter X subgroup. Verified numerically: a pure yaw of the target
+produced `theta=0.0` (zero hand response at all); a pitch of 2.0 rad
+combined with a roll of 0.2 rad produced `theta=-2.9416 = 0.2 - pi` — a
+180-degree flip. This affected BOTH `--tracking` modes identically (`6dof`
+only ever changed the *position* branch), so `orient-only` — the default,
+and the mode named in the live-bringup workflow — was really 0 translation
++ 1 rotation DoF, not 3.
+
+**Bug 2 — wrong frame (found designing the fix, not in the original
+report).** The old code took the target's rotation delta in its OWN BODY
+frame (`R_target_start.T @ R_current`) and applied its extracted roll as a
+PELVIS-frame `Rx(theta)`. `compute_hand_targets` composes the tracked
+rotation as `R @ grasp_frame_R @ R_BASE`, left-multiplying onto
+`grasp_frame_R` — the object marker's own ABSOLUTE PELVIS-frame orientation
+— so `R` needs to be a pelvis-frame delta (`R_current @ target_start_rot.T`)
+for that composition to mean anything. This bug was invisible before because
+single-axis (pure-X) rotations commute with their own transpose, so the two
+forms were numerically identical for every case the old code could ever
+produce — a bug that could only have been found once the single-axis
+collapse itself was being removed.
+
+**Fix, implemented this session** (see `docs/six_dof_tracking_fix.md` for
+the full design, including the two math corrections found and fixed along
+the way — see below):
+
+- `utils/transforms.py`: new `as_rotation`/`is_scalar_theta`/
+  `rotation_angle`/`clamp_rotation` helpers. `theta` is now accepted as
+  EITHER a scalar (the original `Rx(theta)` representation, still used by
+  `SineSource` and the `theta=0.0` fixed-approach-phase call sites) or a
+  full `(3,3)` pelvis-frame rotation matrix, normalized at each public
+  boundary (`compute_hand_targets`, `press_axis`, `RunRecorder.record`).
+- `MarkerSource._rotation_from_target` (renamed from
+  `_theta_from_target_rotation`) now returns the full, WORLD-frame delta
+  `R_current @ target_start_rot.T` — fixing both bugs in one change. Both
+  `orient-only` and `6dof` are now genuinely full-rotation-tracking (3-DoF
+  orientation, and 6-DoF respectively).
+- `RateLimitedSource`/`NoiseFilteredSource` gained a matrix branch alongside
+  their original scalar branch (kept as a SEPARATE code path, not routed
+  through the same math) — the "a rotation matrix's rotvec reduces to the
+  same arithmetic as the raw scalar" shortcut is only true for
+  `|theta| <= pi`; several existing tests deliberately use larger values
+  as stress inputs, and briefly broke one of my own new tests before I
+  caught it (a `Rx(10.0)` round-trips through `as_rotvec()` to `-2.566`,
+  not `10.0`, since a rotation matrix can only ever encode angle mod
+  `2*pi` — the minimal/shortest-path representation). The matrix branch
+  clamps/smooths geodesically (rotvec-based), verified to reduce exactly to
+  the original scalar arithmetic for in-range pure-X input.
+- New `RotationClampSource` wrapper (`trajectory/sources.py`) — a safety
+  POSITION bound (total angle + per-axis enable) wired OUTERMOST, after the
+  rate limiter, since `RateLimitedSource`'s first step after `startup()` is
+  deliberately unclamped by design and Phase 1/1.5 (RRT reach + hand-close)
+  can accumulate several real seconds of target motion with zero `step()`
+  calls before that first tick. Config: new
+  `trajectory.tracked_rotation` block in `configs/default.yaml`
+  (`enabled_axes: [true,true,true]`, `max_angle_deg: 20.0` — **UNMEASURED**,
+  no reachability study against the shoulder-roll self-collision bounds or
+  wrist limits exists yet; raise only after a dry-run sweep, see below).
+- `sdk_pose_tracking.py`: `_log_marker_info` now prints full roll/pitch/yaw
+  + total angle instead of a single `theta_Rx` degree value; added a new
+  ~1Hz IK-orientation-residual + `ipopt_exhaustion_count` print in Phase 2
+  (reusing the same `ik.fk()` + `pin.log3` pattern Phase 1a's own
+  reachability check already used) — pure observability, the missing
+  feedback loop for tuning `max_angle_deg` against real data instead of
+  guessing, since `solve_ik()` never signals when a target is unreachable.
+- `scripts/run_pose_tracking_preview.py`: `_AnimatedMockTracker` gained a
+  new `axes`/`--mock-rotation-axes X Y Z` per-axis amplitude weight (default
+  `1 0 0`, byte-identical to the original pure-roll motion) with a
+  120-degree phase offset between axes so a nonzero weight on more than one
+  axis genuinely varies the rotation axis over time, not just its scale.
+  **This closes a real dry-run testability gap**: the old hardcoded pure-`Rx`
+  mock could never have exercised pitch or yaw, so `--source mock` — the
+  documented pre-flight gate — would never have caught this bug even after
+  a "successful" run.
+- `data_recording/recorder.py`: `SCHEMA_VERSION` 2 → 3. `MarkerSample`
+  gained `tracked_rotvec` (populated for both scalar and matrix `theta`);
+  `theta` itself is `None` whenever the source's rotation was a `(3,3)`
+  matrix that step, DELIBERATELY not back-filled from the rotvec's own X
+  component (that would silently resurrect the exact lossy representation
+  this whole fix removes).
+
+**New regression tests** (direct proof of both bugs, not just "the numbers
+changed"): `tests/test_marker_source.py`'s
+`test_target_yaw_is_tracked_not_discarded` (pure yaw is now tracked, not
+silently ignored) and `test_rotation_delta_is_world_frame_not_body_frame`
+(a non-commuting start rotation distinguishes the two frame conventions and
+pins the correct one) — both fail on `main` before this fix. Plus focused
+coverage for the new matrix branches in the two wrapper sources, the new
+`RotationClampSource` (including the specific safety property that it
+catches a huge rotation `RateLimitedSource`'s unclamped-first-step would
+otherwise pass through), `as_rotation`/`clamp_rotation` in
+`utils/transforms.py`, and the recorder's scalar-vs-matrix `theta`/
+`tracked_rotvec` split.
+
+**Not yet verified live** — human-only per Hard Rules. This is also the
+first change to make the DEFAULT `orient-only` mode command genuine 3-DoF
+orientation instead of 1-DoF roll, which is a bigger behavioral jump than
+it might look like: a live human-run dry-run sweep with
+`--mock-rotation-axes 1 1 1` (watching the new IK-residual print and
+`ipopt_exhaustion_count` for signs the commanded orientation is
+unreachable) is the recommended step BEFORE a live `--source marker` run,
+to find a sane real value for `trajectory.tracked_rotation.max_angle_deg`
+rather than trusting the placeholder `20.0`.
+
+## Mid-tracking guards: warn, don't halt
+
+The user reported that during live tests, tracking appeared to stop/freeze on
+"lost contact" or "lost sight of a marker", and that the triggers seemed to
+fire unnecessarily. Requirement: flags should still print, but nothing should
+stop the work — the operator ends the run with Ctrl-C.
+
+**Most of the suspected culprits were already warn-only**, which is worth
+recording because it means the perceived "stop" was largely something else:
+
+- `object_lost` (marker gone >2s) — print only. Its message text read
+  `(SDK-6: stop here)`, which looks like an abort directive but was literally
+  just inside a print string. No `break`, no state change. **This wording was
+  almost certainly the source of the impression that it halts** — corrected.
+- `target_stale_seconds` — computed, but had **no production consumer at all**.
+- `MarkerSource.step()` on an absent marker — holds last-known pose, prints at
+  0.5s/3.0s, no abort.
+- `execute_joint_path`'s arrival gate — explicitly warn-and-proceed.
+- IPOPT exhaustion — warns, uses the non-converged value, continues.
+
+**The one real mid-run degradation was `PalmContactWatchdog`**, and it was
+**latched**: `tripped = True` was never cleared (`reset()` is only called in
+Phase 3 teardown, never mid-run), so one confirmed loss froze the press for the
+rest of the session even if contact fully returned. That matters more than the
+thresholds suggest because `palm_press.force_source` is now `wrist_wrench` — a
+torque-derived estimate, noisier than the palm tactile sensor the UNMEASURED
+`touch_threshold: 0.5` / `loss_floor: 0.2` placeholders were written for.
+
+**Changes:**
+
+1. `PalmContactWatchdog` gained `latch: bool = True` (class default preserves
+   the original behavior; config selects `false`). Non-latching clears `tripped`
+   the moment force recovers above `loss_floor`. New config keys
+   `palm_press.watchdog_enabled` (turn the guard off WITHOUT disabling the press
+   loop — no such key existed) and `palm_press.watchdog_latch: false`;
+   `loss_frames` raised `3` → `10`. The `[SAFETY]` message is now edge-triggered
+   with a matching "contact regained" on recovery, instead of once-per-run.
+2. `trajectory.tracked_rotation.max_angle_deg` raised `20.0` → `45.0`. A silent
+   clamp makes the arm look like it stopped following; 20° is tight for real
+   head motion. `RotationClampSource`'s warning is now rate-limited (~2s) and
+   reports requested-vs-clamped angle, instead of printing once and never again.
+3. `RateLimitedSource`/`NoiseFilteredSource` no longer `raise TypeError` on a
+   theta type flip — that ran inside the Phase 2 hot loop, which catches only
+   `KeyboardInterrupt`, so it would have killed a live run. They now warn and
+   re-seed/reset. Two tests updated to assert the non-fatal behavior.
+
+**Deliberately left as-is** (user's call): the `RRTPlanningError` hard abort
+(the one guard against driving into a real head — disable per-run via
+`collision_avoidance.enabled` if it misfires), the startup target-marker
+timeout skipping Phase 2 into the SPACE-to-release hold, and
+`control.rotation_duration: 10.0` for `--source sine`/`--source mock`
+(`--source marker` already runs until Ctrl-C).
+
+**Verified** headlessly (the Rerun-spawn sandbox limitation blocks the real
+preview script): a `MarkerSource` run with BOTH markers vanishing 6 polls in
+printed every expected warning — target-stale at 0.5s, object-stale at 2.0s,
+and the corrected `object marker lost … tracking CONTINUES` line — and still
+ran Phase 2 to completion and into Phase 3. Live `--source marker` verification
+stays human-run per Hard Rules.
 

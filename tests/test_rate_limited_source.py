@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from g1_spine_stabilization.trajectory.sources import RateLimitedSource
+from g1_spine_stabilization.utils.transforms import Rx
 
 
 class _FakeClock:
@@ -105,7 +106,9 @@ def test_box_center_within_limit_passes_through_unchanged():
 
 
 def test_uses_measured_dt_not_a_fixed_control_dt():
-    """Same theta jump, different measured dt, must clamp to a different amount."""
+    """Same theta jump, different measured dt, must clamp to a different amount
+    (both dt values here are under the default max_dt=0.5s ceiling, so the
+    gap-capping fix below doesn't interfere with this)."""
     def run_with_dt(dt):
         inner = _FakeSource([[0.35, 0.0, 0.2], [0.35, 0.0, 0.2]], [0.0, 10.0])
         wrapped = RateLimitedSource(inner, max_theta_rate=1.0, max_pos_rate=1.0,
@@ -116,7 +119,90 @@ def test_uses_measured_dt_not_a_fixed_control_dt():
         return theta2
 
     assert run_with_dt(0.02) == pytest.approx(0.02)  # tight clamp at "assumed" 50Hz dt
-    assert run_with_dt(1.0) == pytest.approx(1.0)    # looser clamp at measured 1Hz dt
+    assert run_with_dt(0.3) == pytest.approx(0.3)    # looser clamp at measured ~3Hz dt
+
+
+def test_gap_longer_than_max_dt_does_not_inflate_the_allowed_delta():
+    """Regression test for a confirmed real bug: dt is measured since the
+    LAST step() call, with no assumption step() is called on a schedule.
+    This codebase's controllers only start calling step() once Phase 2
+    begins -- Phase 1a/1b/1.5 (RRT reach, straight-in close, hand-close)
+    can combine to several real seconds with ZERO step() calls. Without
+    capping dt, that gap would inflate max_theta_rate*dt far past the
+    ceiling this limiter exists to enforce -- i.e. the very first step()
+    after such a gap would sail through completely unclamped, exactly
+    backwards from the limiter's purpose."""
+    inner = _FakeSource(
+        [[0.35, 0.0, 0.2], [0.35, 0.0, 0.2]],
+        [0.0, 10.0],  # huge jump after a long real gap
+    )
+    GAP_S = 2.0  # e.g. Phase 1.5's hand-close, with no step() calls in between
+    MAX_DT = 0.5
+    wrapped = RateLimitedSource(inner, max_theta_rate=1.0, max_pos_rate=1.0,
+                                clock=_FakeClock([0.0, GAP_S]), max_dt=MAX_DT)
+    wrapped.startup()
+    wrapped.step()
+    _, theta2 = wrapped.step()
+    # Without the cap, this would clamp to 1.0*2.0=2.0 (unclamped -- 10.0
+    # itself is under that). WITH the cap, dt is capped to MAX_DT=0.5 ->
+    # max_dtheta = 1.0*0.5 = 0.5, correctly still clamping the jump.
+    assert theta2 == pytest.approx(MAX_DT)
+
+
+def test_max_dt_default_does_not_affect_normal_fast_polling():
+    """A normal, fast-polling loop's real inter-step gaps stay far under the
+    default max_dt=0.5s ceiling, so behavior for realistic control rates is
+    completely unchanged by this fix."""
+    inner = _FakeSource(
+        [[0.35, 0.0, 0.2], [0.35, 0.0, 0.2]],
+        [0.0, 10.0],
+    )
+    wrapped = RateLimitedSource(inner, max_theta_rate=1.0, max_pos_rate=1.0,
+                                clock=_FakeClock([0.0, 0.1]))  # 0.1s, default max_dt=0.5s
+    wrapped.startup()
+    wrapped.step()
+    _, theta2 = wrapped.step()
+    assert theta2 == pytest.approx(0.1)  # unaffected by the (much larger) default ceiling
+
+
+def test_matrix_theta_clamped_to_same_magnitude_as_equivalent_scalar():
+    """A (3,3)-rotation jump must clamp to the same result as the equivalent
+    Rx(theta) scalar jump, for a pure-X, IN-RANGE (|theta|<=pi) signal --
+    proving the matrix branch's geodesic clamp reduces to the scalar
+    arithmetic in the range where the two representations agree (a raw
+    scalar and its rotation matrix stop agreeing past +/-pi, where the
+    matrix can only encode the angle mod 2*pi -- see the class docstring)."""
+    inner_scalar = _FakeSource(
+        [[0.35, 0.0, 0.2], [0.35, 0.0, 0.2]], [0.0, 2.0],
+    )
+    inner_matrix = _FakeSource(
+        [[0.35, 0.0, 0.2], [0.35, 0.0, 0.2]], [np.eye(3), Rx(2.0)],
+    )
+    wrapped_scalar = RateLimitedSource(inner_scalar, max_theta_rate=1.0, max_pos_rate=1.0,
+                                       clock=_FakeClock([0.0, 0.1]))
+    wrapped_matrix = RateLimitedSource(inner_matrix, max_theta_rate=1.0, max_pos_rate=1.0,
+                                       clock=_FakeClock([0.0, 0.1]))
+    wrapped_scalar.startup()
+    wrapped_matrix.startup()
+    wrapped_scalar.step()
+    wrapped_matrix.step()
+    _, theta2 = wrapped_scalar.step()
+    _, R2 = wrapped_matrix.step()
+    assert theta2 == pytest.approx(0.1)  # clamped to max_theta_rate * dt
+    np.testing.assert_allclose(R2, Rx(0.1), atol=1e-9)
+
+
+def test_mixed_scalar_and_matrix_theta_warns_and_reseeds_instead_of_raising():
+    """A theta type flip must NOT raise: this runs inside the Phase 2 hot loop,
+    which only catches KeyboardInterrupt, so an exception here would kill a
+    live tracking run. It re-seeds from the new type and continues."""
+    inner = _FakeSource([[0.35, 0.0, 0.2], [0.35, 0.0, 0.2]], [0.0, np.eye(3)])
+    wrapped = RateLimitedSource(inner, max_theta_rate=1.0, max_pos_rate=1.0,
+                                clock=_FakeClock([0.0, 0.1]))
+    wrapped.startup()
+    wrapped.step()
+    _, theta2 = wrapped.step()   # must not raise
+    np.testing.assert_allclose(theta2, np.eye(3), atol=1e-12)
 
 
 def test_getattr_proxies_unknown_attributes_to_inner():
