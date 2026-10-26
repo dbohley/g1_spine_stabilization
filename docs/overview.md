@@ -138,7 +138,7 @@ $$ s\,\begin{bmatrix}u\\v\\1\end{bmatrix} = K\,(R\,X + t),\qquad K=\begin{bmatri
 
 where X ∈ ℝ³ is a point in the marker frame, (R, t) ∈ SE(3) is the marker's pose in the **camera optical frame** (X right, Y down, Z into scene), (u,v) are pixel coordinates, and s is the projective depth. Intrinsics are queried from the RealSense at runtime ([frame_sources.py:59-66](g1_spine_stabilization/g1_spine_stabilization/perception/frame_sources.py#L59-L66)); the YAML values are only placeholders.
 
-**Pose recovery.** Each AprilTag (36h11, 4 cm) gives 4 detected corner pixels u_i and 4 known coplanar object points X_i = (±s/2, ±s/2, 0) with Z out of the marker ([detector.py:50-56](g1_spine_stabilization/g1_spine_stabilization/perception/detector.py#L50-L56)). The pose solves the Perspective-n-Point problem
+**Pose recovery.** Each AprilTag (36h11, 6 cm -- `perception.marker_size`) gives 4 detected corner pixels u_i and 4 known coplanar object points X_i = (±s/2, ±s/2, 0) with Z out of the marker ([detector.py:50-56](g1_spine_stabilization/g1_spine_stabilization/perception/detector.py#L50-L56)). The pose solves the Perspective-n-Point problem
 
 $$ (R^*,t^*) = \arg\min_{R,t}\ \sum_{i=1}^{4}\bigl\lVert u_i - \pi\!\left(K(RX_i+t)\right)\bigr\rVert^2 $$
 

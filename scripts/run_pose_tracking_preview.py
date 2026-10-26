@@ -542,6 +542,7 @@ def main():
         tracker = MarkerTracker(
             frame_source, detector, intrinsics, T_opt_to_d435, T_d435_to_pelvis,
             pelvis_offset=pelvis_offset_hotfix,
+            max_reprojection_error=perception.get("max_reprojection_error_px"),
         )
         source = MarkerSource(tracker, obj_id, tgt_id, mode=args.tracking, countdown=3.0,
                               box_half_height=box_half_height,

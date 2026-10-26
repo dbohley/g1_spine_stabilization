@@ -11,7 +11,28 @@ from g1_spine_stabilization.perception.detector import (
 
 class MarkerTracker:
     """Combines a frame source, detector, and camera-to-pelvis transform.
-    Returns observations in the pelvis frame."""
+    Returns observations in the pelvis frame.
+
+    Real-world fault handling -- step() never raises because of the camera:
+      * Dropped/failed frames: if frame_source.read() raises (e.g. a
+        librealsense wait_for_frames timeout, a USB hiccup) or returns an
+        empty frame, the frame is counted as dropped and step() returns [] --
+        the same "nothing seen this tick" result as a frame with no markers
+        in view. Downstream (MarkerSource) already treats that as "hold the
+        last known pose and track staleness by wall-clock", so a dropped frame
+        degrades gracefully instead of killing the control loop mid-grasp.
+        Logged edge-triggered (first drop, periodic reminder while the outage
+        lasts, recovery) so a sustained outage is loud but doesn't spam.
+      * Bad pose fits: with max_reprojection_error set, detections whose
+        solvePnP reprojection error exceeds it (motion blur, glare, a partly
+        occluded tag) are rejected rather than passed downstream as a
+        confidently-wrong pose. None (default) disables the gate.
+    Counters are exposed via `stats` for post-run diagnostics.
+    """
+
+    # Re-print the "frames are dropping" warning every this many consecutive
+    # drops while an outage lasts (~1 s at 30 fps).
+    DROP_WARN_EVERY = 30
 
     def __init__(
         self,
@@ -21,12 +42,18 @@ class MarkerTracker:
         T_optical_to_d435: np.ndarray,
         T_d435_to_pelvis: np.ndarray,
         pelvis_offset: Optional[np.ndarray] = None,
+        max_reprojection_error: Optional[float] = None,
     ):
         self._source = frame_source
         self._detector = detector
         self._intrinsics = intrinsics
         self._T_optical_to_d435 = T_optical_to_d435
         self._T_d435_to_pelvis = T_d435_to_pelvis
+        self._max_reproj_err = max_reprojection_error
+        self._frames_ok = 0
+        self._frames_dropped = 0
+        self._consecutive_dropped = 0
+        self._detections_rejected = 0
         # Applied directly in pelvis frame, AFTER the full optical->mount->
         # pelvis composition below -- this is the one place "pelvis frame"
         # is unambiguous and final, so e.g. [0, 0.05, 0] means exactly "+5cm
@@ -46,14 +73,34 @@ class MarkerTracker:
         self._last_d435_mount: dict[int, np.ndarray] = {}
 
     def step(self) -> list[MarkerObservation]:
-        """Read one frame, detect markers, return current-frame observations."""
-        read_result = self._source.read()
+        """Read one frame, detect markers, return current-frame observations.
+
+        Returns [] (never raises) on end-of-stream or a dropped frame -- see
+        the class docstring."""
+        try:
+            read_result = self._source.read()
+        except Exception as exc:  # camera faults only; KeyboardInterrupt still propagates
+            self._record_drop(f"{type(exc).__name__}: {exc}")
+            return []
         if read_result is None:
             return []
         frame, timestamp = read_result
+        if frame is None or frame.size == 0:
+            self._record_drop("empty frame")
+            return []
+        if self._consecutive_dropped:
+            print(f"[MarkerTracker] Camera recovered after "
+                  f"{self._consecutive_dropped} dropped frame(s).")
+            self._consecutive_dropped = 0
+        self._frames_ok += 1
+
         raw = self._detector.detect(frame, self._intrinsics)
         observations = []
         for det in raw:
+            if (self._max_reproj_err is not None
+                    and det.reprojection_error > self._max_reproj_err):
+                self._detections_rejected += 1
+                continue
             pose_d435_mount = self._T_optical_to_d435 @ det.pose_in_optical
             pose_pelvis = self._T_d435_to_pelvis @ pose_d435_mount
             pose_pelvis[:3, 3] += self._pelvis_offset
@@ -69,6 +116,26 @@ class MarkerTracker:
             observations.append(obs)
             self._latest[det.marker_id] = obs
         return observations
+
+    def _record_drop(self, reason: str) -> None:
+        self._frames_dropped += 1
+        self._consecutive_dropped += 1
+        if self._consecutive_dropped == 1:
+            print(f"[MarkerTracker] WARNING: dropped frame ({reason}) -- "
+                  f"holding last known marker poses.")
+        elif self._consecutive_dropped % self.DROP_WARN_EVERY == 0:
+            print(f"[MarkerTracker] WARNING: {self._consecutive_dropped} consecutive "
+                  f"dropped frames (latest: {reason}).")
+
+    @property
+    def stats(self) -> dict:
+        """Frame/detection health counters since construction."""
+        return {
+            "frames_ok": self._frames_ok,
+            "frames_dropped": self._frames_dropped,
+            "consecutive_dropped": self._consecutive_dropped,
+            "detections_rejected": self._detections_rejected,
+        }
 
     def get_latest(self, marker_id: int) -> Optional[MarkerObservation]:
         return self._latest.get(marker_id)

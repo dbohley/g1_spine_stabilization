@@ -516,18 +516,33 @@ def test_wait_for_keypress_blocks_on_input_and_refreshes_theta():
         err_msg=f"Expected theta delta {expected_delta} from the post-keypress refresh, got {theta}")
 
 
-def test_target_stale_seconds_increments():
-    """target_stale_seconds increments by control_dt each step where target is absent."""
-    dt = 0.02
+class _FakeClock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_target_stale_seconds_tracks_wall_clock_not_frame_count():
+    """target_stale_seconds is wall-clock time since the target was last seen,
+    independent of how many step() calls happened or of control_dt. The real
+    loop runs at ~6-10 Hz, so frames * control_dt (the old formula) undercounts
+    staleness 5-9x."""
+    clock = _FakeClock()
     tracker = _StartupOnlyTracker(BOX_CENTER, tgt_theta=0.0)
     source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only",
-                          countdown=0.0, control_dt=dt)
+                          countdown=0.0, control_dt=0.02, clock=clock)
     source.startup()
     assert source.target_stale_seconds == 0.0
+    source.step()                 # first step anchors the stale clock
+    assert source.target_stale_seconds == 0.0
+    clock.t += 0.15               # one slow (IK-bound) tick
     source.step()
-    assert abs(source.target_stale_seconds - dt) < 1e-9
+    assert abs(source.target_stale_seconds - 0.15) < 1e-9
+    clock.t += 0.15
     source.step()
-    assert abs(source.target_stale_seconds - 2 * dt) < 1e-9
+    assert abs(source.target_stale_seconds - 0.30) < 1e-9
 
 
 def test_last_obs_properties_populated_after_step():
@@ -560,17 +575,20 @@ def test_last_obs_none_when_markers_absent():
 
 
 def test_object_lost_after_threshold():
-    """object_lost becomes True after object marker is absent for more than 2s."""
-    dt = 0.02
+    """object_lost becomes True after object marker is absent for more than 2s
+    of wall-clock time -- here only ~15 steps at a realistic ~7 Hz loop rate,
+    which the old frame-count formula (needing 101 steps) would have missed."""
+    clock = _FakeClock()
     tracker = _StartupOnlyTracker(BOX_CENTER, tgt_theta=0.0)
     source = MarkerSource(tracker, OBJ_ID, TGT_ID, mode="orient-only",
-                          countdown=0.0, control_dt=dt)
+                          countdown=0.0, control_dt=0.02, clock=clock)
     source.startup()
+    source.step()
     assert not source.object_lost
-    # 2s / 0.02s = 100 steps; need > 100 to cross the threshold
-    for _ in range(101):
+    for _ in range(14):
+        clock.t += 0.15
         source.step()
-    assert source.object_lost, "object_lost should be True after 101 steps with no object marker"
+    assert source.object_lost, "object_lost should be True after 2.1s with no object marker"
 
 
 # ---------------------------------------------------------------------------

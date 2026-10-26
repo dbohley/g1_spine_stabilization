@@ -168,6 +168,12 @@ perception:
                                          # tags used before.
   object_marker_id: 0
   target_marker_id: 2
+  # Reject detections whose solvePnP reprojection error (pixels) exceeds this
+  # -- motion blur, glare, or a partly occluded tag give a confidently-wrong
+  # pose otherwise. null disables the gate. UNMEASURED: check the
+  # reprojection errors visualize_markers.py prints for a clean static tag
+  # (typically well under 1 px) before picking a threshold (e.g. 2.0).
+  max_reprojection_error_px: null
   # Camera stream request (used by every RealSenseSource call site). The
   # D435's color sensor is native 16:9 -- a 4:3 request like 640x480 uses a
   # narrower center-crop of the sensor than a 16:9 request, which visibly

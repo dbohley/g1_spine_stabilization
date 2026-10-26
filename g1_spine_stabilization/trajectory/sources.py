@@ -103,8 +103,12 @@ class MarkerSource:
                            since the caller reads the arm's live joint state
                            immediately after startup() returns. Default False
                            preserves the original timed-countdown behavior.
-        control_dt:        control loop period in seconds; used for stale-time
-                           calculations (does not introduce delays in step()).
+        control_dt:        accepted for call-site compatibility; no longer used.
+                           Staleness is now measured with `clock` (below)
+                           rather than frames-missed * control_dt.
+        clock:             zero-arg callable returning seconds (default
+                           time.monotonic), used for marker staleness /
+                           object_lost. Injectable for tests.
         box_half_height:   the object marker is mounted on TOP of the held
                            object, not at its center -- half the box's height
                            (meters), subtracted along the object marker's own
@@ -150,7 +154,8 @@ class MarkerSource:
     def __init__(self, tracker, object_marker_id, target_marker_id,
                  mode="orient-only", countdown=0.0, control_dt=0.02,
                  box_half_height=0.0, box_center_offset=None,
-                 wait_for_keypress=False, on_observations=None):
+                 wait_for_keypress=False, on_observations=None,
+                 clock=time.monotonic):
         if mode not in ("orient-only", "6dof"):
             raise ValueError(f"mode must be 'orient-only' or '6dof', got {mode!r}")
         self._tracker = tracker
@@ -159,7 +164,6 @@ class MarkerSource:
         self._mode = mode
         self._countdown = countdown
         self._wait_for_keypress = wait_for_keypress
-        self._control_dt = control_dt
         self._box_half_height = float(box_half_height)
         self._box_center_offset = (None if box_center_offset is None
                                    else np.asarray(box_center_offset, dtype=float))
@@ -174,12 +178,20 @@ class MarkerSource:
         self._last_rotation = np.eye(3)
         self._last_obj_obs = None
         self._last_tgt_obs = None
-        # Stale-target tracking
-        self._target_stale_frames = 0
+        # Staleness is measured in WALL-CLOCK time since each marker was last
+        # seen, not frames-missed * control_dt: the real loop runs at ~6-10 Hz
+        # (solve_ik costs ~100 ms), so counting frames at the nominal 50 Hz
+        # made every "0.5 s"/"2 s" threshold fire 5-9x late. Same assumed-dt
+        # vs measured-dt bug class RateLimitedSource fixes. The clock starts
+        # at the first step() call (see _stale_seconds).
+        self._clock = clock
+        self._target_last_seen = None
+        self._target_stale_s = 0.0
         self._stale_warned_05 = False
         self._stale_warned_3 = False
         # Object-lost monitoring
-        self._object_stale_frames = 0
+        self._object_last_seen = None
+        self._object_stale_s = 0.0
         self._object_warned_2s = False
         self._object_warned_5s = False
 
@@ -342,6 +354,9 @@ class MarkerSource:
             raise RuntimeError("Call startup() before step()")
 
         obj_obs, tgt_obs, _current = self._step_tracker()
+        now = self._clock()
+        if self._target_last_seen is None:   # first step(): start the stale clocks
+            self._target_last_seen = self._object_last_seen = now
 
         # --- Target marker ---
         self._last_tgt_obs = tgt_obs
@@ -349,12 +364,12 @@ class MarkerSource:
             self._last_rotation = self._rotation_from_target(tgt_obs.pose_in_pelvis[:3, :3])
             if self._mode == "6dof":
                 self._box_center = self._box_center_from_target_position(tgt_obs.pose_in_pelvis[:3, 3])
-            self._target_stale_frames = 0
+            self._target_last_seen = now
+            self._target_stale_s = 0.0
             self._stale_warned_05 = False
             self._stale_warned_3 = False
         else:
-            self._target_stale_frames += 1
-            stale_s = self._target_stale_frames * self._control_dt
+            stale_s = self._target_stale_s = now - self._target_last_seen
             if stale_s >= 0.5 and not self._stale_warned_05:
                 print(f"[MarkerSource] WARNING: target marker not seen for {stale_s:.1f}s — holding last known pose")
                 self._stale_warned_05 = True
@@ -365,12 +380,12 @@ class MarkerSource:
         # --- Object marker monitoring ---
         self._last_obj_obs = obj_obs
         if obj_obs is not None:
-            self._object_stale_frames = 0
+            self._object_last_seen = now
+            self._object_stale_s = 0.0
             self._object_warned_2s = False
             self._object_warned_5s = False
         else:
-            self._object_stale_frames += 1
-            lost_s = self._object_stale_frames * self._control_dt
+            lost_s = self._object_stale_s = now - self._object_last_seen
             if lost_s > 2.0 and not self._object_warned_2s:
                 print(f"[MarkerSource] WARNING: object marker not seen for {lost_s:.1f}s — object may have moved!")
                 self._object_warned_2s = True
@@ -422,13 +437,14 @@ class MarkerSource:
 
     @property
     def target_stale_seconds(self) -> float:
-        """Seconds since target marker was last seen this frame (0.0 if seen)."""
-        return self._target_stale_frames * self._control_dt
+        """Wall-clock seconds since the target marker was last seen, as of the
+        latest step() (0.0 if seen that step)."""
+        return self._target_stale_s
 
     @property
     def object_lost(self) -> bool:
         """True if object marker has not been seen for more than 2s during tracking."""
-        return self._object_stale_frames * self._control_dt > 2.0
+        return self._object_stale_s > 2.0
 
     @property
     def tracker(self):
@@ -501,7 +517,8 @@ class RateLimitedSource:
     the TOTAL angular speed (rotvec norm) rather than only the X component --
     the same number, generalized, strictly tighter per-axis than before.
     A source that returns one type on one call and the other type on a
-    later call (without an intervening startup()) raises TypeError.
+    later call (without an intervening startup()) triggers a warning and a
+    re-seed (not an exception -- see step()).
     """
 
     def __init__(self, inner, max_theta_rate, max_pos_rate, clock=time.monotonic,
@@ -647,7 +664,8 @@ class NoiseFilteredSource:
     anchor (exact for the in-range pure-X case); the EMA blends geodesically
     (R_ema <- R_ema @ Exp(alpha * Log(R_ema.T @ R_med))), which also reduces
     to the exact scalar EMA formula for pure-X input. A source that returns
-    one type on one call and the other on a later call raises TypeError.
+    one type on one call and the other on a later call triggers a warning
+    and a filter-history reset (not an exception -- see step()).
     """
 
     def __init__(self, inner, median_window=5, ema_alpha=0.3):

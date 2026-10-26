@@ -120,3 +120,66 @@ def test_no_pelvis_offset_by_default():
 
     obs = tracker.step()[0]
     np.testing.assert_allclose(obs.pose_in_pelvis[:3, 3], [1.0, 2.0, 3.0])
+
+
+class _FlakyFrameSource:
+    """Yields frames per a script: 'ok' -> a frame, 'raise' -> RuntimeError
+    (like a librealsense wait_for_frames timeout), 'empty' -> a 0-size frame."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self._t = 0.0
+
+    def read(self):
+        kind = self._script.pop(0)
+        self._t += 0.1
+        if kind == "raise":
+            raise RuntimeError("Frame didn't arrive within 5000")
+        if kind == "empty":
+            return np.zeros((0, 0, 3), dtype=np.uint8), self._t
+        return np.zeros((4, 4, 3), dtype=np.uint8), self._t
+
+
+def _flaky_tracker(script, **kwargs):
+    return MarkerTracker(
+        _FlakyFrameSource(script), _StubDetector(np.eye(4)), intrinsics=None,
+        T_optical_to_d435=np.eye(4), T_d435_to_pelvis=np.eye(4), **kwargs,
+    )
+
+
+def test_dropped_frames_return_empty_instead_of_raising():
+    """A camera read failure must not propagate into the control loop -- it is
+    reported as 'nothing seen this tick', and tracking resumes on the next
+    good frame."""
+    tracker = _flaky_tracker(["ok", "raise", "empty", "ok"])
+
+    assert len(tracker.step()) == 1
+    assert tracker.step() == []
+    assert tracker.step() == []
+    assert tracker.stats["consecutive_dropped"] == 2
+    assert len(tracker.step()) == 1
+
+    stats = tracker.stats
+    assert stats["frames_ok"] == 2
+    assert stats["frames_dropped"] == 2
+    assert stats["consecutive_dropped"] == 0
+
+
+def test_dropped_frame_keeps_last_known_observation():
+    """get_latest() still returns the last good detection through an outage,
+    so consumers can hold the last known pose."""
+    tracker = _flaky_tracker(["ok", "raise"])
+    tracker.step()
+    tracker.step()
+    assert tracker.get_latest(0) is not None
+
+
+def test_reprojection_gate_rejects_poor_fits():
+    """Detections above max_reprojection_error are dropped (stub reports 0.3 px)."""
+    strict = _flaky_tracker(["ok"], max_reprojection_error=0.1)
+    assert strict.step() == []
+    assert strict.stats["detections_rejected"] == 1
+    assert strict.get_latest(0) is None
+
+    loose = _flaky_tracker(["ok"], max_reprojection_error=1.0)
+    assert len(loose.step()) == 1
